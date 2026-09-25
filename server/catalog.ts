@@ -21,13 +21,14 @@ const DEFAULT_TIER = "high";
 /**
  * The reasoning tiers Antigravity encodes in the model id itself (`gemini-3.8-flash-high`). The
  * CLI rejects `--model X --effort Y` for those ids, so a tier is chosen as a thinking option and
- * resolved back into the slug the CLI accepts.
+ * resolved back into the slug the CLI accepts. `max` is here for a model that lists one — no model
+ * on `agy models` 1.2.11 does, which the composer shows by offering the tiers the ids carry.
  */
-const TIERS = ["high", "medium", "low"] as const;
+const TIERS = ["max", "high", "medium", "low"] as const;
 type Tier = (typeof TIERS)[number];
 
-const TIER_ID = /^(?<base>.+)-(?<tier>high|medium|low)$/;
-const TIER_LABEL = /\s*\((?:high|medium|low)\)$/i;
+const TIER_ID = /^(?<base>.+)-(?<tier>max|high|medium|low)$/;
+const TIER_LABEL = /\s*\((?:max|high|medium|low)\)$/i;
 
 /** `default` is implicit: omitting --mode gives review-before-write behaviour. */
 export const MODES: readonly ProviderMode[] = [

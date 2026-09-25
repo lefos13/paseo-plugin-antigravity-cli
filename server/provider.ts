@@ -33,6 +33,7 @@ import {
 } from "./edits";
 import {
   DEFAULT_MODE_ID,
+  DEFAULT_MODEL_ID,
   MODES,
   buildCatalog,
   catalogCacheKey,
@@ -40,7 +41,13 @@ import {
   invalidateCatalogCache,
   resolveThinking,
 } from "./catalog";
-import { MAX_SKILL_BYTES, discoverCommands, renderSkillPrompt } from "./commands";
+import {
+  MAX_SKILL_BYTES,
+  discoverAgents,
+  discoverCommands,
+  renderSkillPrompt,
+  type DiscoveredAgent,
+} from "./commands";
 import {
   STEP_AGENT_RESPONSE,
   STEP_STATE_DONE,
@@ -77,10 +84,10 @@ const PLAN_MODE_ID = "plan";
 /** The mode an approved plan is implemented in. */
 const IMPLEMENT_MODE_ID = "accept-edits";
 /**
- * `--mode plan` changes nothing in a headless run: agy 1.1.28+ approves its own plan review when
- * no one can answer it, and a plan-mode run on agy 1.2.10 edited files straight away, with and
- * without --dangerously-skip-permissions (probed 2026-09-24). So plan mode is the plugin's to
- * enforce: every plan-mode turn carries this preamble, and its answer is offered as a plan.
+ * agy's `--mode plan` is never passed (`ensureProcess` explains why): it takes effect only while
+ * slash-command expansion is on, and with expansion on the CLI approves its own plan review and
+ * implements in the same turn. So plan mode is the plugin's to enforce: every plan-mode turn
+ * carries this preamble, and its answer is offered as a plan.
  */
 const PLAN_MODE_PREAMBLE = `<plan_mode>
 Plan mode is on. Do not create, edit, move or delete any file, and do not run commands that change anything: no installs, builds that write output, git commits, servers or other side effects. Read-only investigation — reading files, searching, and read-only commands — is allowed.
@@ -164,6 +171,15 @@ interface Session {
   readonly extraArgs?: readonly string[];
   /** Absolute, existing directories from `providerOptions.addDirs`, passed as extra --add-dir. */
   readonly addDirs: readonly string[];
+  readonly agent?: string;
+  /**
+   * `providerOptions.effort`. It only becomes the launch slug's tier (`resolveEffort`) or, with no
+   * model selected, the one `--effort` flag; it is never passed alongside `--model`.
+   */
+  readonly effort?: string;
+  /** The last effort drop `applyProviderEffort` named, so a relaunch does not report it again. */
+  effortNotice: string | null;
+  readonly availableAgents: readonly DiscoveredAgent[];
   settings: Record<string, JsonValue>;
   /**
    * The composer's selectors. `model` and `thinkingOption` are kept as they were chosen — a
@@ -324,6 +340,7 @@ interface SubagentInfo {
   role?: string;
   prompt?: string;
   done?: boolean;
+  workspaceUris?: readonly string[];
 }
 
 /**
@@ -381,6 +398,11 @@ interface ChildFollow {
   readonly childId: string;
   /** The turn that spawned it, or null for a child resumed from a replayed row. */
   readonly turnId: string | null;
+  /**
+   * Where the child works: its own worktree for a `Workspace: branch` child, the parent's
+   * directory otherwise (`resolveChildCwd`). Both its transcript and its session row use it.
+   */
+  readonly cwd: string;
   /** Assigned right after construction: the tailer's handlers need the follow they belong to. */
   transcript: SubagentTranscript;
   /** Null when the parent session is not persisted: the child's rows are then not stored either. */
@@ -514,6 +536,55 @@ async function dispatch(input: ProviderInput, state: ConnectionState, emit: Emit
   }
 }
 
+/**
+ * How `providerOptions.effort` reaches the CLI.
+ *
+ * `--effort` is never passed next to `--model`: agy refuses every model id alongside it
+ * (`--effort is not supported for model "X"` for one without tiers, `--model X conflicts with
+ * --effort=Y` for a tiered slug). A model selected by the composer therefore keeps its effort in
+ * the slug — a tier its family lists becomes the session's thinking option, which `resolveThinking`
+ * folds into the id — and any other effort is dropped. With no model selected the effort applies to
+ * the CLI's own default model, which is the only family that can validate it.
+ */
+function resolveEffort(
+  model: string | undefined,
+  effort: string | undefined,
+): { thinkingOption?: string; flag?: string; dropped?: string } {
+  if (effort === undefined) return {};
+  // Every way of saying "no model" behaves alike: the effort then belongs to the CLI's own choice.
+  const selected = model !== undefined && model.length > 0 ? model : undefined;
+  const options = resolveThinking(selected ?? DEFAULT_MODEL_ID, undefined).options;
+  if (options.some((option) => option.id === effort)) {
+    return selected === undefined ? { flag: effort } : { thinkingOption: effort };
+  }
+  const available = options.map((option) => option.id).join(", ");
+  return {
+    dropped:
+      available.length > 0
+        ? `${selected ?? DEFAULT_MODEL_ID} has no "${effort}" effort (available: ${available})`
+        : `${selected ?? DEFAULT_MODEL_ID} has no reasoning tiers`,
+  };
+}
+
+/**
+ * Applies `providerOptions.effort` to the session (`resolveEffort`) and returns the `--effort` the
+ * next launch may carry, naming a dropped effort once so a relaunch does not repeat it. Called at
+ * open, on every configure, and before each launch, because the model may change in between.
+ */
+function applyProviderEffort(session: Session): string | undefined {
+  const effort = resolveEffort(session.selection.model, session.effort);
+  if (effort.dropped !== undefined && effort.dropped !== session.effortNotice) {
+    session.effortNotice = effort.dropped;
+    console.log(`[antigravity] ignoring effort "${session.effort}": ${effort.dropped}`);
+  }
+  // A model chosen after the session opened may have the tier the effort asked for; adopting it
+  // keeps the slug and the committed config (`configState`) in agreement.
+  if (session.selection.thinkingOption === undefined && effort.thinkingOption !== undefined) {
+    session.selection.thinkingOption = effort.thinkingOption;
+  }
+  return effort.flag;
+}
+
 async function openSession(
   input: Extract<ProviderInput, { type: "session.open" }>,
   state: ConnectionState,
@@ -525,6 +596,7 @@ async function openSession(
   const persist = config.persist !== false;
   const attachmentsDir = await prepareAttachmentsDir(input.sessionId);
   const addDirs = await checkAddDirs(options.addDirs);
+  const availableAgents = await discoverAgents(config.cwd);
 
   // Computed before this session joins the map: a conversation with no timeline of this plugin's
   // own is one that already existed in Antigravity. Another open session's rows may still be
@@ -542,10 +614,15 @@ async function openSession(
     agyPath: options.agyPath,
     extraArgs: options.extraArgs,
     addDirs: addDirs.kept,
+    agent: options.agent,
+    effort: options.effort,
+    effortNotice: null,
+    availableAgents,
     settings: { ...config.settings },
     selection: {
       model: config.model,
       mode: config.mode ?? DEFAULT_MODE_ID,
+      // `providerOptions.effort` fills this in below; an explicit composer tier wins over it.
       thinkingOption: config.thinkingOption,
     },
     conversationId,
@@ -579,6 +656,8 @@ async function openSession(
     planApproval: state.capabilities.includes("permission"),
   };
   state.sessions.set(input.sessionId, session);
+  // Before `session.config`: the tier the effort becomes is what the composer has to show.
+  applyProviderEffort(session);
 
   emit({
     type: "session.opened",
@@ -754,7 +833,8 @@ async function replaySubagentItem(
     restoration: "parent",
     title: row.info.role ?? row.info.typeName ?? "Subagent",
     description: (row.info.prompt ?? "").slice(0, DESCRIPTION_LIMIT),
-    cwd: session.config.cwd,
+    // The directory the child's own transcript was read in, which `replaySubagentItem` resumes.
+    cwd: resolveChildCwd(session.config.cwd, info.workspaceUris),
   });
   emit({ type: "session.ready", sessionId: childId });
   emit({
@@ -799,6 +879,7 @@ async function replaySubagentItem(
     childConversationId: info.conversationId,
     childId,
     turnId: null,
+    cwd: resolveChildCwd(session.config.cwd, info.workspaceUris),
     store: stored,
     opened: true,
     done: false,
@@ -809,7 +890,7 @@ async function replaySubagentItem(
       logUri: info.logUri ?? "",
       childConversationId: info.conversationId,
       parentConversationId: session.conversationId ?? "",
-      cwd: session.config.cwd,
+      cwd: follow.cwd,
     },
     {
       onRender: (render, changed) => handleChildRender(session, emit, follow, render, changed),
@@ -1174,6 +1255,10 @@ async function configureSession(
     session.settings = { ...session.settings, ...changes.settings };
   }
 
+  // A newly selected model may be the one the provider option's effort belongs to, and a newly
+  // selected tier wins over it; either way the committed config below has to carry the winner.
+  applyProviderEffort(session);
+
   // agy fixes the model, mode, and approval flags at launch, so a change is applied by restarting
   // the CLI. That restart is deferred to the start of the next turn: killing the process here
   // would abort an answer that is already streaming just because a selector moved.
@@ -1456,12 +1541,23 @@ function ensureProcess(session: Session, emit: Emit): AgyProcess {
     void current.dispose();
   }
 
+  // Resolved first: the provider option's effort may be what supplies the tier the slug carries.
+  const effort = applyProviderEffort(session);
+  const thinking = resolveThinking(session.selection.model, session.selection.thinkingOption);
   const process = new AgyProcess(
     {
       cwd: session.config.cwd,
       env: session.config.env,
-      model: resolveThinking(session.selection.model, session.selection.thinkingOption).slug,
-      mode: session.selection.mode,
+      model: thinking.slug,
+      // Paseo's plan mode is the plugin's preamble, never agy's `--mode plan`: agy leaves that flag
+      // without effect while slash-command expansion is disabled, and making it real is worse —
+      // probed 2026-09-25, with expansion on the CLI approved its own plan review and implemented
+      // in the same turn, preamble or not (fixtures/16-plan-mode.*). The preamble alone planned and
+      // stopped, with and without `--dangerously-skip-permissions`.
+      mode: session.selection.mode === PLAN_MODE_ID ? undefined : session.selection.mode,
+      // Set only when no model is selected: with one, the effort already lives in the slug's tier.
+      effort,
+      agent: selectedAgent(session),
       conversationId: session.conversationId ?? undefined,
       sandbox: isSettingOn(session.settings.sandbox),
       addDirs: session.addDirs,
@@ -1688,6 +1784,7 @@ interface SubagentEntry {
   prompt?: string;
   conversationId?: string;
   logUri?: string;
+  workspaceUris?: readonly string[];
 }
 
 /** The children a step names: the subagent line first, the tool call's parameters second. */
@@ -1700,6 +1797,7 @@ function readSubagentEntries(step: AgyStepUpdate): SubagentEntry[] {
       ...(child.initial_prompt !== undefined ? { prompt: child.initial_prompt } : {}),
       ...(child.conversation_id !== undefined ? { conversationId: child.conversation_id } : {}),
       ...(child.log_uri !== undefined ? { logUri: child.log_uri } : {}),
+      ...(child.workspace_uris !== undefined ? { workspaceUris: child.workspace_uris } : {}),
     }));
   }
 
@@ -1752,6 +1850,7 @@ function handleSubagentStep(
     if (entry.prompt !== undefined) row.info.prompt = entry.prompt;
     if (entry.conversationId !== undefined) row.info.conversationId = entry.conversationId;
     if (entry.logUri !== undefined) row.info.logUri = entry.logUri;
+    if (entry.workspaceUris !== undefined) row.info.workspaceUris = entry.workspaceUris;
     if (entry.prompt !== undefined && row.log.length === 0) row.log = entry.prompt;
 
     refreshSubagentRow(row);
@@ -1760,7 +1859,7 @@ function handleSubagentStep(
     publishSubagent(session, emit, row);
 
     if (row.status === "running" && entry.conversationId !== undefined && entry.logUri !== undefined) {
-      void startChildFollow(session, emit, row, entry.conversationId, entry.logUri);
+      void startChildFollow(session, emit, row, entry.conversationId, entry.logUri, row.info.workspaceUris);
     }
   }
 }
@@ -1876,6 +1975,22 @@ function closeChildSession(
 }
 
 /**
+ * The directory a child works in, which its transcript renders paths against and its session
+ * reports as its cwd.
+ *
+ * Verified against agy 1.2.11 (fixtures/14-subagent-worktree.ndjson): `workspace_uris[0]` is the
+ * child's *own* directory — the parent workspace for a `Workspace: inherit` child (fixture 12), and
+ * `<appDataDir>/worktrees/<parent conversation id>/<worktree name>` for a `branch` child — as a
+ * `file://` URI. Only such a URI names a directory here: anything else, or one whose path cannot be
+ * decoded, leaves the child where the parent is rather than inventing a working directory.
+ */
+export function resolveChildCwd(parentCwd: string, workspaceUris?: readonly string[]): string {
+  const first = workspaceUris?.[0];
+  if (!first || first.trim().length === 0) return parentCwd;
+  return transcriptFilePath(first) ?? parentCwd;
+}
+
+/**
  * Starts following the transcript of one child. Everything here is best-effort: a transcript that
  * cannot be read, parsed, or watched costs the child's own session and nothing else — the row the
  * stream justified stays on screen, and the parent's turn is never failed or delayed by it. This
@@ -1887,9 +2002,10 @@ async function startChildFollow(
   row: SubagentRow,
   childConversationId: string,
   logUri: string,
+  workspaceUris?: readonly string[],
 ): Promise<void> {
   try {
-    await followChildTranscript(session, emit, row, childConversationId, logUri);
+    await followChildTranscript(session, emit, row, childConversationId, logUri, workspaceUris);
   } catch (error) {
     // Nothing a child does may fail or delay the parent's turn, so anything that goes wrong here
     // ends with the child's transcript unfollowed and a line in the log.
@@ -1905,6 +2021,7 @@ async function followChildTranscript(
   row: SubagentRow,
   childConversationId: string,
   logUri: string,
+  workspaceUris?: readonly string[],
 ): Promise<void> {
   if (session.follows.has(row.id) || session.closing) return;
 
@@ -1928,6 +2045,7 @@ async function followChildTranscript(
     childConversationId,
     childId: childSessionId(session.sessionId, childConversationId),
     turnId: row.turnId,
+    cwd: resolveChildCwd(session.config.cwd, workspaceUris),
     store,
     opened: false,
     done: false,
@@ -1938,7 +2056,7 @@ async function followChildTranscript(
       logUri,
       childConversationId,
       parentConversationId: session.conversationId ?? "",
-      cwd: session.config.cwd,
+      cwd: follow.cwd,
     },
     {
       onRender: (render, changed) => handleChildRender(session, emit, follow, render, changed),
@@ -1979,7 +2097,8 @@ function handleChildRender(
       restoration: "parent",
       title,
       description: (row?.info.prompt ?? "").slice(0, DESCRIPTION_LIMIT),
-      cwd: session.config.cwd,
+      // The child's own directory, which is its worktree when the model branched one.
+      cwd: follow.cwd,
     });
     emit({ type: "session.ready", sessionId: follow.childId });
     emit({
@@ -2445,6 +2564,18 @@ function buildSettings(session: Session): readonly ProviderSetting[] {
   // names that value rather than guessing at what a headless run will do.
   const permission = readToolPermission() ?? "unknown";
   return [
+    ...(session.availableAgents.length > 0 || session.agent !== undefined
+      ? [
+          {
+            type: "select" as const,
+            id: "agent",
+            label: "Agent profile",
+            description: "Run under a project or global custom agent profile (--agent <name>).",
+            value: chosenAgent(session),
+            options: agentOptions(session),
+          },
+        ]
+      : []),
     {
       type: "select",
       id: "approvalPolicy",
@@ -2482,6 +2613,37 @@ function buildSettings(session: Session): readonly ProviderSetting[] {
 }
 
 /**
+ * The agent the select shows: the setting while one is chosen, else what a launch would pass
+ * (`selectedAgent`'s fallback), so the row never disagrees with the flags.
+ */
+function chosenAgent(session: Session): string {
+  const setting = session.settings.agent;
+  if (typeof setting === "string" && setting.trim().length > 0) return setting.trim();
+  return session.agent ?? "default";
+}
+
+/**
+ * The agent select's options. A `providerOptions.agent` — or a setting saved elsewhere — may name
+ * an agent this workspace scan does not offer (a global one, or one only the CLI knows). That name
+ * still reaches `--agent`, so it is offered here too: a select whose value is not among its own
+ * options shows the user something they cannot select back.
+ */
+function agentOptions(session: Session): ReadonlyArray<{ label: string; value: string }> {
+  const options: Array<{ label: string; value: string }> = [
+    { label: "Default (general)", value: "default" },
+    ...session.availableAgents.map((agent) => ({
+      label: agent.description ? `${agent.name} (${agent.description})` : agent.name,
+      value: agent.name,
+    })),
+  ];
+  const chosen = chosenAgent(session);
+  if (!options.some((option) => option.value === chosen)) {
+    options.push({ label: chosen, value: chosen });
+  }
+  return options;
+}
+
+/**
  * Paseo draws plugin toggles as icon-only buttons with no on/off state, so a boolean setting is
  * offered as a two-option select instead: Paseo then shows the current value as a pill. A value
  * saved while the setting was a toggle (`true`/`false`) still reads correctly.
@@ -2509,6 +2671,18 @@ function approvalPolicy(session: Session): "agy" | "skip" {
   const value = session.settings.approvalPolicy;
   if (value === "agy" || value === "skip") return value;
   return session.settings.autoApprove === true ? "skip" : "agy";
+}
+
+/**
+ * The agent the next launch passes to `--agent`, if any. The composer's own setting is what the
+ * user is looking at, so an explicit `"default"` means the CLI's default agent and beats a
+ * `providerOptions.agent` — which only applies while no setting has been chosen at all.
+ */
+function selectedAgent(session: Session): string | undefined {
+  const fromSetting = session.settings.agent;
+  if (fromSetting === "default") return undefined;
+  if (typeof fromSetting === "string" && fromSetting.trim().length > 0) return fromSetting.trim();
+  return session.agent;
 }
 
 function requireSession(state: ConnectionState, sessionId: string): Session {
@@ -2545,11 +2719,15 @@ function readProviderOptions(config: ProviderSessionConfig): {
   agyPath?: string;
   extraArgs?: readonly string[];
   addDirs?: readonly string[];
+  agent?: string;
+  effort?: string;
 } {
   const options = config.providerOptions ?? {};
   const rawPath = options.agyPath;
   const rawArgs = options.extraArgs;
   const rawDirs = options.addDirs;
+  const rawAgent = options.agent;
+  const rawEffort = options.effort;
   return {
     agyPath: typeof rawPath === "string" && rawPath.trim().length > 0 ? rawPath : undefined,
     extraArgs: Array.isArray(rawArgs)
@@ -2558,6 +2736,8 @@ function readProviderOptions(config: ProviderSessionConfig): {
     addDirs: Array.isArray(rawDirs)
       ? rawDirs.filter((dir): dir is string => typeof dir === "string")
       : undefined,
+    agent: typeof rawAgent === "string" && rawAgent.trim().length > 0 ? rawAgent.trim() : undefined,
+    effort: typeof rawEffort === "string" && rawEffort.trim().length > 0 ? rawEffort.trim() : undefined,
   };
 }
 

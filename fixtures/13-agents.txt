@@ -1,0 +1,214 @@
+agy 1.2.11 — `agy agents` and custom agent layout (probe for Tasks 4 and 6)
+Probed 2026-09-25 by an assistant agent. Scratch git repo: /tmp/agyprobe/repoA (macOS).
+No file under server/ was read-only-prohibited; nothing in the plugin repo was modified except
+this fixture and 14-subagent-worktree.*.
+
+================================================================================
+1. VERIFIED LAYOUTS  (all of these were listed by `agy agents`)
+================================================================================
+
+Workspace roots (relative to the workspace root the CLI was launched with; there is NO walk-up
+from cwd to the git root — see §4):
+
+  .agents/agents/<name>.md            flat file
+  .agents/agents/<name>/agent.md      directory form
+  .agent/agents/<name>.md             the singular `.agent` root is also read
+  _agents/agents/<name>/agent.md      the underscore root is also read
+
+NOT an agent root: `.agents/subagents/<name>/agent.md` (not listed).
+
+Global roots (both are real, both accept flat and directory forms):
+
+  ~/.gemini/config/agents/<name>.md
+  ~/.gemini/config/agents/<name>/agent.md
+  ~/.gemini/antigravity-cli/agents/<name>/agent.md        <- also listed (guessed root was right)
+
+The frontmatter `name` wins over the file/directory name: `.agents/agents/mismatch-dir/agent.md`
+with `name: renamed-agent` is listed as `renamed-agent`.
+
+A markdown file with no YAML frontmatter is skipped. The binary carries the message
+`Markdown agent at %s is missing name or description in frontmatter`.
+
+Frontmatter fields seen in the binary: name, description, hidden, mainAgent, subagent,
+inheritMcp, commandExecutionPolicy, excludeDefaultComponents, agents, rules, model, tools.
+
+================================================================================
+2. TRUST GATES WORKSPACE AGENTS (this is the trap)
+================================================================================
+
+Untrusted workspace (repo under /tmp, not in the CLI's trust list):
+
+  $ cd /tmp/agyprobe/repoA && agy agents
+  (no output, RC=0)
+
+After adding the directory to `~/.gemini/antigravity-cli/settings.json` ->
+`"trustedWorkspaces": [...]` (NOT `~/.gemini/trustedFolders.json`; that file is not what the CLI
+reads for this — editing it alone changed nothing):
+
+  $ cd /tmp/agyprobe/repoA && agy agents
+  dir-four
+  dir-two
+  flat-one
+  flat-three
+  hidden-one
+  probe-cli-root
+  probe-global-dir
+  probe-global-flat
+  renamed-agent
+  RC=0
+
+One name per line, name-sorted, no description, no header. Nothing at all when there are no
+agents (empty stdout, exit 0) — not an empty table.
+
+`agy agents --help` (there is NO machine-readable flag; `--json`/`-o` do not exist):
+
+  Usage: agy agent [flags]
+
+  List available agents
+
+  Flags:
+    -h      Show help
+    --help  Show help
+
+  (`agy agents --log-file x` fails: "flags provided but not defined: -log-file".)
+
+================================================================================
+3. hidden / mainAgent / subagent
+================================================================================
+
+Files used (verbatim):
+
+  .agents/agents/flat-one.md
+    ---
+    name: flat-one
+    description: Flat layout probe
+    ---
+    # Flat One
+    Your codename is FLATONE. When the user asks for your codename, reply with exactly the single
+    word FLATONE and nothing else.
+
+  .agents/agents/dir-two/agent.md
+    ---
+    name: dir-two
+    description: Dir layout probe
+    ---
+    # Dir Two
+    Your codename is DIRTWO. ...
+
+  .agents/agents/hidden-one.md      (frontmatter adds `hidden: true`, codename HIDDENONE)
+  .agents/agents/sub-only.md        (frontmatter adds `mainAgent: false`, codename SUBONLY)
+  .agents/agents/mismatch-dir/agent.md   (name: renamed-agent)
+  .agents/agents/no-frontmatter/agent.md (no frontmatter at all)
+  .agents/subagents/dir-five/agent.md    (name: dir-five)
+  .agent/agents/flat-three.md            (name: flat-three)
+  _agents/agents/dir-four/agent.md       (name: dir-four)
+  ~/.gemini/config/agents/probe-global-dir/agent.md   (name: probe-global-dir)
+  ~/.gemini/config/agents/probe-global-flat.md        (name: probe-global-flat)
+  ~/.gemini/antigravity-cli/agents/probe-cli-root/agent.md (name: probe-cli-root)
+
+`agy agents` listing (trusted repoA):
+  dir-four, dir-two, flat-one, flat-three, hidden-one, probe-cli-root,
+  probe-global-dir, probe-global-flat, renamed-agent
+
+  -> `hidden: true` DOES appear in `agy agents` (it is not filtered out here).
+  -> `mainAgent: false` does NOT appear.
+  -> `no-frontmatter` and `dir-five` (`.agents/subagents/`) do not appear.
+
+`--agent <name> -p "What is your codename? Reply with just the codename."`
+  (model gemini-3.8-flash-low, trusted repoA):
+
+  --agent flat-one          -> FLATONE          (workspace flat file works)
+  --agent dir-two           -> DIRTWO           (workspace directory form works)
+  --agent hidden-one        -> HIDDENONE        (hidden agents ARE launchable)
+  --agent probe-global-dir  -> GLOBALDIR        (global root works)
+  --agent sub-only          -> Antigravity      (mainAgent:false is NOT launchable -> default agent)
+  --agent bogus-name        -> Antigravity      (unknown name is silently the default agent, RC=0)
+
+  For reference, in the SAME repo before it was trusted:
+  --agent flat-one/dir-two/hidden-one all answered "I am Gemini, ..." (no agent persona at all),
+  i.e. `--agent` was accepted but resolved to nothing; and `agy agents` printed nothing.
+
+Conclusion for Task 4: list from the four workspace roots above plus
+`~/.gemini/config/agents` and `~/.gemini/antigravity-cli/agents`, keep flat AND directory forms,
+use the frontmatter `name`, drop entries with `mainAgent: false`, and DO NOT filter `hidden: true`
+if the goal is "the agents `agy agents` lists". Note `--agent` NEVER errors on an unknown name,
+so a wrong list entry fails silently — exactly the bug Task 4 describes.
+
+================================================================================
+4. Discovery base directory
+================================================================================
+
+  $ cd /tmp/agyprobe/repoA/sub/dir && agy agents
+  probe-cli-root
+  probe-global-dir
+  probe-global-flat
+  (only the global roots: the workspace agents were NOT found from a subdirectory —
+   no walk-up to the git root)
+
+  $ cd /tmp/agyprobe/repoA/sub/dir && agy --add-dir /tmp/agyprobe/repoA agents
+  <all nine names>
+  (the workspace root must be the directory that directly contains `.agents/`)
+
+  $ cd /tmp && agy --add-dir /tmp/agyprobe/repoA agents
+  <all nine names>
+
+So `path.join(workspaceRoot, ".agents"|".agent"|"_agents"|"_agent", "agents")` is correct, where
+workspaceRoot is the cwd the CLI is launched with (Paseo passes it as `--add-dir`).
+
+================================================================================
+5. PLUGIN ENABLEMENT (probe for Task 6, same scratch repo)
+================================================================================
+
+Embedded doc `assets/external/skills/agy-customizations/docs/plugins.md` (also on disk at
+`~/.gemini/antigravity-cli/builtin/skills/agy-customizations/docs/plugins.md`), verbatim:
+
+  Most discovered plugins are **enabled by default**; a plugin can ship switched off by declaring
+  `"disabled": true` in its `plugin.json`, and some built-in ones do. Whether a plugin is active is
+  recorded in your `config.json`, under a `plugins` map keyed by the plugin's **directory** name:
+  { "plugins": { "my-plugin": { "enabled": false } } }
+  ... `config.json` wins wherever it has an entry, so your choice always beats what the plugin
+  declares. ... A disabled plugin still appears in the plugin list so you can turn it back on, but
+  none of its bundled customizations are loaded.
+
+Empirical A/B in `/tmp/agyprobe/repoA/.agents/plugins/` (each plugin one SKILL.md whose
+description mentions "plugin", then one model turn asking for the skill names from the skills
+section):
+
+  plugprobe-off/plugin.json = {"name":"plugprobe-off","disabled":true}   skill offskill
+  plugprobe-on/plugin.json  = {"name":"plugprobe-on"}                    skill onskill
+  plugprobe-en/plugin.json  = {"name":"plugprobe-en","enabled":false}    skill enskill
+
+  run 1 -> "agy-customizations, onskill"
+           (offskill absent: plugin.json "disabled": true IS honoured)
+  run 2 (with plugprobe-en added) -> "enskill, onskill"
+           (enskill present: plugin.json "enabled": false is IGNORED)
+
+So: `disabled: true` = off, `enabled: false` = on. The plugin's current code (checks
+`disabled: true`) matches the CLI.
+
+MCP "needs configuration variables" (changelog 1.2.11: "a plugin whose MCP server needs
+configuration variables now starts disabled until you enable it"): hand-placed global plugins
+under `~/.gemini/config/plugins/<name>/` with mcp_config.json placeholders
+`${VAR}`, `{{VAR}}`, and a `variables` map on the mcpServer entry produced NO new entry in
+`~/.gemini/config/config.json` after `agy agents` and after a full print-mode turn
+(`plugin_data/<name>/` was created, so the plugin manager did load them). Exact trigger NOT
+determined. The mcp server config schema does carry a `variables` field
+(`json:"variables,omitempty,omitzero"` / `yaml:"variables,omitempty"` / `mapstructure:...`), so
+[INFERENCE] that is the declaration the CLI keys off, and the disabled state would be recorded as
+`~/.gemini/config/config.json` -> `plugins.<dirname>.enabled: false` per the doc quoted above.
+The user's own config.json already uses that shape (`"superpowers": { "enabled": false }`).
+
+================================================================================
+6. Account state touched (all restored; see the accompanying report)
+================================================================================
+
+  ~/.gemini/trustedFolders.json                 temporarily gained /tmp/agyprobe entries (no effect
+                                                observed) — restored byte-for-byte
+  ~/.gemini/antigravity-cli/settings.json       temporarily gained /tmp/agyprobe* in
+                                                trustedWorkspaces — restored byte-for-byte
+  ~/.gemini/config/config.json                  probe plugins added/removed; file untouched (diff
+                                                against a backup is empty)
+  ~/.gemini/config/agents/{probe-global-dir,probe-global-flat.md}
+  ~/.gemini/antigravity-cli/agents/probe-cli-root/
+  ~/.gemini/config/plugins/probe-mcp-{dollar,brace,vars1,vars2}/
+                                                all created for the probe and deleted afterwards

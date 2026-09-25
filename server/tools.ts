@@ -49,6 +49,13 @@ export function mapToolDetail(
       const commandId = text("CommandId");
       return commandId ? { type: "shell", command: commandId, cwd, output } : plain();
     }
+    case "manage_task": {
+      const action = text("Action") ?? "manage_task";
+      const taskId = text("TaskId");
+      const input = text("Input");
+      const command = [action, taskId, input ? `(${input})` : ""].filter(Boolean).join(" ");
+      return { type: "shell", command: command.length > 0 ? command : "manage_task", cwd, output };
+    }
     case "view_file":
     case "read_resource": {
       const filePath = text("AbsolutePath") ?? text("Path");

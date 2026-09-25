@@ -10,6 +10,10 @@ export interface AgyLaunchConfig {
   env?: Readonly<Record<string, string>>;
   model?: string;
   mode?: string;
+  /** Passes --effort (low|medium|high|max). */
+  effort?: string;
+  /** Passes --agent to select an agent profile. */
+  agent?: string;
   conversationId?: string;
   /** Passes --dangerously-skip-permissions, so every tool runs without approval. */
   skipPermissions: boolean;
@@ -69,19 +73,24 @@ export function buildAgyArgs(config: AgyLaunchConfig): string[] {
     ...(config.attachmentDir ? ["--add-dir", config.attachmentDir] : []),
     ...(config.skillDir ? ["--add-dir", config.skillDir] : []),
     ...(config.addDirs ?? []).flatMap((dir) => ["--add-dir", dir]),
-    // A command turn needs expansion; every other turn must keep plain text from starting with
-    // `/` out of the CLI's slash parser (` /skills` and `/tasks` kill a print-mode turn outright).
+    // A command turn needs expansion; every other turn must keep plain text starting with `/` out
+    // of the CLI's slash parser (` /skills` and `/tasks` kill a print-mode turn outright). Plan
+    // mode is not an exception: agy ignores `--mode plan` while expansion is off, and turning it on
+    // to make the flag real costs the plugin's plan flow (see `ensureProcess` in provider.ts).
     ...(config.allowSlashCommands === true ? [] : ["--disable-slash-commands"]),
     // 0 waits until the turn completes; Paseo owns cancellation instead of a wall clock.
     "--print-timeout",
     "0",
   ];
-  // `--effort` is deliberately never passed: Antigravity encodes the reasoning tier in the model
-  // id itself (gemini-3.8-flash-high/medium/low) and rejects the pair with
-  // "--model X conflicts with --effort=Y". The caller resolves the tier the composer chose back
-  // into that slug before launch (`resolveThinking`).
+  // `--effort` is only ever passed without `--model`: agy refuses every model id alongside it
+  // ("--effort is not supported for model X", "--model X conflicts with --effort=Y"), so the
+  // caller folds the tier into the slug (`resolveThinking`) whenever a model is selected.
   if (config.model) args.push("--model", config.model);
-  // `default` is the implicit mode; agy only accepts accept-edits/plan.
+  if (config.effort) args.push("--effort", config.effort);
+  if (config.agent) args.push("--agent", config.agent);
+  // `default` is the implicit mode; agy only accepts accept-edits/plan. `plan` never arrives here:
+  // the provider keeps Paseo's Plan mode to itself (see `ensureProcess`), because agy ignores
+  // `--mode plan` while slash-command expansion is disabled.
   if (config.mode && config.mode !== "default") args.push("--mode", config.mode);
   if (config.conversationId) args.push("--conversation", config.conversationId);
   if (config.sandbox) args.push("--sandbox");

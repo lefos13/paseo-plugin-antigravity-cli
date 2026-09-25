@@ -43,6 +43,21 @@ describe("mapToolDetail from the captured edit run", () => {
       filePath: `${cwd}/hello.txt`,
     });
   });
+
+  it("maps manage_task steps to shell tool calls", () => {
+    expect(
+      detail("manage_task", {
+        name: "manage_task",
+        parameters: { Action: "status", TaskId: "task-123" },
+        output: "Task status: RUNNING",
+      }),
+    ).toEqual({
+      type: "shell",
+      command: "status task-123",
+      cwd: CWD,
+      output: "Task status: RUNNING",
+    });
+  });
 });
 
 describe("mapToolDetail edits", () => {

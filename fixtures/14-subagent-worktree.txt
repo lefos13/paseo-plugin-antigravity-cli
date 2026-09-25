@@ -1,0 +1,60 @@
+fixtures/14-subagent-worktree.ndjson — 1.2.11 subagent worktree probe (Task 7)
+Captured 2026-09-25. Scratch git repo /tmp/agyprobe/repoC (one commit 307bfbd), trusted via
+~/.gemini/antigravity-cli/settings.json trustedWorkspaces.
+
+Command (from /tmp/agyprobe/repoC):
+
+  cat /tmp/agyprobe/promptC.json | agy \
+    --input-format stream-json --output-format stream-json \
+    --add-dir "$PWD" --model gemini-3.8-flash-low \
+    --dangerously-skip-permissions --print-timeout 0
+
+stdin line (the plugin's own encodeUserTurn shape):
+
+  {"event":"user","message":{"role":"user","content":[{"type":"text","text":"Invoke exactly one
+  subagent using invoke_subagent with the Workspace parameter set to 'branch', Role 'Branch
+  Worker', TypeName 'self', and Prompt: 'Run pwd and create a file named hello.txt containing the
+  word hello in your current working directory. ...'"}]}}
+
+(one line in the real file). Exit code 0, empty stderr.
+
+WHAT workspace_uris HOLDS (the whole point of the probe) — the child's `subagent_info` entry in
+the step_update with state DONE:
+
+  "workspace_uris": [
+    "file:///Users/dev/.gemini/antigravity-cli/worktrees/72c3ee5b-91e9-448f-a04f-f227aead682f/subagent-Branch-Worker-self-13808e26"
+  ]
+
+i.e. the CHILD'S GIT WORKTREE, not the parent workspace:
+  <appDataDir>/worktrees/<parent conversation id>/<worktree name>
+with appDataDir = ~/.gemini/antigravity-cli on this machine.
+
+Corroboration on disk right after the run:
+
+  $ git -C /tmp/agyprobe/repoC worktree list
+  /private/tmp/agyprobe/repoC                      307bfbd [master]
+  /Users/dev/.gemini/antigravity-cli/worktrees/72c3ee5b-91e9-448f-a04f-f227aead682f/subagent-Branch-Worker-self-13808e26  307bfbd [subagent-Branch-Worker-self-13808e26]
+
+  $ ls .../subagent-Branch-Worker-self-13808e26
+  .git  a.txt  hello.txt        (hello.txt written by the child inside the worktree)
+
+The model's own summary of the child's report: pwd =
+/Users/dev/.gemini/antigravity-cli/worktrees/72c3ee5b-91e9-448f-a04f-f227aead682f/subagent-Branch-Worker-self-13808e26
+
+Context for comparison, from fixtures/12-subagents.ndjson (1.2.9): a default `Workspace: inherit`
+child carried `"workspace_uris": ["file:///Users/dev/agy-subagent-probe2"]`, i.e. the parent
+workspace. So workspace_uris[0] is the child's own working directory in both cases — the parent
+workspace for inherit children, the app-data worktree for `Workspace: 'branch'` children. The
+plugin's resolveChildCwd = workspace_uris[0] is therefore correct on 1.2.11, and the worktree URI
+is a real `file://` path that exists on disk.
+
+The `Workspace` parameter of invoke_subagent, from the tool schema embedded in the binary:
+
+  "Workspace mode for the subagent. 'inherit' (default) uses the same workspace as the parent.
+   'branch' creates a new isolated workspace branched or cloned from the parent. 'share' creates a
+   new workspace sharing the parent's underlying repository directory (similar to a git worktree or
+   Mercurial 'hg share'), allowing independent branching without duplicating storage. If omitted,
+   defaults to 'inherit'."
+
+Note: the worktree was NOT removed after the run (it is still on disk with hello.txt and a
+registered git worktree entry), and the CLI did not clean it up on process exit.

@@ -1,0 +1,57 @@
+fixtures/16-plan-mode.ndjson — 1.2.11 plan-mode probe (Task 9)
+Captured 2026-09-25. Scratch git repo /tmp/agy-plan-probe (one commit), trusted via
+~/.gemini/antigravity-cli/settings.json trustedWorkspaces. Paths anonymized to /Users/dev.
+
+What the stream is: the launch Paseo's plan mode uses, with the prompt the plugin sends. Command
+(from /tmp/agy-plan-probe):
+
+  cat /tmp/agy-plan-probe/prompt.json | agy \
+    --input-format stream-json --output-format stream-json \
+    --add-dir "$PWD" --model gemini-3.8-flash-low --disable-slash-commands \
+    --dangerously-skip-permissions --print-timeout 0
+
+stdin line: the plugin's own plan-mode text — the `<plan_mode>` preamble, a blank line, then
+"Create a file named a.txt containing the word hello."
+
+Result: exit code 0, empty stderr, no file written, and the turn ends on the plan itself:
+
+  "### Implementation Plan\n\n#### Proposed Changes\n1. **Create `a.txt`** …\n\nPlease approve this
+   plan to proceed with creating the file."
+
+Note there is no `--mode plan` on that command line. The four launches probed, each one clean repo,
+with that preamble and that prompt:
+
+  | launch                                        | a.txt | stderr |
+  |-----------------------------------------------|-------|--------|
+  | `--disable-slash-commands` (+ skip-perms)      |  no   | —      |   ← this fixture
+  | `--disable-slash-commands`, no skip-perms      |  no   | —      |
+  | `--mode plan` (+ skip-perms)                   |  YES  | —      |
+  | `--mode plan --disable-slash-commands`         |  no   | warning: --mode plan has no effect while
+  |                                                |       | slash command expansion is disabled.
+
+`--mode plan` needs slash-command expansion to be on (that is what the warning is about), and with
+expansion on the CLI writes a plan artifact, approves its own review — nobody is there to answer it
+in a headless run — and then implements inside the same turn. The `--mode plan` runs ended with:
+
+  "I have created the implementation plan … Please review the plan and approve it so I can
+   proceed with creating a.txt.\nThe task has been completed:\n\n- Created a.txt with the content
+   `hello`."
+
+That happened with the `<plan_mode>` preamble in front of the prompt, and with and without
+`--dangerously-skip-permissions` (the machine's own `toolPermission` is `always-proceed`). Without
+expansion, the same prompt plans and stops under both policies, which is why the plugin keeps
+expansion off and Paseo's plan mode is its own preamble rather than `--mode plan`.
+
+Slash-command expansion, for the turn shape the plugin sends (no plan mode, expansion ON) — probed
+the same day:
+
+  `/skills`  → exit 2, `error: /skills is answered by the CLI itself and is unavailable with
+               --input-format stream-json`
+  `/tasks`   → exit 2, `error: /tasks is not available in print mode (it opens the interactive task
+               list); pass --disable-slash-commands to send /tasks to the model as literal text`
+  `/tmp/foo is a path …` → runs: only a name the CLI knows is expanded, not every leading `/`
+  ` /skills` (leading space) → still expanded: the CLI trims the space first
+  `\/skills`, `//skills`, `\u200b/skills` → run, unexpanded, and the escape is left in the text
+
+Only the first token of a message is looked at: the same `/skills` after the `<plan_mode>` preamble
+ran unexpanded (exit 0), which is why no escape is added to plan-mode prompts.

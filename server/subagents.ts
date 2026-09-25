@@ -18,14 +18,30 @@ import { mapToolDetail } from "./tools";
  *    "tool_calls":[{"name":"view_file","args":{"AbsolutePath":"\"/abs/a.txt\""}}]}
  *   {"step_index":2,"source":"MODEL","type":"GENERIC","status":"DONE","content":"…the result…"}
  *
+ * A child whose instruction arrives as a message rather than a user turn opens with
+ * `{"type":"SYSTEM_MESSAGE"}` instead of the `USER_INPUT` step — see `childInstruction`.
+ *
  * Lines are appended while the child runs, several at once, and a step may land before its
  * predecessor (step 2 before step 1 was observed), so nothing here may assume file order.
  */
 
-/** The three step types a child's transcript uses. Anything else is skipped and reported. */
+/**
+ * The step types a child's transcript uses. Anything else is skipped and reported.
+ *
+ * `SYSTEM_MESSAGE` is not plumbing to be dropped: it carries the child's own instruction, as
+ * `[Message] timestamp=… sender=<parent conversation> priority=… content=<prompt>` inside a
+ * `<SYSTEM_MESSAGE>` block, and a child that opens with it has no `USER_INPUT` step at all — 1.2.11
+ * delivers the parent's `invoke_subagent` prompt this way when it arrives as a message rather than
+ * a user turn (probed 2026-09-25, `fixtures/15-subagent-system-message.txt`).
+ *
+ * `EPHEMERAL_MESSAGE` carries no content: the step holds its own metadata and nothing else, so it
+ * is skipped like `GENERIC` rather than reported.
+ */
 const TRANSCRIPT_USER_INPUT = "USER_INPUT";
 const TRANSCRIPT_PLANNER_RESPONSE = "PLANNER_RESPONSE";
 const TRANSCRIPT_GENERIC = "GENERIC";
+const TRANSCRIPT_SYSTEM_MESSAGE = "SYSTEM_MESSAGE";
+const TRANSCRIPT_EPHEMERAL_MESSAGE = "EPHEMERAL_MESSAGE";
 
 /** The tool a child reports to its parent with; the parent conversation id is the recipient. */
 const SEND_MESSAGE = "send_message";
@@ -211,13 +227,11 @@ export function renderChild(
     const entry = sorted[position];
     if (entry === undefined) continue;
 
-    if (entry.type === TRANSCRIPT_USER_INPUT) {
-      // agy wraps the child's instructions in `<USER_REQUEST>` and appends its own metadata.
-      const match = /<USER_REQUEST>\s*([\s\S]*?)\s*<\/USER_REQUEST>/.exec(entry.content ?? "");
+    if (entry.type === TRANSCRIPT_USER_INPUT || entry.type === TRANSCRIPT_SYSTEM_MESSAGE) {
       items.push({
         type: "user_message",
         id: childItemId(context, entry.stepIndex, "user"),
-        text: (match?.[1] ?? entry.content ?? "").trim(),
+        text: childInstruction(entry),
       });
       continue;
     }
@@ -275,7 +289,9 @@ export function renderChild(
       continue;
     }
 
-    if (entry.type === TRANSCRIPT_GENERIC) continue;
+    // GENERIC holds a tool result (mapped with the call above it) and EPHEMERAL_MESSAGE holds
+    // nothing at all, so neither is a row of its own.
+    if (entry.type === TRANSCRIPT_GENERIC || entry.type === TRANSCRIPT_EPHEMERAL_MESSAGE) continue;
     if (!unknownTypes.includes(entry.type)) unknownTypes.push(entry.type);
   }
 
@@ -301,6 +317,27 @@ export function renderChild(
  */
 function childItemId(context: ChildContext, stepIndex: number, kind: string): string {
   return `agy-sub:${context.childConversationId}:${stepIndex}:${kind}`;
+}
+
+/**
+ * The instruction a child was given, out of the envelope agy delivered it in — `USER_INPUT` wraps
+ * it in `<USER_REQUEST>` and appends its own metadata, `SYSTEM_MESSAGE` wraps it as
+ * `[Message] timestamp=… sender=… priority=… content=<the prompt>` inside `<SYSTEM_MESSAGE>`.
+ * Either way only the instruction is a row: the envelope and its metadata are model-facing, and a
+ * step in neither shape keeps its own text rather than losing it to a changed envelope.
+ */
+function childInstruction(entry: TranscriptEntry): string {
+  const content = entry.content ?? "";
+  if (entry.type !== TRANSCRIPT_SYSTEM_MESSAGE) {
+    const match = /<USER_REQUEST>\s*([\s\S]*?)\s*<\/USER_REQUEST>/.exec(content);
+    return (match?.[1] ?? content).trim();
+  }
+  const block = /<SYSTEM_MESSAGE>([\s\S]*?)<\/SYSTEM_MESSAGE>/.exec(content)?.[1]?.trim();
+  if (block === undefined) return content.trim();
+  // The metadata is a `key=value` run before the payload, so the payload is everything after the
+  // first `content=`.
+  const payload = block.indexOf("content=");
+  return (payload === -1 ? block : block.slice(payload + "content=".length)).trim();
 }
 
 /** A transcript larger than this is not re-read on every tick. */

@@ -1,0 +1,30 @@
+fixtures/15-subagent-system-message.transcript.jsonl — 1.2.11 `SYSTEM_MESSAGE` probe (Task 10)
+
+Captured 2026-09-25 from
+~/.gemini/antigravity-cli/brain/17e88fd5-83b8-4ba0-a872-23f152233f00/.system_generated/logs/
+transcript_full.jsonl — the child an `invoke_subagent` call ran during that day's live health
+check, in this plugin's own repo. Read-only: nothing under `~/.gemini` was written or edited.
+
+Kept: step 0's envelope verbatim in shape, the child's first `run_command` step and its GENERIC
+result, and the child's final PLANNER_RESPONSE. Changed: the sender is the parent conversation id
+that fixtures/12 already uses, the workspace paths read `/Users/dev/agy-subagent-probe3`, the
+`ls -la` output is cut down to four lines, and the eleven middle run_command pairs are dropped.
+
+What the step is: the CLI delivers the parent's instruction to a child inside this envelope when it
+does not arrive as a `USER_INPUT` step —
+
+  The following is a <SYSTEM_MESSAGE> not actually sent by the user. …
+  <SYSTEM_MESSAGE>
+  [Message] timestamp=… sender=<parent conversation> priority=MESSAGE_PRIORITY_HIGH content=<prompt>
+  </SYSTEM_MESSAGE>
+
+— so the payload after `content=` is the child's prompt, and server/subagents.ts renders it as the
+child's first user row rather than reporting an unknown step type. The preamble and the
+`[Message] …` metadata are model-facing plumbing and are dropped, exactly as the `<USER_REQUEST>`
+unwrapping does for a `USER_INPUT` step.
+
+Checked across every child transcript on this machine on 2026-09-25 (12 children, 199 steps): five
+children carried a `SYSTEM_MESSAGE`, all of them at step 0, and none of those five carried a
+`USER_INPUT` — the two carriers are mutually exclusive, so the row cannot be a duplicate. Two steps
+were `EPHEMERAL_MESSAGE` and held nothing but their own metadata (`step_index`, `source`, `type`,
+`status`, `created_at`), so that type is skipped like `GENERIC`.

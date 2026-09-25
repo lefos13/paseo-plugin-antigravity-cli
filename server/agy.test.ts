@@ -44,3 +44,21 @@ describe("AgyProcess", () => {
     await process.dispose();
   });
 });
+
+describe("buildAgyArgs", () => {
+  it("includes --effort, which never rides with --model, and --agent when provided", async () => {
+    const { buildAgyArgs } = await import("./agy");
+    const args = buildAgyArgs({
+      cwd: "/test/cwd",
+      skipPermissions: false,
+      effort: "max",
+      agent: "code-reviewer",
+    });
+
+    expect(args).not.toContain("--model");
+    expect(args).toContain("--effort");
+    expect(args[args.indexOf("--effort") + 1]).toBe("max");
+    expect(args).toContain("--agent");
+    expect(args[args.indexOf("--agent") + 1]).toBe("code-reviewer");
+  });
+});

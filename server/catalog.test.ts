@@ -220,4 +220,25 @@ describe("resolveThinking", () => {
     });
     expect(resolveThinking(undefined, "high")).toEqual({ options: [] });
   });
+
+  it("handles max reasoning effort tier", async () => {
+    const { groupModels, parseModels, resolveThinking } = await import("./catalog");
+    const parsed = parseModels(
+      "custom-model-max\tCustom Model (Max)\ncustom-model-high\tCustom Model (High)\ncustom-model-low\tCustom Model (Low)\n",
+    );
+    const grouped = groupModels(parsed);
+    expect(grouped).toEqual([
+      {
+        id: "custom-model",
+        label: "Custom Model",
+        isDefault: false,
+        defaultThinkingOptionId: "high",
+        thinkingOptions: [
+          { id: "max", label: "Max", isDefault: false },
+          { id: "high", label: "High", isDefault: true },
+          { id: "low", label: "Low", isDefault: false },
+        ],
+      },
+    ]);
+  });
 });

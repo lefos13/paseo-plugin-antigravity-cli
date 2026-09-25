@@ -2,7 +2,7 @@ import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import {
   SubagentTranscript,
   decodeArgs,
@@ -21,6 +21,8 @@ const PARENT = "fff372d8-ed2b-4411-b145-836c9e0726e7";
 const CWD = "/Users/dev/agy-subagent-probe2";
 const CHILD_A = "15363ad9-3485-4249-aee7-a7605879f405";
 const CHILD_B = "3222e2ba-df81-4e8f-8321-4c1bf895f37e";
+/** The child of fixtures/15, whose instruction arrived in a `SYSTEM_MESSAGE` envelope. */
+const CHILD_C = "17e88fd5-83b8-4ba0-a872-23f152233f00";
 
 function captured(childConversationId: string): string {
   return readFileSync(`${fixturesDir}/12-subagent-${childConversationId}.transcript.jsonl`, "utf8");
@@ -161,6 +163,44 @@ describe("renderChild on the captured transcripts", () => {
     expect(capturedRender(CHILD_B).report).toContain("beta");
   });
 
+  it("renders the instruction that arrived as a system message", () => {
+    // fixtures/15: 1.2.11 delivers the parent's instruction in a `<SYSTEM_MESSAGE>` envelope, with
+    // `[Message] timestamp=… sender=… priority=… content=<the prompt>` inside it, and such a child
+    // has no `USER_INPUT` step at all — so this is the child's prompt, not an unknown step.
+    const text = readFileSync(
+      `${fixturesDir}/15-subagent-system-message.transcript.jsonl`,
+      "utf8",
+    );
+    const parsed = parseTranscriptLines(text);
+    expect(parsed.malformed).toBe(0);
+    const render = renderChild(parsed.entries, context(CHILD_C));
+
+    expect(render.unknownTypes).toEqual([]);
+    expect(render.items.map((item) => item.type)).toEqual([
+      "user_message",
+      "tool_call",
+      "assistant_message",
+    ]);
+    expect(render.items[0]).toMatchObject({
+      id: `agy-sub:${CHILD_C}:0:user`,
+      // The preamble and the `[Message] … priority=…` metadata around it are not the instruction.
+      text:
+        "Please read README.md in the current workspace (do not modify any files). Return:\n" +
+        "1. The title line of the file (e.g. the first header or # line).\n" +
+        "2. The number of top-level '##' (H2) sections in the file.",
+    });
+    expect(render.items[1]).toMatchObject({
+      name: "run_command",
+      status: "completed",
+      detail: { type: "shell", command: "ls -la /Users/dev/agy-subagent-probe3" },
+    });
+    expect(render.items[2]).toMatchObject({
+      id: `agy-sub:${CHILD_C}:3:msg`,
+      text: "I have analyzed `README.md` and sent the results back to the parent agent.",
+    });
+    expect(render.done).toBe(true);
+  });
+
   it("renders the same rows however the lines arrived", () => {
     // Captured from real streams: a child writes several steps at once and may write step 2 before
     // step 1. The render must not depend on file order.
@@ -247,6 +287,29 @@ describe("renderChild", () => {
     expect(render.unknownTypes).toEqual(["FOO"]);
     expect(render.items).toEqual([]);
     expect(render.done).toBe(false);
+  });
+
+  it("skips an empty ephemeral step rather than reporting it", () => {
+    // Probed 2026-09-25: 1.2.11 child transcripts carry `EPHEMERAL_MESSAGE` steps that hold
+    // nothing but their own metadata, so there is no row to make from one.
+    const render = renderChild(
+      [
+        entry({ stepIndex: 0, type: "EPHEMERAL_MESSAGE" }),
+        entry({ stepIndex: 1, type: "PLANNER_RESPONSE", content: "done here" }),
+      ],
+      context(CHILD_A),
+    );
+    expect(render.unknownTypes).toEqual([]);
+    expect(render.items.map((item) => item.type)).toEqual(["assistant_message"]);
+  });
+
+  it("keeps a system message's own text when the envelope is not the shape it knows", () => {
+    const first = (content: string) =>
+      renderChild([entry({ stepIndex: 0, type: "SYSTEM_MESSAGE", content })], context(CHILD_A)).items[0];
+    expect(first("just the instruction")).toMatchObject({ text: "just the instruction" });
+    expect(first("<SYSTEM_MESSAGE>\nno metadata here\n</SYSTEM_MESSAGE>")).toMatchObject({
+      text: "no metadata here",
+    });
   });
 
   it("does not treat a last response that still calls a tool as finished", () => {
@@ -344,6 +407,36 @@ describe("SubagentTranscript", () => {
     expect(published).toEqual([[`agy-sub:${CHILD}:0:user`]]);
     await firstRender;
     transcript.stop();
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  it("publishes a system-message transcript without reporting its step types", async () => {
+    const { dir, file } = tempTranscript();
+    writeFileSync(
+      file,
+      readFileSync(`${fixturesDir}/15-subagent-system-message.transcript.jsonl`, "utf8"),
+      "utf8",
+    );
+    // The warning this case is about is the one `publish` writes for a step type it does not know.
+    const logged = vi.spyOn(console, "error").mockImplementation(() => {});
+
+    const { transcript, published, degraded, lost, firstRender } = harness(file);
+    transcript.start();
+    await transcript.readFinal();
+    await firstRender;
+    transcript.stop();
+
+    expect(published.at(-1)).toEqual([
+      `agy-sub:${CHILD}:0:user`,
+      `agy-sub:${CHILD}:1:tool:0`,
+      `agy-sub:${CHILD}:3:msg`,
+    ]);
+    // Every step of a 1.2.11 child transcript is known: nothing is reported as unknown, and no
+    // line is unreadable either.
+    expect(logged).not.toHaveBeenCalled();
+    expect(degraded).toEqual([]);
+    expect(lost).toEqual([]);
+    vi.restoreAllMocks();
     rmSync(dir, { recursive: true, force: true });
   });
 });
