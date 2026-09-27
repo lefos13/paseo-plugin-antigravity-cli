@@ -4,3 +4,6 @@ tasks/todo.md
 .agents/
 tasks/subagents.md
 tasks/archive/
+tasks/
+docs/intent
+.ds_store
