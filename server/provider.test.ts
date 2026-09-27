@@ -29,9 +29,11 @@ import {
 } from "@getpaseo/plugin/server/provider";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { z } from "zod";
+import { DEFAULT_ACCOUNT_ID, addAccount, removeAccount, setActive } from "./accounts";
 import { createProvider, resolveChildCwd } from "./provider";
 import { parseTranscriptLines, renderChild } from "./subagents";
 import { writeConversationDb } from "./testing/conversation-db";
+import { installFakeSecurity, type FakeSecurity } from "./testing/fake-security";
 
 const fakeAgy = fileURLToPath(new URL("./testing/fake-agy.mjs", import.meta.url));
 const OFFERED = [
@@ -52,6 +54,7 @@ const originalHome = process.env.HOME;
 let tempDir: string;
 let argvFile: string;
 let argvLog: string;
+let envFile: string;
 let promptFile: string;
 let openConnections: ProviderConnection[];
 
@@ -64,6 +67,8 @@ let openConnections: ProviderConnection[];
  * here, so a violation fails the test that caused it instead of only the assertion that noticed.
  */
 let schemaViolations: string[];
+/** Account sessions sync their shadow home, whose Keychain must never be the real `/usr/bin/security`. */
+let security: FakeSecurity;
 
 function check(schema: z.ZodType, value: unknown, direction: "input" | "event"): void {
   const parsed = schema.safeParse(value);
@@ -98,6 +103,7 @@ beforeEach(() => {
   tempDir = mkdtempSync(join(tmpdir(), "antigravity-provider-"));
   argvFile = join(tempDir, "argv.json");
   argvLog = join(tempDir, "argv-log.jsonl");
+  envFile = join(tempDir, "env.json");
   promptFile = join(tempDir, "prompts.jsonl");
   schemaViolations = [];
 
@@ -106,10 +112,12 @@ beforeEach(() => {
   process.env.PASEO_HOME = join(tempDir, "paseo-home");
   process.env.FAKE_ARGV_FILE = argvFile;
   process.env.FAKE_ARGV_LOG = argvLog;
+  process.env.FAKE_ENV_FILE = envFile;
   process.env.FAKE_PROMPT_FILE = promptFile;
   delete process.env.FAKE_SCENARIO;
   delete process.env.FAKE_MODELS_OK;
   openConnections = [];
+  security = installFakeSecurity("linux");
 });
 
 afterEach(async () => {
@@ -120,6 +128,7 @@ afterEach(async () => {
     "PASEO_HOME",
     "FAKE_ARGV_FILE",
     "FAKE_ARGV_LOG",
+    "FAKE_ENV_FILE",
     "FAKE_PROMPT_FILE",
     "FAKE_SCENARIO",
     "FAKE_MODELS_OK",
@@ -149,6 +158,7 @@ afterEach(async () => {
   // The approval description is read from HOME, so a test that repoints it must not leak.
   if (originalHome === undefined) delete process.env.HOME;
   else process.env.HOME = originalHome;
+  security.restore();
   rmSync(tempDir, { recursive: true, force: true });
   // Last, so every test still cleans up after itself: a provider message the host cannot decode
   // is a session-killing bug, and it is reported with the test that produced it.
@@ -2948,13 +2958,16 @@ describe("subagents", () => {
     // A child's transcript directory usually does not exist yet when its follow starts, so the
     // tailer reaches the first line on its next tick — which can be after this turn has ended. The
     // row is therefore taken once it carries the report, not whenever the turn happens to finish.
+    // `childSessionId` arrives with the subagent tool line; `done` only with the report that
+    // follows it, so the wait has to ask for the same settled row the assertions below read.
     const withReport = await waitFor(() => {
       const last = subagentRows(events)
         .filter((row) => row.id === rows[0]?.id)
         .at(-1);
-      return last?.detail.type === "sub_agent" && last.detail.childSessionId !== undefined
-        ? last
-        : undefined;
+      if (last?.detail.type !== "sub_agent" || last.detail.childSessionId === undefined) {
+        return undefined;
+      }
+      return reported(last).done === true ? last : undefined;
     }, "the child's report to reach the row");
     expect(withReport).toMatchObject({
       status: "completed",
@@ -3583,5 +3596,425 @@ describe("resolveChildCwd", () => {
     expect(resolveChildCwd(PARENT, [])).toBe(PARENT);
     expect(resolveChildCwd(PARENT, ["   "])).toBe(PARENT);
     expect(resolveChildCwd(PARENT, undefined)).toBe(PARENT);
+  });
+});
+
+describe("accounts", () => {
+  /**
+   * The real home a test works against. Every account's shadow home mirrors it, so a test that
+   * repointed `HOME` to it proves both directions: what the child sees, and what the plugin reads.
+   */
+  function realHome(): string {
+    const home = join(tempDir, "home");
+    mkdirSync(join(home, ".gemini", "antigravity-cli"), { recursive: true });
+    process.env.HOME = home;
+    return home;
+  }
+
+  /** Where `server/accounts.ts` puts an account's shadow home, under this test's `PASEO_HOME`. */
+  function shadowHome(id: string): string {
+    return join(
+      process.env.PASEO_HOME ?? "",
+      "plugin-data",
+      "antigravity-cli",
+      "accounts",
+      id,
+      "home",
+    );
+  }
+
+  /** What the last `agy` launch received, as `testing/fake-agy.mjs` recorded it. */
+  function launchEnv(): { HOME?: string | null } {
+    return existsSync(envFile)
+      ? (JSON.parse(readFileSync(envFile, "utf8")) as { HOME?: string | null })
+      : {};
+  }
+
+  async function persistedAccount(
+    events: ProviderEvent[],
+  ): Promise<Extract<ProviderEvent, { type: "session.persistence" }>["persistence"]> {
+    return (
+      await waitFor(
+        () =>
+          events.find(
+            (event): event is Extract<ProviderEvent, { type: "session.persistence" }> =>
+              event.type === "session.persistence",
+          ),
+        "the persistence event",
+      )
+    ).persistence;
+  }
+
+  function settingsOf(events: ProviderEvent[]): readonly ProviderSetting[] {
+    const config = events.filter((event) => event.type === "session.config").at(-1);
+    return config?.type === "session.config" ? config.config.settings : [];
+  }
+
+  it("runs a new session under the active account's shadow home", async () => {
+    const home = realHome();
+    writeFileSync(join(home, ".gemini", "antigravity-cli", "settings.json"), "{}", "utf8");
+    addAccount("Work");
+    setActive("work");
+    // Created after the account was: it must be linked on the way to the launch, not only at add.
+    writeFileSync(join(home, ".real-entry-created-later"), "later\n", "utf8");
+
+    const { connection, events } = await connect();
+    await openSession(connection);
+    await prompt(connection, "hello");
+    await waitFor(() => turns(events, "completed")[0], "the turn to complete");
+
+    // End to end: the child itself resolved the account's home, and the shadow home it was given
+    // reads the real home's settings through the link.
+    expect(launchEnv().HOME).toBe(shadowHome("work"));
+    expect(statSync(join(shadowHome("work"), ".gemini")).isDirectory()).toBe(true);
+    expect(existsSync(join(shadowHome("work"), ".gemini", "antigravity-cli", "settings.json"))).toBe(
+      true,
+    );
+    expect(existsSync(join(shadowHome("work"), ".real-entry-created-later"))).toBe(true);
+    // The plugin's own process keeps the real home: only the child is ever repointed.
+    expect(process.env.HOME).toBe(home);
+  });
+
+  it("adds no HOME to a Default launch that had none configured", async () => {
+    realHome();
+    // Neither the config nor the environment names a home, which is Default's whole behaviour.
+    delete process.env.HOME;
+
+    const { connection, events } = await connect();
+    await openSession(connection);
+    await prompt(connection, "hello");
+    await waitFor(() => turns(events, "completed")[0], "the turn to complete");
+
+    expect(launchEnv()).toEqual({ HOME: null });
+  });
+
+  it("gives the account's home precedence over a HOME the session configures", async () => {
+    realHome();
+    addAccount("Work");
+    setActive("work");
+
+    const { connection, events } = await connect();
+    await openSession(connection, { env: { HOME: "/decoy" } });
+    await prompt(connection, "hello");
+    await waitFor(() => turns(events, "completed")[0], "the turn to complete");
+
+    expect(launchEnv().HOME).toBe(shadowHome("work"));
+  });
+
+  it("keeps today's precedence for Default: the session's own env wins", async () => {
+    realHome();
+
+    const { connection, events } = await connect();
+    await openSession(connection, { env: { HOME: "/decoy" } });
+    await prompt(connection, "hello");
+    await waitFor(() => turns(events, "completed")[0], "the turn to complete");
+
+    expect(launchEnv().HOME).toBe("/decoy");
+  });
+
+  it("emits the account beside the conversation id, and resumes under it from then on", async () => {
+    realHome();
+    addAccount("Work");
+    setActive("work");
+
+    const first = await connect();
+    await openSession(first.connection);
+    await prompt(first.connection, "hello");
+    await waitFor(() => turns(first.events, "completed")[0], "the first turn to complete");
+
+    const persistence = await persistedAccount(first.events);
+    expect(persistence).toEqual({
+      version: 1,
+      data: { conversationId: "11111111-2222-3333-4444-555555555555", accountId: "work" },
+    });
+
+    // Another account is active now; the resume must still run under the one that created it.
+    addAccount("Personal");
+    setActive("personal");
+    const second = await connect();
+    await openSession(second.connection, {}, {
+      sessionId: "session-2",
+      history: "replay",
+      persistence,
+    });
+    await prompt(second.connection, "again", "m2", "session-2");
+    await waitFor(() => turns(second.events, "completed", "session-2")[0], "the resumed turn");
+
+    expect(launchEnv().HOME).toBe(shadowHome("work"));
+    expect(readArgv()).toContain("--conversation");
+    const opened = second.events.find(
+      (event): event is Extract<ProviderEvent, { type: "session.opened" }> =>
+        event.type === "session.opened",
+    );
+    expect(opened?.persistence).toEqual(persistence);
+  });
+
+  it("keeps a session on its own account when the active one changes under it", async () => {
+    realHome();
+    addAccount("Work");
+    addAccount("Personal");
+    setActive("work");
+
+    const { connection, events } = await connect();
+    await openSession(connection);
+    await prompt(connection, "hello");
+    await waitFor(() => turns(events, "completed")[0], "the first turn");
+    expect(launchEnv().HOME).toBe(shadowHome("work"));
+
+    setActive("personal");
+    // A command turn replaces the CLI, so this is a fresh launch that must still see `work`.
+    await connection.send({
+      type: "session.prompt",
+      sessionId: "session-1",
+      prompt: {
+        clientMessageId: "c1",
+        delivery: "auto",
+        input: { type: "command", name: "plan", arguments: "say ok" },
+      },
+    } as ProviderInput);
+    await waitFor(() => turns(events, "completed")[1], "the command turn to complete");
+
+    expect(readArgvLog()).toHaveLength(2);
+    expect(launchEnv().HOME).toBe(shadowHome("work"));
+    expect(launchEnv().HOME).not.toBe(shadowHome("personal"));
+  });
+
+  it("resumes a conversation written before accounts existed under Default", async () => {
+    const home = realHome();
+    addAccount("Work");
+    setActive("work");
+
+    // A blob with no `accountId`: only Default could have written it, whatever is active now.
+    const persistence = {
+      version: 1,
+      data: { conversationId: "11111111-2222-3333-4444-555555555555" },
+    };
+    const { connection, events } = await connect();
+    await openSession(connection, { env: { HOME: "/decoy" } }, {
+      history: "replay",
+      persistence,
+    });
+    await prompt(connection, "hello");
+    await waitFor(() => turns(events, "completed")[0], "the turn to complete");
+
+    expect(launchEnv().HOME).toBe("/decoy");
+    expect(process.env.HOME).toBe(home);
+    expect(readArgv()).toContain("--conversation");
+    const opened = events.find(
+      (event): event is Extract<ProviderEvent, { type: "session.opened" }> =>
+        event.type === "session.opened",
+    );
+    expect(opened?.persistence).toEqual({
+      version: 1,
+      data: { conversationId: persistence.data.conversationId, accountId: "default" },
+    });
+  });
+
+  it("refuses to resume a conversation whose account is gone, naming it", async () => {
+    realHome();
+    addAccount("Work");
+    setActive("work");
+
+    const { connection, events } = await connect();
+    await openSession(connection);
+    await prompt(connection, "hello");
+    await waitFor(() => turns(events, "completed")[0], "the turn to complete");
+    const persistence = await persistedAccount(events);
+
+    removeAccount("work");
+
+    const second = await connect();
+    await expect(
+      openSession(second.connection, {}, {
+        sessionId: "session-2",
+        history: "replay",
+        persistence,
+      }),
+    ).rejects.toThrow(/account "work" no longer exists/);
+    // The failed open leaves nothing behind.
+    expect(second.events.some((event) => event.type === "session.opened")).toBe(false);
+
+    // The session that is already open cannot quietly continue either: the next launch would have
+    // no home to use, and a command turn is one (it replaces the CLI). The turn fails, naming the
+    // account, rather than falling back to another one.
+    await connection.send({
+      type: "session.prompt",
+      sessionId: "session-1",
+      prompt: {
+        clientMessageId: "c1",
+        delivery: "auto",
+        input: { type: "command", name: "plan", arguments: "say ok" },
+      },
+    } as ProviderInput);
+    const failed = await waitFor(() => turns(events, "failed")[0], "the failed turn");
+    expect(failed).toMatchObject({
+      error: { message: expect.stringContaining("Unknown account: work") },
+    });
+  });
+
+  function agentValues(events: ProviderEvent[]): string[] {
+    const setting = settingsOf(events).find((candidate) => candidate.id === "agent");
+    return setting?.type === "select" ? setting.options.map((option) => option.value) : [];
+  }
+
+  it("keeps skills and commands on the real home while an account is active", async () => {
+    const home = realHome();
+    // The shadow home mirrors `config`, `skills` and `antigravity-cli/skills`, but not
+    // `antigravity-cli/builtin`: a command found *only* here proves `homedir()` never moved.
+    const skill = join(home, ".gemini", "antigravity-cli", "builtin", "skills", "real-only");
+    mkdirSync(skill, { recursive: true });
+    writeFileSync(
+      join(skill, "SKILL.md"),
+      "---\nname: real-only\ndescription: Only in the real home\n---\n\nSteps.\n",
+      "utf8",
+    );
+    addAccount("Work");
+    setActive("work");
+
+    const { connection, events } = await connect();
+    await openSession(connection);
+
+    const published = events.find(
+      (event): event is Extract<ProviderEvent, { type: "session.commands" }> =>
+        event.type === "session.commands",
+    );
+    expect(published?.commands).toContainEqual({
+      name: "real-only",
+      description: "Only in the real home",
+    });
+    expect(process.env.HOME).toBe(home);
+  });
+
+  it("reads the approval label and workspace trust from the session's own account", async () => {
+    const home = realHome();
+    writeFileSync(
+      join(home, ".gemini", "antigravity-cli", "settings.json"),
+      JSON.stringify({ toolPermission: "request-review" }),
+      "utf8",
+    );
+    addAccount("Work");
+    // Seeded from the real file, then changed by `agy` and the accounts screen: work's own values.
+    writeFileSync(
+      join(shadowHome("work"), ".gemini", "antigravity-cli", "settings.json"),
+      JSON.stringify({ toolPermission: "turbo", trustedWorkspaces: [tempDir, realpathSync(tempDir)] }),
+      "utf8",
+    );
+    const agentDir = join(tempDir, ".agents", "agents");
+    mkdirSync(agentDir, { recursive: true });
+    writeFileSync(
+      join(agentDir, "reviewer.md"),
+      "---\nname: my-custom-agent\ndescription: Custom reviewer\n---\nPrompt here",
+      "utf8",
+    );
+
+    setActive("work");
+    const work = await connect();
+    await openSession(work.connection);
+
+    // A workspace agent is only offered once its own settings trust the workspace, and the approval
+    // label names the value `agy` under this account would actually use.
+    expect(
+      settingsOf(work.events).find((setting) => setting.id === "approvalPolicy"),
+    ).toMatchObject({ description: expect.stringContaining("turbo") });
+    expect(agentValues(work.events)).toContain("my-custom-agent");
+
+    // Default reads the real file, whose value the account's copy left alone.
+    setActive(DEFAULT_ACCOUNT_ID);
+    const plain = await connect();
+    await openSession(plain.connection, {}, { sessionId: "session-2" });
+
+    expect(
+      settingsOf(plain.events).find((setting) => setting.id === "approvalPolicy"),
+    ).toMatchObject({ description: expect.stringContaining("request-review") });
+    expect(agentValues(plain.events)).not.toContain("my-custom-agent");
+  });
+
+  it("backfills a held turn from the account's own brain directory, not the real home's", async () => {
+    realHome();
+    addAccount("Work");
+    setActive("work");
+    process.env.FAKE_SCENARIO = "background";
+    process.env.PASEO_ANTIGRAVITY_BACKFILL_DELAY_MS = "50";
+    process.env.FAKE_BACKGROUND_GATE = join(tempDir, "background-gate");
+
+    const { connection, events } = await connect();
+    await openSession(connection);
+    await prompt(connection, "start it");
+    await waitFor(() => turns(events, "completed")[0], "the held turn to complete");
+
+    // The child wrote its transcript under its own HOME. The turn can only complete if the poller
+    // looked in the account's brain directory: nothing was ever written under the real home.
+    expect([...paseoView(events).messages.values()]).toEqual([
+      "Starting the server.",
+      "The server is running (start it).",
+    ]);
+    const conversation = "11111111-2222-3333-4444-555555555555";
+    expect(
+      existsSync(join(shadowHome("work"), ".gemini", "antigravity-cli", "brain", conversation)),
+    ).toBe(true);
+    expect(
+      existsSync(join(process.env.HOME ?? "", ".gemini", "antigravity-cli", "brain", conversation)),
+    ).toBe(false);
+  });
+
+  it("lists every account's conversations, and an imported one resumes under its own account", async () => {
+    const home = realHome();
+    const imported = "61d5201e-47e0-405e-9cd3-2264e8b5d740";
+    writeConversationDb(home, [
+      {
+        conversationId: "11111111-1111-1111-1111-111111111111",
+        title: "Default conversation",
+        preview: "Written by the main account",
+        lastModifiedTime: "2026-09-23 09:00:00+00:00",
+        workspacePaths: [tempDir],
+      },
+    ]);
+    addAccount("Work");
+    // The account's own index, where its CLI writes it: under the shadow home's real `.gemini`.
+    writeConversationDb(shadowHome("work"), [
+      {
+        conversationId: imported,
+        title: "Work conversation",
+        preview: "Written by the work account",
+        lastModifiedTime: "2026-09-23 15:00:00+00:00",
+        workspacePaths: [tempDir],
+      },
+    ]);
+    // Default stays active: the resume must follow the row's own account, not the active one.
+    const { connection, events } = await connect();
+    await connection.send({ type: "sessions", requestId: "list-1", cwd: tempDir } as ProviderInput);
+    const listed = await waitFor(
+      () =>
+        events.find(
+          (event): event is Extract<ProviderEvent, { type: "sessions" }> => event.type === "sessions",
+        ),
+      "the session list",
+    );
+    expect(
+      listed.sessions.map((session) => {
+        const data = session.persistence.data;
+        const accountId =
+          typeof data === "object" && data !== null && !Array.isArray(data)
+            ? data.accountId
+            : undefined;
+        return [accountId, session.title];
+      }),
+    ).toEqual([
+      ["work", "Work conversation"],
+      ["default", "Default conversation"],
+    ]);
+
+    const second = await connect();
+    await openSession(second.connection, {}, {
+      sessionId: "session-2",
+      history: "replay",
+      persistence: listed.sessions[0]?.persistence,
+    });
+    await prompt(second.connection, "carry on", "m2", "session-2");
+    await waitFor(() => turns(second.events, "completed", "session-2")[0], "the imported turn");
+
+    expect(launchEnv().HOME).toBe(shadowHome("work"));
+    expect(readArgv()).toContain("--conversation");
+    expect(readArgv()[readArgv().indexOf("--conversation") + 1]).toBe(imported);
   });
 });

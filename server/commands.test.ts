@@ -71,7 +71,8 @@ function trustWorkspaces(...entries: readonly string[]): void {
 }
 
 async function agentNames(): Promise<string[]> {
-  return (await discoverAgents(workspace)).map((agent) => agent.name);
+  // The `.gemini` root a session's account would pass: Default is the real home.
+  return (await discoverAgents(workspace, join(home, ".gemini"))).map((agent) => agent.name);
 }
 
 async function names(): Promise<string[]> {
@@ -511,7 +512,7 @@ describe("discoverCommands", () => {
     writeAgent(join(home, ".gemini", "antigravity-cli", "agents", "helper.md"), "global-helper", "General helper");
     trustWorkspaces(workspace);
 
-    expect(await discoverAgents(workspace)).toEqual([
+    expect(await discoverAgents(workspace, join(home, ".gemini"))).toEqual([
       { name: "code-reviewer", description: "Reviews code thoroughly" },
       { name: "global-helper", description: "General helper" },
     ]);

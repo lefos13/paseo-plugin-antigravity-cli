@@ -21,6 +21,13 @@ import {
   type ProviderUsage,
 } from "@getpaseo/plugin/server/provider";
 import { TranscriptPoller, conversationTranscriptPath, renderBackfill } from "./backfill";
+import {
+  DEFAULT_ACCOUNT_ID,
+  accountGeminiRoot,
+  accountHome,
+  readAccounts,
+  syncShadowHome,
+} from "./accounts";
 import { AgyProcess } from "./agy";
 import { attachmentsDir, clearAttachments, writeAttachment } from "./attachments";
 import { readToolPermission } from "./agysettings";
@@ -149,11 +156,12 @@ export function createProvider(): ProviderRegistration {
     icon: "icon.svg",
     async getCatalogCacheKey(options) {
       // Catalog inputs carry no providerOptions, so a per-session `agyPath` cannot reach the
-      // catalog; the key follows the resolved binary, its build, and the environment override.
-      // `force` is the caller asking for a refresh, which the in-process cache must not answer
-      // with the list it already has.
+      // catalog; the key follows the resolved binary, its build, the environment override, and the
+      // active account — `agy models` runs under that account's `HOME`, so its list can change
+      // with it. `force` is the caller asking for a refresh, which the in-process cache must not
+      // answer with the list it already has.
       if (options.force) invalidateCatalogCache();
-      return catalogCacheKey();
+      return catalogCacheKey(readAccounts().active);
     },
     async connect(request) {
       if (!request.versions.includes(1)) {
@@ -188,6 +196,11 @@ interface Session {
    */
   selection: { model?: string; mode?: string; thinkingOption?: string };
   conversationId: string | null;
+  /**
+   * The account every launch of this session runs under: the one the conversation was created
+   * with on resume, the active one on open. Changing the active account never moves a session.
+   */
+  readonly accountId: string;
   /** `persist: false` keeps the conversation resumable but writes no timeline to disk. */
   readonly persist: boolean;
   transcript: TranscriptStore | null;
@@ -504,7 +517,13 @@ function validateAdmission(input: ProviderInput, state: ConnectionState): void {
 async function dispatch(input: ProviderInput, state: ConnectionState, emit: Emit): Promise<void> {
   switch (input.type) {
     case "catalog":
-      emit({ type: "catalog", requestId: input.requestId, catalog: await buildCatalog() });
+      // Not per session: the composer's global list is the active account's, exactly as a new
+      // session's launch would be.
+      emit({
+        type: "catalog",
+        requestId: input.requestId,
+        catalog: await buildCatalog(readAccounts().active),
+      });
       return;
     case "sessions":
       emit({
@@ -549,11 +568,12 @@ async function dispatch(input: ProviderInput, state: ConnectionState, emit: Emit
 function resolveEffort(
   model: string | undefined,
   effort: string | undefined,
+  accountId: string,
 ): { thinkingOption?: string; flag?: string; dropped?: string } {
   if (effort === undefined) return {};
   // Every way of saying "no model" behaves alike: the effort then belongs to the CLI's own choice.
   const selected = model !== undefined && model.length > 0 ? model : undefined;
-  const options = resolveThinking(selected ?? DEFAULT_MODEL_ID, undefined).options;
+  const options = resolveThinking(selected ?? DEFAULT_MODEL_ID, undefined, accountId).options;
   if (options.some((option) => option.id === effort)) {
     return selected === undefined ? { flag: effort } : { thinkingOption: effort };
   }
@@ -572,7 +592,7 @@ function resolveEffort(
  * open, on every configure, and before each launch, because the model may change in between.
  */
 function applyProviderEffort(session: Session): string | undefined {
-  const effort = resolveEffort(session.selection.model, session.effort);
+  const effort = resolveEffort(session.selection.model, session.effort, session.accountId);
   if (effort.dropped !== undefined && effort.dropped !== session.effortNotice) {
     session.effortNotice = effort.dropped;
     console.log(`[antigravity] ignoring effort "${session.effort}": ${effort.dropped}`);
@@ -591,12 +611,17 @@ async function openSession(
   emit: Emit,
 ): Promise<void> {
   const config = input.config;
-  const conversationId = readConversationId(input.persistence);
+  const conversationId = persistenceField(input.persistence, "conversationId");
+  // Resolved before anything else: an account that no longer exists has no home to launch in, and
+  // the failure has to name it rather than start a session that cannot run.
+  const accountId = resolveAccountId(input.persistence, conversationId);
   const options = readProviderOptions(config);
   const persist = config.persist !== false;
   const attachmentsDir = await prepareAttachmentsDir(input.sessionId);
   const addDirs = await checkAddDirs(options.addDirs);
-  const availableAgents = await discoverAgents(config.cwd);
+  // The workspace's own agents are hidden until the *session's* account trusts the workspace, and
+  // that trust lives in the account's settings file, which the launch's `HOME` selects.
+  const availableAgents = await discoverAgents(config.cwd, accountGeminiRoot(accountId));
 
   // Computed before this session joins the map: a conversation with no timeline of this plugin's
   // own is one that already existed in Antigravity. Another open session's rows may still be
@@ -626,6 +651,7 @@ async function openSession(
       thinkingOption: config.thinkingOption,
     },
     conversationId,
+    accountId,
     persist,
     transcript:
       persist && conversationId !== null ? await TranscriptStore.load(conversationId) : null,
@@ -665,7 +691,7 @@ async function openSession(
     sessionId: input.sessionId,
     capabilities: state.capabilities,
     restoration: "core",
-    persistence: persistenceFor(conversationId),
+    persistence: persistenceFor(conversationId, accountId),
     title: config.title,
     cwd: config.cwd,
   });
@@ -1309,8 +1335,9 @@ function scheduleBackfill(session: Session, turn: PendingTurn, emit: Emit): void
     console.log(
       `[antigravity] a tool has been running for ${delay / 1000}s; following the conversation transcript`,
     );
-    turn.backfill = new TranscriptPoller(conversationTranscriptPath(conversationId), (entries) =>
-      applyBackfill(session, turn, entries, emit),
+    turn.backfill = new TranscriptPoller(
+      conversationTranscriptPath(accountGeminiRoot(session.accountId), conversationId),
+      (entries) => applyBackfill(session, turn, entries, emit),
     );
     turn.backfill.start();
   }, delay);
@@ -1543,11 +1570,22 @@ function ensureProcess(session: Session, emit: Emit): AgyProcess {
 
   // Resolved first: the provider option's effort may be what supplies the tier the slug carries.
   const effort = applyProviderEffort(session);
-  const thinking = resolveThinking(session.selection.model, session.selection.thinkingOption);
+  const thinking = resolveThinking(
+    session.selection.model,
+    session.selection.thinkingOption,
+    session.accountId,
+  );
+  // Every launch re-syncs the account's shadow home, so a real entry added — or a link whose
+  // target is gone — never survives into the next `agy`. Default has no shadow home and no
+  // override: its env is exactly what Paseo configured.
+  const home = accountHome(session.accountId);
+  if (home !== null) syncShadowHome(session.accountId);
   const process = new AgyProcess(
     {
       cwd: session.config.cwd,
-      env: session.config.env,
+      // After `config.env`, because the account decides where `$HOME/.gemini` resolves even when
+      // the user set a HOME of their own in the session's environment.
+      env: home === null ? session.config.env : { ...session.config.env, HOME: home },
       model: thinking.slug,
       // Paseo's plan mode is the plugin's preamble, never agy's `--mode plan`: agy leaves that flag
       // without effect while slash-command expansion is disabled, and making it real is worse —
@@ -1620,7 +1658,7 @@ function handleAgyEvent(session: Session, event: AgyEvent, emit: Emit): void {
       emit({
         type: "session.persistence",
         sessionId: session.sessionId,
-        persistence: persistenceFor(event.conversationId),
+        persistence: persistenceFor(event.conversationId, session.accountId),
       });
       return;
     case "step_update":
@@ -2545,13 +2583,18 @@ function emitNotice(
 
 function configState(session: Session): ProviderConfigState {
   // The tier belongs to the selected model, so the composer's axis is that model's own tiers and
-  // the committed option is the one the next launch will actually pass.
-  const thinking = resolveThinking(session.selection.model, session.selection.thinkingOption);
+  // the committed option is the one the next launch will actually pass. Both the list and the tiers
+  // are the account's: another account's `agy models` output has no say in this session.
+  const thinking = resolveThinking(
+    session.selection.model,
+    session.selection.thinkingOption,
+    session.accountId,
+  );
   return {
     model: session.selection.model,
     mode: session.selection.mode ?? DEFAULT_MODE_ID,
     thinkingOption: thinking.option,
-    models: currentModels(),
+    models: currentModels(session.accountId),
     modes: MODES,
     thinkingOptions: thinking.options,
     settings: buildSettings(session),
@@ -2561,8 +2604,9 @@ function configState(session: Session): ProviderConfigState {
 function buildSettings(session: Session): readonly ProviderSetting[] {
   const policy = approvalPolicy(session);
   // Antigravity decides through its own setting unless the user overrides it here, so the row
-  // names that value rather than guessing at what a headless run will do.
-  const permission = readToolPermission() ?? "unknown";
+  // names that value rather than guessing at what a headless run will do. `agy` reads it from the
+  // account's home, so this does too: the value a launch would actually use.
+  const permission = readToolPermission(accountGeminiRoot(session.accountId)) ?? "unknown";
   return [
     ...(session.availableAgents.length > 0 || session.agent !== undefined
       ? [
@@ -2703,16 +2747,52 @@ function toErrorJson(error: ProviderError): JsonValue {
   };
 }
 
-function persistenceFor(conversationId: string | null): ProviderPersistence {
-  return { version: 1, data: { conversationId } };
+/**
+ * The blob Paseo stores for this conversation. `accountId` decides which account's home a resume
+ * launches in, so it travels with `conversationId`; the extra key needs no version bump, since a
+ * reader of version 1 already ignores what it does not know.
+ */
+function persistenceFor(conversationId: string | null, accountId: string): ProviderPersistence {
+  return { version: 1, data: { conversationId, accountId } };
 }
 
-function readConversationId(persistence: ProviderPersistence | undefined): string | null {
+/** A version-1 string field of the persistence blob, or `null` when it is absent or unusable. */
+function persistenceField(
+  persistence: ProviderPersistence | undefined,
+  key: "conversationId" | "accountId",
+): string | null {
   if (!persistence || persistence.version !== 1) return null;
   const data = persistence.data;
   if (typeof data !== "object" || data === null || Array.isArray(data)) return null;
-  const value = (data as Record<string, JsonValue>).conversationId;
+  const value = (data as Record<string, JsonValue>)[key];
   return typeof value === "string" && value.length > 0 ? value : null;
+}
+
+/**
+ * Which account a session runs under.
+ *
+ * A resume names the account that created the conversation. A persisted conversation with no
+ * `accountId` predates accounts and can only have run under Default, which is also what a
+ * conversation written by plain `agy` outside Paseo is. A brand-new conversation takes the
+ * host-wide active account. A named account that is gone fails the open rather than silently
+ * handing the conversation to another account.
+ */
+function resolveAccountId(
+  persistence: ProviderPersistence | undefined,
+  conversationId: string | null,
+): string {
+  const stored = persistenceField(persistence, "accountId");
+  if (stored !== null && stored !== DEFAULT_ACCOUNT_ID) {
+    if (!readAccounts().accounts.some((account) => account.id === stored)) {
+      throw new Error(
+        `Antigravity account "${stored}" no longer exists, so this conversation cannot be resumed`,
+      );
+    }
+    return stored;
+  }
+  if (stored !== null) return DEFAULT_ACCOUNT_ID;
+  if (conversationId !== null) return DEFAULT_ACCOUNT_ID;
+  return readAccounts().active;
 }
 
 function readProviderOptions(config: ProviderSessionConfig): {

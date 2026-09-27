@@ -1,5 +1,4 @@
 import { readFile, stat } from "node:fs/promises";
-import { homedir } from "node:os";
 import { join } from "node:path";
 import type { ProviderTimelineItem } from "@getpaseo/plugin/server/provider";
 import { decodeArgs, parseTranscriptLines, type TranscriptEntry } from "./subagents";
@@ -25,11 +24,14 @@ type JsonValue = string | number | boolean | null | JsonValue[] | { [key: string
 const PLANNER_RESPONSE = "PLANNER_RESPONSE";
 const GENERIC = "GENERIC";
 
-/** Where agy writes a conversation's transcript. */
-export function conversationTranscriptPath(conversationId: string): string {
+/**
+ * Where agy writes a conversation's transcript. The caller names the `.gemini` root: the real home
+ * for a Default session, the session's account shadow home otherwise — the CLI runs under that
+ * account's `HOME`, so its brain directory is the account's, not the daemon's.
+ */
+export function conversationTranscriptPath(geminiRoot: string, conversationId: string): string {
   return join(
-    homedir(),
-    ".gemini",
+    geminiRoot,
     "antigravity-cli",
     "brain",
     conversationId,

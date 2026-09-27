@@ -1,30 +1,72 @@
-import { chmodSync, copyFileSync, mkdtempSync, readFileSync, rmSync, utimesSync } from "node:fs";
+import { chmodSync, copyFileSync, mkdirSync, mkdtempSync, readFileSync, rmSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { DEFAULT_ACCOUNT_ID, addAccount, setActive } from "./accounts";
 import { parseModels } from "./catalog";
+import { installFakeSecurity, type FakeSecurity } from "./testing/fake-security";
 
 const fakeAgy = fileURLToPath(new URL("./testing/fake-agy.mjs", import.meta.url));
 
+const originalHome = process.env.HOME;
+const originalPaseoHome = process.env.PASEO_HOME;
+
 let tempDir: string;
+/** The daemon's home: the real one every account shadow home mirrors. */
+let home: string;
+let paseoHome: string;
+let envFile: string;
+/** Accounts are added here, so the shadow-home sync must never reach the real `/usr/bin/security`. */
+let security: FakeSecurity;
 
 beforeEach(() => {
   tempDir = mkdtempSync(join(tmpdir(), "antigravity-catalog-"));
+  home = join(tempDir, "home");
+  paseoHome = join(tempDir, "paseo-home");
+  envFile = join(tempDir, "env.json");
+  mkdirSync(home, { recursive: true });
+  // Repointed per test: HOME so a Default `agy models` runs under this test's real home, PASEO_HOME
+  // so the account store and the caches of the plugin never touch the developer's own data.
+  process.env.HOME = home;
+  process.env.PASEO_HOME = paseoHome;
   chmodSync(fakeAgy, 0o755);
   process.env.PASEO_ANTIGRAVITY_BIN = fakeAgy;
   delete process.env.FAKE_MODELS_OK;
   delete process.env.FAKE_MODELS_LOG;
+  delete process.env.FAKE_ENV_FILE;
   // Each case needs a cold module cache so the model list is discovered again; the tests then use
   // dynamic imports for the same reason, since a static one would keep the first case's cache.
   vi.resetModules();
+  // Installed after the reset: the static `./accounts` this file's `addAccount` comes from is the
+  // one that gets the fake, and the dynamically imported catalog only reads account paths.
+  security = installFakeSecurity("linux");
 });
 
 afterEach(() => {
-  delete process.env.PASEO_ANTIGRAVITY_BIN;
-  delete process.env.FAKE_MODELS_LOG;
+  security.restore();
+  for (const key of ["PASEO_ANTIGRAVITY_BIN", "FAKE_MODELS_LOG", "FAKE_MODELS_OK", "FAKE_ENV_FILE"]) {
+    delete process.env[key];
+  }
+  if (originalHome === undefined) delete process.env.HOME;
+  else process.env.HOME = originalHome;
+  if (originalPaseoHome === undefined) delete process.env.PASEO_HOME;
+  else process.env.PASEO_HOME = originalPaseoHome;
   rmSync(tempDir, { recursive: true, force: true });
 });
+
+/** The shadow home of an account created by these tests, as `server/accounts.ts` lays it out. */
+function shadowHome(id: string): string {
+  return join(paseoHome, "plugin-data", "antigravity-cli", "accounts", id, "home");
+}
+
+/** The `HOME` the last `agy` run recorded, which is how a test tells the accounts apart. */
+function launchedHome(): string | null | undefined {
+  const recorded: unknown = JSON.parse(readFileSync(envFile, "utf8"));
+  if (typeof recorded !== "object" || recorded === null || !("HOME" in recorded)) return undefined;
+  const value = recorded.HOME;
+  return typeof value === "string" ? value : null;
+}
 
 describe("parseModels", () => {
   it("reads the tab separated slug and label pairs", () => {
@@ -74,13 +116,13 @@ describe("catalog cache", () => {
     copyFileSync(fakeAgy, second);
     const { catalogCacheKey } = await import("./catalog");
 
-    const key = catalogCacheKey(first);
+    const key = catalogCacheKey(DEFAULT_ACCOUNT_ID, first);
     expect(key).toContain(first);
-    expect(catalogCacheKey(second)).not.toBe(key);
+    expect(catalogCacheKey(DEFAULT_ACCOUNT_ID, second)).not.toBe(key);
 
     // A CLI update rewrites the binary, so the build identity is part of the key.
     utimesSync(first, new Date("2026-01-01T00:00:00Z"), new Date("2026-01-01T00:00:00Z"));
-    expect(catalogCacheKey(first)).not.toBe(key);
+    expect(catalogCacheKey(DEFAULT_ACCOUNT_ID, first)).not.toBe(key);
   });
 
   it("discovers models again when the binary changes, and when a caller forces it", async () => {
@@ -93,22 +135,83 @@ describe("catalog cache", () => {
     copyFileSync(fakeAgy, second);
     const { buildCatalog, catalogCacheKey } = await import("./catalog");
 
-    await buildCatalog(first);
-    await buildCatalog(first);
+    await buildCatalog(DEFAULT_ACCOUNT_ID, first);
+    await buildCatalog(DEFAULT_ACCOUNT_ID, first);
     expect(modelsRuns(logPath)).toBe(1);
 
     // A different binary may report a different list, so it must not be served from the cache.
-    await buildCatalog(second);
+    await buildCatalog(DEFAULT_ACCOUNT_ID, second);
     expect(modelsRuns(logPath)).toBe(2);
 
     const { createProvider } = await import("./provider");
     const registration = createProvider();
-    expect(await registration.getCatalogCacheKey?.({ scope: "global" })).toBe(catalogCacheKey());
+    expect(await registration.getCatalogCacheKey?.({ scope: "global" })).toBe(
+      catalogCacheKey(DEFAULT_ACCOUNT_ID),
+    );
 
     // An explicit refresh bypasses our cache as well as the daemon's.
     await registration.getCatalogCacheKey?.({ scope: "global", force: true });
-    await buildCatalog(second);
+    await buildCatalog(DEFAULT_ACCOUNT_ID, second);
     expect(modelsRuns(logPath)).toBe(3);
+  });
+
+  it("keeps a list per account, runs `agy models` under each home, and keys Paseo on the active one", async () => {
+    process.env.FAKE_MODELS_OK = "1";
+    process.env.FAKE_ENV_FILE = envFile;
+    const logPath = join(tempDir, "models.log");
+    process.env.FAKE_MODELS_LOG = logPath;
+    addAccount("Work");
+    const { buildCatalog, catalogCacheKey, currentModels } = await import("./catalog");
+
+    // Default is the real home and spawns with today's env: no HOME is invented for it.
+    await buildCatalog(DEFAULT_ACCOUNT_ID);
+    expect(launchedHome()).toBe(home);
+    expect(modelsRuns(logPath)).toBe(1);
+    await buildCatalog(DEFAULT_ACCOUNT_ID);
+    expect(modelsRuns(logPath)).toBe(1);
+
+    // A different account means a different `$HOME`, so the list has to be discovered again.
+    await buildCatalog("work");
+    expect(launchedHome()).toBe(shadowHome("work"));
+    expect(modelsRuns(logPath)).toBe(2);
+
+    // Switching back is served from Default's own entry, not a rediscovery or the bare fallback.
+    await buildCatalog(DEFAULT_ACCOUNT_ID);
+    expect(modelsRuns(logPath)).toBe(2);
+    expect(currentModels(DEFAULT_ACCOUNT_ID).map((model) => model.id)).toContain("fake-model-x");
+    expect(currentModels("work").map((model) => model.id)).toContain("fake-model-x");
+    // An account that was never discovered has no entry of its own: the bundled list stands in.
+    expect(currentModels("personal").map((model) => model.id)).not.toContain("fake-model-x");
+
+    // The account is part of Paseo's rediscovery key, so switching accounts triggers a discovery
+    // there too; the same account and binary keeps the key stable.
+    addAccount("Personal");
+    const { createProvider } = await import("./provider");
+    const registration = createProvider();
+    const asDefault = await registration.getCatalogCacheKey?.({ scope: "global" });
+    expect(asDefault).toBe(catalogCacheKey(DEFAULT_ACCOUNT_ID));
+    expect(catalogCacheKey("work")).not.toBe(asDefault);
+
+    setActive("work");
+    expect(await registration.getCatalogCacheKey?.({ scope: "global" })).toBe(
+      catalogCacheKey("work"),
+    );
+  });
+
+  it("falls back to the bundled list for an account whose `agy models` fails", async () => {
+    addAccount("Work");
+    // Dynamic import, as everywhere in this file: the catalog cache is module state that the
+    // `vi.resetModules()` above is what clears between cases.
+    const { FALLBACK_MODELS, buildCatalog } = await import("./catalog");
+
+    const catalog = await buildCatalog("work");
+
+    // A signed-out account (or any other failure) is exactly a failing `agy models`: the bundled
+    // list, discovered rows never having existed.
+    expect(catalog.models.map((model) => model.id)).toEqual(
+      FALLBACK_MODELS.map((model) => model.id),
+    );
+    expect(catalog.models.map((model) => model.id)).not.toContain("fake-model-x");
   });
 });
 
@@ -117,7 +220,7 @@ describe("buildCatalog", () => {
     process.env.FAKE_MODELS_OK = "1";
     const { buildCatalog } = await import("./catalog");
 
-    const catalog = await buildCatalog();
+    const catalog = await buildCatalog(DEFAULT_ACCOUNT_ID);
 
     // Every `<family>-high|medium|low` row becomes one model; the tier suffix becomes the option.
     expect(catalog.models.map((model) => model.id)).toEqual([
@@ -163,7 +266,7 @@ describe("buildCatalog", () => {
   it("falls back to the bundled list when the CLI cannot list models", async () => {
     const { buildCatalog } = await import("./catalog");
 
-    const catalog = await buildCatalog();
+    const catalog = await buildCatalog(DEFAULT_ACCOUNT_ID);
 
     // The bundled list is grouped exactly like a discovered one.
     expect(catalog.models.map((model) => model.id)).toEqual([
@@ -187,38 +290,38 @@ describe("resolveThinking", () => {
     const { resolveThinking } = await import("./catalog");
 
     // The family plus an explicit tier.
-    expect(resolveThinking("gemini-3.8-flash", "low")).toMatchObject({
+    expect(resolveThinking("gemini-3.8-flash", "low", DEFAULT_ACCOUNT_ID)).toMatchObject({
       slug: "gemini-3.8-flash-low",
       option: "low",
     });
     // No option: the family's default tier.
-    expect(resolveThinking("gemini-3.8-flash", undefined)).toMatchObject({
+    expect(resolveThinking("gemini-3.8-flash", undefined, DEFAULT_ACCOUNT_ID)).toMatchObject({
       slug: "gemini-3.8-flash-high",
       option: "high",
     });
     // A slug persisted before tiers existed launches unchanged, and reports its own tier.
-    expect(resolveThinking("gemini-3.8-flash-high", undefined)).toMatchObject({
+    expect(resolveThinking("gemini-3.8-flash-high", undefined, DEFAULT_ACCOUNT_ID)).toMatchObject({
       slug: "gemini-3.8-flash-high",
       option: "high",
     });
     // A tier chosen afterwards replaces the slug's own tier.
-    expect(resolveThinking("gemini-3.8-flash-high", "medium")).toMatchObject({
+    expect(resolveThinking("gemini-3.8-flash-high", "medium", DEFAULT_ACCOUNT_ID)).toMatchObject({
       slug: "gemini-3.8-flash-medium",
       option: "medium",
     });
     // A stale option the model does not have is ignored rather than invented into a slug.
-    expect(resolveThinking("gemini-3.1-pro", "low").slug).toBe("gemini-3.1-pro-low");
-    expect(resolveThinking("gemini-3.1-pro", "medium").slug).toBe("gemini-3.1-pro-high");
-    expect(resolveThinking("claude-sonnet-4-6", "high")).toEqual({
+    expect(resolveThinking("gemini-3.1-pro", "low", DEFAULT_ACCOUNT_ID).slug).toBe("gemini-3.1-pro-low");
+    expect(resolveThinking("gemini-3.1-pro", "medium", DEFAULT_ACCOUNT_ID).slug).toBe("gemini-3.1-pro-high");
+    expect(resolveThinking("claude-sonnet-4-6", "high", DEFAULT_ACCOUNT_ID)).toEqual({
       slug: "claude-sonnet-4-6",
       options: [],
     });
     // `-medium` here belongs to the id, so no tier may be appended or substituted.
-    expect(resolveThinking("gpt-oss-120b-medium", "high")).toMatchObject({
+    expect(resolveThinking("gpt-oss-120b-medium", "high", DEFAULT_ACCOUNT_ID)).toMatchObject({
       slug: "gpt-oss-120b-medium",
       options: [],
     });
-    expect(resolveThinking(undefined, "high")).toEqual({ options: [] });
+    expect(resolveThinking(undefined, "high", DEFAULT_ACCOUNT_ID)).toEqual({ options: [] });
   });
 
   it("handles max reasoning effort tier", async () => {

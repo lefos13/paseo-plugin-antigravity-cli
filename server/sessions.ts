@@ -1,8 +1,9 @@
-import { homedir } from "node:os";
+import { existsSync } from "node:fs";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { fileURLToPath } from "node:url";
 import type { ProviderSessionSummary } from "@getpaseo/plugin/server/provider";
+import { accountGeminiRoot, listAccounts } from "./accounts";
 
 const DEFAULT_LIMIT = 50;
 
@@ -32,8 +33,12 @@ export interface ConversationQuery {
 
 /**
  * Reads Antigravity's own conversation index so an existing conversation can be opened in Paseo.
- * The database is only ever read (the CLI owns it), and every failure - missing file, unexpected
- * schema, locked or corrupt pages - yields an empty list plus a log line, never a thrown error.
+ * Every account keeps its own index under its own `.gemini`, so the conversations of Default and of
+ * every stored account are merged, newest first, and each row carries the account that owns it:
+ * opening it must resume the conversation under the account that created it. The databases are only
+ * ever read (the CLI owns them), and every failure - missing file, unexpected schema, locked or
+ * corrupt pages - yields no rows for that account plus a log line, never a thrown error. An account
+ * that has not run yet has no index at all, which is normal and therefore not logged.
  */
 export function listConversations(options: ConversationQuery): ProviderSessionSummary[] {
   const rows = readConversations();
@@ -43,7 +48,7 @@ export function listConversations(options: ConversationQuery): ProviderSessionSu
   const limit = requested > 0 ? Math.floor(requested) : DEFAULT_LIMIT;
 
   const summaries: ProviderSessionSummary[] = [];
-  for (const row of rows) {
+  for (const { row, accountId } of rows) {
     const workspace = firstWorkspacePath(row.workspace_uris);
     if (
       wantedCwd !== undefined &&
@@ -62,7 +67,7 @@ export function listConversations(options: ConversationQuery): ProviderSessionSu
     const preview = row.preview.trim();
     const updatedAt = isoTimestamp(row.last_modified_time);
     summaries.push({
-      persistence: { version: 1, data: { conversationId: row.conversation_id } },
+      persistence: { version: 1, data: { conversationId: row.conversation_id, accountId } },
       cwd: workspace ?? options.cwd ?? "",
       ...(title.length > 0 ? { title } : {}),
       ...(preview.length > 0 ? { description: preview } : {}),
@@ -73,14 +78,40 @@ export function listConversations(options: ConversationQuery): ProviderSessionSu
   return summaries;
 }
 
-function readConversations(): ConversationRow[] {
-  const path = join(homedir(), ".gemini", "antigravity-cli", "conversation_summaries.db");
+/** One conversation index row together with the account whose `agy` wrote it. */
+interface AccountRow {
+  row: ConversationRow;
+  accountId: string;
+}
+
+/**
+ * Every account's index, in one newest-first list. Each index is already sorted, so the merge is a
+ * sort of the concatenation; the sort is stable, which leaves rows of the same timestamp in the
+ * order they were read (Default first).
+ */
+function readConversations(): AccountRow[] {
+  const rows: AccountRow[] = [];
+  for (const account of listAccounts()) {
+    for (const row of readAccountConversations(account.id)) {
+      rows.push({ row, accountId: account.id });
+    }
+  }
+  return rows.sort((a, b) => modifiedTime(b.row) - modifiedTime(a.row));
+}
+
+function readAccountConversations(accountId: string): ConversationRow[] {
+  const path = join(accountGeminiRoot(accountId), "antigravity-cli", "conversation_summaries.db");
+  // An account whose CLI has never run has no index at all, which is its normal state, not a
+  // fault: sqlite would only report it as "unable to open database file", so it is checked first.
+  if (!existsSync(path)) return [];
   let db: DatabaseSync | undefined;
   try {
     db = new DatabaseSync(path, { readOnly: true });
     return db.prepare(SELECT_CONVERSATIONS).all().map(toRow);
   } catch (error) {
-    console.error(`[antigravity] could not read Antigravity conversations: ${describe(error)}`);
+    console.error(
+      `[antigravity] could not read Antigravity conversations of account ${accountId}: ${describe(error)}`,
+    );
     return [];
   } finally {
     try {
@@ -89,6 +120,12 @@ function readConversations(): ConversationRow[] {
       // A database that never opened has nothing to close.
     }
   }
+}
+
+/** Antigravity's timestamp as a comparable number; an unparsable one sorts last. */
+function modifiedTime(row: ConversationRow): number {
+  const parsed = Date.parse(row.last_modified_time.trim().replace(" ", "T"));
+  return Number.isNaN(parsed) ? 0 : parsed;
 }
 
 function toRow(value: Record<string, unknown>): ConversationRow {

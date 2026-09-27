@@ -1,6 +1,7 @@
 import { readdir, readFile, stat } from "node:fs/promises";
 import { homedir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
+import { readSettingsFile } from "./agysettings";
 
 /**
  * The slash commands the composer offers. Paseo sends one as `/<name> <arguments>`, which the CLI
@@ -515,24 +516,23 @@ export interface DiscoveredAgent {
 const GLOBAL_AGENT_ROOTS = [".gemini/antigravity-cli/agents", ".gemini/config/agents"] as const;
 
 /**
- * The CLI's settings file. A workspace's own agents, and `--agent` itself, do nothing until the
- * workspace is listed in its `trustedWorkspaces` — probed 2026-09-25: with the workspace untrusted,
- * `agy agents` printed nothing and `--agent <workspace agent>` answered as the default agent.
+ * The custom agents the composer offers, in the order `agy agents` lists them. `geminiRoot` is the
+ * root whose `settings.json` decides whether the workspace is trusted: the session's account one,
+ * because `agy` launches under that account's `HOME`. The global agent roots stay on the real home,
+ * which every account shares. Probed 2026-09-25 on 1.2.11 (`fixtures/13-agents.txt`): the
+ * workspace's agents come from the same four launch-directory roots the CLI reads skills from —
+ * `.agents`, `.agent` and `_agents` were verified for agents, and `_agent` is read on the strength
+ * of the skill probe — and are hidden until that workspace is trusted, while the global roots are
+ * always read. An agent is `<name>.md` or `<name>/agent.md`, with the frontmatter `name` deciding
+ * what `--agent` is called with.
  */
-const SETTINGS_FILE = ".gemini/antigravity-cli/settings.json";
-
-/**
- * The custom agents the composer offers, in the order `agy agents` lists them. Probed 2026-09-25 on
- * 1.2.11 (`fixtures/13-agents.txt`): the workspace's agents come from the same four launch-directory
- * roots the CLI reads skills from — `.agents`, `.agent` and `_agents` were verified for agents, and
- * `_agent` is read on the strength of the skill probe — and are hidden until that workspace is
- * trusted, while the global roots are always read. An agent is `<name>.md` or `<name>/agent.md`,
- * with the frontmatter `name` deciding what `--agent` is called with.
- */
-export async function discoverAgents(cwd: string): Promise<readonly DiscoveredAgent[]> {
+export async function discoverAgents(
+  cwd: string,
+  geminiRoot: string,
+): Promise<readonly DiscoveredAgent[]> {
   const agents = new Map<string, DiscoveredAgent>();
 
-  if (await isWorkspaceTrusted(cwd)) {
+  if (await isWorkspaceTrusted(geminiRoot, cwd)) {
     for (const root of WORKSPACE_ROOTS) {
       await collectAgents(join(cwd, root, "agents"), agents);
     }
@@ -546,20 +546,17 @@ export async function discoverAgents(cwd: string): Promise<readonly DiscoveredAg
 }
 
 /**
- * Whether the CLI reads the workspace's own agents. The store's `isUnder` and `matchedPrefixLen`
- * (jetski 1.2.11) compare the workspace against each `trustedWorkspaces` entry, so an entry covers
- * the paths beneath it — which is what makes the entry this machine's settings file holds, a
- * directory of many checkouts, useful at all. Read off the binary rather than probed, and paths are
- * compared as written: another spelling of the same directory, through a symlink, is not trusted.
+ * Whether the CLI reads the workspace's own agents: with the workspace untrusted, `agy agents`
+ * printed nothing and `--agent <workspace agent>` answered as the default agent (probed
+ * 2026-09-25). The store's `isUnder` and `matchedPrefixLen` (jetski 1.2.11) compare the workspace
+ * against each `trustedWorkspaces` entry, so an entry covers the paths beneath it — which is what
+ * makes the entry this machine's settings file holds, a directory of many checkouts, useful at all.
+ * Read off the binary rather than probed, and paths are compared as written: another spelling of
+ * the same directory, through a symlink, is not trusted.
  */
-async function isWorkspaceTrusted(cwd: string): Promise<boolean> {
-  let parsed: unknown;
-  try {
-    parsed = JSON.parse(await readFile(join(homedir(), SETTINGS_FILE), "utf8"));
-  } catch {
-    return false;
-  }
-  if (typeof parsed !== "object" || parsed === null || !("trustedWorkspaces" in parsed)) return false;
+async function isWorkspaceTrusted(geminiRoot: string, cwd: string): Promise<boolean> {
+  const parsed = readSettingsFile(geminiRoot);
+  if (parsed === null) return false;
   const trusted = parsed.trustedWorkspaces;
   if (!Array.isArray(trusted)) return false;
   const workspace = resolve(cwd);

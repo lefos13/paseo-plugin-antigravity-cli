@@ -5,6 +5,8 @@
  *
  *   FAKE_ARGV_FILE       when set, the received argv is written here so tests can assert flags
  *   FAKE_ARGV_LOG        when set, every launch appends its argv here, one JSON array per line
+ *   FAKE_ENV_FILE        when set, the launch's own `HOME` is written here as JSON, which is how a
+ *                        test tells an account's shadow home from the real one (or its absence)
  *   FAKE_SCENARIO        text (default) | tool | edit | edit-applied | queued | interrupt | error
  *                        | fail | tool-hang | stdin-closed | schema | schema-invalid | subagent
  *   FAKE_SUBAGENT_COUNT       children the `subagent` scenario spawns (default 1)
@@ -31,10 +33,13 @@
  *   FAKE_TOOL_END        how `tool-hang` ends the turn: interrupt (default) | error | die
  *   FAKE_MODELS_OK       "1" makes `agy models` succeed, anything else makes it fail
  *   FAKE_MODELS_LOG      when set, every `agy models` run appends a line here
+ *   FAKE_QUOTA           the answer to `-p /usage --output-format json` (server/quota.ts):
+ *                        ok (default) | signed-out | error | agent-turn | garbage
+ *   FAKE_QUOTA_LOG       when set, every `/usage` run appends its argv, HOME and cwd here
  *   FAKE_RESULT_INPUT_TOKENS  input_tokens of the terminal result (default 15466)
  *   FAKE_STEP_INPUT_TOKENS    input_tokens of an agent_response step (default: the result's)
  */
-import { appendFileSync, closeSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { appendFileSync, closeSync, existsSync, mkdirSync, readFileSync, writeFileSync, writeSync } from "node:fs";
 import { createServer } from "node:net";
 import { homedir } from "node:os";
 import { basename, dirname, join } from "node:path";
@@ -51,6 +56,12 @@ if (process.env.FAKE_ARGV_FILE) {
 // Every launch, in order: a restart test needs to see the flags of each process, not just the last.
 if (process.env.FAKE_ARGV_LOG) {
   appendFileSync(process.env.FAKE_ARGV_LOG, `${JSON.stringify(argv)}\n`, "utf8");
+}
+
+// Like a real `agy`, this process resolves `$HOME/.gemini` — so a test can assert which home it was
+// launched under (and that no HOME was invented where none was configured).
+if (process.env.FAKE_ENV_FILE) {
+  writeFileSync(process.env.FAKE_ENV_FILE, JSON.stringify({ HOME: process.env.HOME ?? null }), "utf8");
 }
 
 /** The schema file `--json-schema` points at, when this process was launched with one. */
@@ -84,6 +95,150 @@ if (argv[0] === "models") {
   }
   process.stderr.write("error: could not list models\n");
   process.exit(1);
+}
+
+/** A read-only command turn spends nothing, so its token counters are all zero. */
+const zeroUsage = {
+  input_tokens: 0,
+  output_tokens: 0,
+  thinking_tokens: 0,
+  cache_read_tokens: 0,
+  total_tokens: 0,
+};
+
+/**
+ * The quota read: `agy -p /usage --output-format json`. It is its own short-lived process, never
+ * the stream-json session (see server/quota.ts), so it is answered here and the process exits
+ * without reading stdin. Output is flushed before exiting: a `process.exit()` right after a write to
+ * a pipe truncates it.
+ */
+if (argv[0] === "-p" && argv[1] === "/usage") {
+  if (process.env.FAKE_QUOTA_LOG) {
+    appendFileSync(
+      process.env.FAKE_QUOTA_LOG,
+      `${JSON.stringify({ argv, HOME: process.env.HOME ?? null, cwd: process.cwd() })}\n`,
+      "utf8",
+    );
+  }
+  // A synchronous write, so the payload is in the pipe before the process is gone: `execFile` would
+  // otherwise race an async stdout write against `process.exit`.
+  const emit = (fd, text, code) => {
+    writeSync(fd, text);
+    process.exit(code);
+  };
+  const json = (payload) => emit(1, `${JSON.stringify(payload)}\n`, 0);
+
+  switch (process.env.FAKE_QUOTA ?? "ok") {
+    case "signed-out":
+      // A logged-out CLI refuses to read quota. Which channel it uses is not something the plugin
+      // relies on, so the fixture puts the line on stderr and exits non-zero.
+      emit(2, "error: You are not logged into Antigravity. Please sign in.\n", 1);
+      break;
+    case "error":
+      // `status: ERROR` carrying `agy`'s own message and no command payload: the shape a
+      // service-side quota failure has.
+      json({
+        ...quotaEnvelope(),
+        status: "ERROR",
+        response: "",
+        error: "no quota summary is available for this account",
+        duration_seconds: 0.4,
+      });
+      break;
+    case "agent-turn":
+      // What `/usage` becomes when slash expansion is disabled: a real agent turn that spends quota.
+      json({
+        ...quotaEnvelope(),
+        response: "Antigravity counts your usage against a weekly and a five hour limit.\n",
+        duration_seconds: 12.5,
+        num_turns: 1,
+        usage: { ...zeroUsage, input_tokens: 15466, output_tokens: 27, total_tokens: 15518 },
+      });
+      break;
+    case "garbage":
+      emit(1, "not json at all\n", 0);
+      break;
+    default:
+      json(quotaPayload());
+  }
+  // `emit` exits the process, so nothing below it runs.
+}
+
+/** The top-level fields every `/usage` result has, without the command payload. */
+function quotaEnvelope() {
+  return {
+    conversation_id: "99999999-0000-4111-8222-333333333333",
+    status: "SUCCESS",
+    response: [
+      "Gemini Models\tWeekly Limit Remaining\t45%\t2026-09-30T09:43:54Z",
+      "Gemini Models\tFive Hour Limit Remaining\t100%\t2026-09-27T16:10:09Z",
+      "Claude and GPT models\tWeekly Limit Remaining\t87%\t2026-09-30T14:42:32Z",
+      "Claude and GPT models\tFive Hour Limit Remaining\t100%\t2026-09-27T16:10:09Z",
+      "",
+    ].join("\n"),
+    duration_seconds: 4.2,
+    num_turns: 0,
+    usage: zeroUsage,
+  };
+}
+
+/**
+ * Copied from `agy -p '/usage' --output-format json` on Antigravity CLI 1.2.12
+ * (`tasks/quota-research/agy-local.md` §1.3). One bucket's `remaining_fraction` is deliberately
+ * absent, so a test can assert that the plugin drops it instead of showing it as 0 %.
+ */
+function quotaPayload() {
+  return {
+    ...quotaEnvelope(),
+    command: {
+      name: "usage",
+      data: {
+        description: "Model quota usage",
+        groups: [
+          {
+            name: "Gemini Models",
+            description: "Gemini quota",
+            buckets: [
+              {
+                id: "gemini-weekly",
+                name: "Weekly Limit Remaining",
+                description: "it will fully refresh in 2 days, 22 hours.",
+                window: "weekly",
+                remaining_fraction: 0.4486817717552185,
+                reset_time: "2026-09-30T09:43:54Z",
+              },
+              {
+                id: "gemini-5h",
+                name: "Five Hour Limit Remaining",
+                window: "5h",
+                remaining_fraction: 1,
+                reset_time: "2026-09-27T16:10:09Z",
+              },
+            ],
+          },
+          {
+            name: "Claude and GPT models",
+            description: "Third party model quota",
+            buckets: [
+              {
+                id: "3p-weekly",
+                name: "Weekly Limit Remaining",
+                window: "weekly",
+                remaining_fraction: 0.8659847974777222,
+                reset_time: "2026-09-30T14:42:32Z",
+              },
+              {
+                id: "3p-5h",
+                name: "Five Hour Limit Remaining",
+                window: "5h",
+                reset_time: "2026-09-27T16:10:09Z",
+              },
+            ],
+          },
+        ],
+      },
+    },
+  };
 }
 
 const conversationId = process.env.FAKE_CONVERSATION_ID ?? "11111111-2222-3333-4444-555555555555";

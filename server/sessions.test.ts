@@ -3,28 +3,54 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { DEFAULT_ACCOUNT_ID, addAccount } from "./accounts";
 import { listConversations } from "./sessions";
 import { writeConversationDb, type ConversationFixture } from "./testing/conversation-db";
+import { installFakeSecurity, type FakeSecurity } from "./testing/fake-security";
 
 const originalHome = process.env.HOME;
+const originalPaseoHome = process.env.PASEO_HOME;
 
+let root: string;
+/** The real home: Default's index lives here, and every account shadow home mirrors the entry. */
 let home: string;
+let paseoHome: string;
 let cwd: string;
+/** Accounts are added here, so the shadow-home sync must never reach the real `/usr/bin/security`. */
+let security: FakeSecurity;
 
 beforeEach(() => {
-  home = mkdtempSync(join(tmpdir(), "antigravity-sessions-"));
+  root = mkdtempSync(join(tmpdir(), "antigravity-sessions-"));
+  home = join(root, "home");
+  paseoHome = join(root, "paseo-home");
   cwd = join(home, "workspace");
   mkdirSync(cwd, { recursive: true });
-  // The CLI's index lives under the home directory, which is how a test repoints it.
+  // The CLI's index lives under the home directory, which is how a test repoints it; the accounts
+  // themselves are addressed by PASEO_HOME so nothing touches the developer's own data.
   process.env.HOME = home;
+  process.env.PASEO_HOME = paseoHome;
+  security = installFakeSecurity("linux");
 });
 
 afterEach(() => {
+  security.restore();
   if (originalHome === undefined) delete process.env.HOME;
   else process.env.HOME = originalHome;
-  rmSync(home, { recursive: true, force: true });
+  if (originalPaseoHome === undefined) delete process.env.PASEO_HOME;
+  else process.env.PASEO_HOME = originalPaseoHome;
+  rmSync(root, { recursive: true, force: true });
   vi.restoreAllMocks();
 });
+
+/** What a row's persistence must carry: the conversation and the account whose CLI wrote it. */
+function persistence(conversationId: string, accountId = DEFAULT_ACCOUNT_ID) {
+  return { version: 1, data: { conversationId, accountId } };
+}
+
+/** Where `server/accounts.ts` puts an account's shadow home, and with it its own index. */
+function shadowHome(id: string): string {
+  return join(paseoHome, "plugin-data", "antigravity-cli", "accounts", id, "home");
+}
 
 function conversation(overrides: Partial<ConversationFixture> = {}): ConversationFixture {
   return {
@@ -51,13 +77,13 @@ describe("listConversations", () => {
 
     expect(listConversations({})).toEqual([
       {
-        persistence: { version: 1, data: { conversationId: "newest" } },
+        persistence: persistence("newest"),
         cwd,
         description: "Explain the streaming protocol",
         updatedAt: "2026-09-23T15:45:49.636Z",
       },
       {
-        persistence: { version: 1, data: { conversationId: "older" } },
+        persistence: persistence("older"),
         cwd,
         title: "Replace Word In File",
         description: "In hello.txt change the word hello to bye.",
@@ -78,14 +104,14 @@ describe("listConversations", () => {
       conversation({ conversationId: "subagent", parentConversationId: "here" }),
     ]);
 
-    expect(listConversations({ cwd }).map((session) => session.persistence.data)).toEqual([
-      { conversationId: "here" },
+    expect(listConversations({ cwd }).map((session) => session.persistence)).toEqual([
+      persistence("here"),
     ]);
     // Without a cwd filter the workspace-less one is still listed.
-    expect(listConversations({}).map((session) => session.persistence.data)).toEqual([
-      { conversationId: "here" },
-      { conversationId: "elsewhere" },
-      { conversationId: "orphan" },
+    expect(listConversations({}).map((session) => session.persistence)).toEqual([
+      persistence("here"),
+      persistence("elsewhere"),
+      persistence("orphan"),
     ]);
   });
 
@@ -96,9 +122,9 @@ describe("listConversations", () => {
       conversation({ conversationId: "c", title: "Unrelated", preview: "nothing to match" }),
     ]);
 
-    expect(listConversations({ query: "flaky" }).map((session) => session.persistence.data)).toEqual([
-      { conversationId: "a" },
-      { conversationId: "b" },
+    expect(listConversations({ query: "flaky" }).map((session) => session.persistence)).toEqual([
+      persistence("a"),
+      persistence("b"),
     ]);
     expect(listConversations({ query: "no such text" })).toEqual([]);
   });
@@ -110,19 +136,18 @@ describe("listConversations", () => {
       conversation({ conversationId: "three", lastModifiedTime: "2026-09-23 12:00:03+00:00" }),
     ]);
 
-    expect(listConversations({ limit: 2 }).map((session) => session.persistence.data)).toEqual([
-      { conversationId: "three" },
-      { conversationId: "two" },
+    expect(listConversations({ limit: 2 }).map((session) => session.persistence)).toEqual([
+      persistence("three"),
+      persistence("two"),
     ]);
   });
 
-  it("returns nothing when the database is missing", () => {
+  it("returns nothing, and logs no fault, when the database is missing", () => {
+    // No index at all is a normal state: a fresh install, or an account whose CLI has not run yet.
     const logged = vi.spyOn(console, "error").mockImplementation(() => {});
 
     expect(listConversations({ cwd })).toEqual([]);
-    expect(logged).toHaveBeenCalledWith(
-      expect.stringContaining("could not read Antigravity conversations"),
-    );
+    expect(logged).not.toHaveBeenCalled();
   });
 
   it("returns nothing when the database is corrupt", () => {
@@ -153,6 +178,77 @@ describe("listConversations", () => {
     listConversations({ cwd });
 
     expect(readDatabaseBytes(path)).toEqual(before);
+  });
+});
+
+describe("accounts", () => {
+  it("merges every account's index, newest first, each tagged with its account", () => {
+    writeConversationDb(home, [
+      conversation({
+        conversationId: "default-old",
+        lastModifiedTime: "2026-09-23 09:00:00+00:00",
+      }),
+    ]);
+    addAccount("Work");
+    // The account's own index, where its CLI writes it: under the shadow home's real `.gemini`.
+    writeConversationDb(shadowHome("work"), [
+      conversation({
+        conversationId: "work-new",
+        lastModifiedTime: "2026-09-23 15:00:00+00:00",
+      }),
+      conversation({
+        conversationId: "work-old",
+        lastModifiedTime: "2026-09-23 12:00:00+00:00",
+      }),
+      // A conversation of a workspace this list is not asked about: filtered like any other.
+      conversation({
+        conversationId: "work-elsewhere",
+        lastModifiedTime: "2026-09-23 08:00:00+00:00",
+        workspacePaths: [join(home, "elsewhere")],
+      }),
+    ]);
+
+    // The newest row is `work`'s, so the merge is by time and not by account.
+    expect(listConversations({}).map((session) => session.persistence)).toEqual([
+      persistence("work-new", "work"),
+      persistence("work-old", "work"),
+      persistence("default-old"),
+      persistence("work-elsewhere", "work"),
+    ]);
+    expect(listConversations({ cwd }).map((session) => session.persistence)).toEqual([
+      persistence("work-new", "work"),
+      persistence("work-old", "work"),
+      persistence("default-old"),
+    ]);
+    // The limit cuts across accounts, which only a merged ordering can honor.
+    expect(listConversations({ limit: 2 }).map((session) => session.persistence)).toEqual([
+      persistence("work-new", "work"),
+      persistence("work-old", "work"),
+    ]);
+  });
+
+  it("contributes nothing, and logs no fault, for an account with no index yet", () => {
+    writeConversationDb(home, [conversation({ conversationId: "default-only" })]);
+    addAccount("Fresh");
+    const logged = vi.spyOn(console, "error").mockImplementation(() => {});
+
+    expect(listConversations({}).map((session) => session.persistence)).toEqual([
+      persistence("default-only"),
+    ]);
+    expect(logged).not.toHaveBeenCalled();
+  });
+
+  it("still lists the other accounts when one index is unreadable", () => {
+    writeConversationDb(home, [conversation({ conversationId: "default-only" })]);
+    addAccount("Broken");
+    const path = writeConversationDb(shadowHome("broken"), [conversation()]);
+    writeFileSync(path, "this is not a database");
+    const logged = vi.spyOn(console, "error").mockImplementation(() => {});
+
+    expect(listConversations({}).map((session) => session.persistence)).toEqual([
+      persistence("default-only"),
+    ]);
+    expect(logged).toHaveBeenCalledWith(expect.stringContaining("account broken"));
   });
 });
 

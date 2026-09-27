@@ -17,6 +17,7 @@
   },
   "include": [
     "index.server.ts",
-    "server/**/*.ts"
+    "server/**/*.ts",
+    "shared/**/*.ts"
   ]
 }

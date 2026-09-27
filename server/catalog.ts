@@ -7,6 +7,7 @@ import type {
   ProviderModel,
   ProviderThinkingOption,
 } from "@getpaseo/plugin/server/provider";
+import { accountHome } from "./accounts";
 import { resolveAgyBinary } from "./agy";
 
 const execFileAsync = promisify(execFile);
@@ -66,14 +67,20 @@ export const FALLBACK_MODELS: readonly ProviderModel[] = groupModels(
 const CACHE_TTL_MS = 10 * 60 * 1000;
 const MODELS_TIMEOUT_MS = 20_000;
 
-let cache: { key: string; at: number; models: readonly ProviderModel[] } | null = null;
+/**
+ * One entry per account, not one global slot: the list belongs to the account whose `HOME` the CLI
+ * was run with, and switching the active account has to show that account's list immediately rather
+ * than after the 10-minute TTL, or a rediscovery under the previous account.
+ */
+const cache = new Map<string, { key: string; at: number; models: readonly ProviderModel[] }>();
 
 /**
- * Identity of the CLI whose model list is cached. A different binary or a rebuilt one can report a
- * different list, so both the resolved path and its modification time belong in the key that Paseo
- * uses to decide whether to rediscover — and in the key this module caches under.
+ * Identity of the CLI whose model list is cached. A different binary, a rebuilt one, and a
+ * different account can each report a different list, so the resolved path, its modification time
+ * and the account all belong in the key that Paseo uses to decide whether to rediscover — and in
+ * the key this module caches under.
  */
-export function catalogCacheKey(binary?: string): string {
+export function catalogCacheKey(accountId: string, binary?: string): string {
   const resolved = resolveAgyBinary(binary);
   let mtime = "unknown";
   try {
@@ -81,24 +88,27 @@ export function catalogCacheKey(binary?: string): string {
   } catch {
     // A PATH-resolved or deleted binary has no build identity; the path still keys the cache.
   }
-  return `${resolved}|${mtime}|${process.env.PASEO_ANTIGRAVITY_BIN ?? ""}`;
+  return `${resolved}|${mtime}|${process.env.PASEO_ANTIGRAVITY_BIN ?? ""}|${accountId}`;
 }
 
-/** Drops the discovered list so the next catalog request runs `agy models` again. */
+/** Drops the discovered lists so the next catalog request runs `agy models` again. */
 export function invalidateCatalogCache(): void {
-  cache = null;
+  cache.clear();
 }
 
 /**
- * Synchronous view of the last discovered list, for `session.config` where an async lookup would
- * stall the provider. The catalog request path is what refreshes the cache.
+ * Synchronous view of the last list discovered for an account, for `session.config` where an async
+ * lookup would stall the provider. The catalog request path is what refreshes the cache.
  */
-export function currentModels(): readonly ProviderModel[] {
-  return cache?.models ?? FALLBACK_MODELS;
+export function currentModels(accountId: string): readonly ProviderModel[] {
+  return cache.get(accountId)?.models ?? FALLBACK_MODELS;
 }
 
-export async function buildCatalog(binary?: string): Promise<ProviderCatalog> {
-  const models = await loadModels(binary);
+export async function buildCatalog(
+  accountId: string,
+  binary?: string,
+): Promise<ProviderCatalog> {
+  const models = await loadModels(accountId, binary);
   return {
     models,
     modes: MODES,
@@ -109,23 +119,33 @@ export async function buildCatalog(binary?: string): Promise<ProviderCatalog> {
   };
 }
 
-async function loadModels(binary?: string): Promise<readonly ProviderModel[]> {
-  const key = catalogCacheKey(binary);
-  if (cache && cache.key === key && Date.now() - cache.at < CACHE_TTL_MS) return cache.models;
+async function loadModels(
+  accountId: string,
+  binary?: string,
+): Promise<readonly ProviderModel[]> {
+  const key = catalogCacheKey(accountId, binary);
+  const cached = cache.get(accountId);
+  if (cached && cached.key === key && Date.now() - cached.at < CACHE_TTL_MS) return cached.models;
 
+  // `agy models` is login-gated, so it has to run under the same `HOME` its sessions will. Default
+  // is the real home and adds no override: its env is exactly the daemon's.
+  const home = accountHome(accountId);
   let models: readonly ProviderModel[] = [];
   try {
     const { stdout } = await execFileAsync(resolveAgyBinary(binary), ["models"], {
       timeout: MODELS_TIMEOUT_MS,
       maxBuffer: 4 * 1024 * 1024,
+      ...(home === null ? {} : { env: { ...process.env, HOME: home } }),
     });
     models = groupModels(parseModels(stdout));
   } catch (error) {
-    console.error(`[antigravity] falling back to bundled model list: ${describe(error)}`);
+    console.error(
+      `[antigravity] falling back to bundled model list for account ${accountId}: ${describe(error)}`,
+    );
   }
 
   const resolved = models.length > 0 ? models : FALLBACK_MODELS;
-  cache = { key, at: Date.now(), models: resolved };
+  cache.set(accountId, { key, at: Date.now(), models: resolved });
   return resolved;
 }
 
@@ -212,14 +232,16 @@ export function groupModels(rows: readonly ProviderModel[]): readonly ProviderMo
 /**
  * The `(model, thinkingOption)` pair a session holds, resolved to what the CLI is launched with.
  * `model` may be a catalog family (`gemini-3.8-flash`) or a persisted full slug; a tier the model
- * does not have is ignored rather than turned into a slug the CLI would reject.
+ * does not have is ignored rather than turned into a slug the CLI would reject. The tiers come from
+ * the account's own discovered list, which is the only one that can have reported this model.
  */
 export function resolveThinking(
   model: string | undefined,
   thinkingOption: string | undefined,
+  accountId: string,
 ): { slug?: string; options: readonly ProviderThinkingOption[]; option?: string } {
   if (!model || model.length === 0) return { options: [] };
-  const models = currentModels();
+  const models = currentModels(accountId);
   const direct = models.find((entry) => entry.id === model);
   const family =
     direct && (direct.thinkingOptions?.length ?? 0) > 0
