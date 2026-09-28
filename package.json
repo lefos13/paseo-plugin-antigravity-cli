@@ -1,6 +1,6 @@
 {
   "name": "paseo-plugin-antigravity-cli",
-  "version": "0.5.0",
+  "version": "0.6.0",
   "files": [
     "README.md",
     "paseo-plugin.json",
@@ -29,7 +29,7 @@
     "vitest": "^4.1.6",
     "zod": "^4.4.3"
   },
-  "description": "Antigravity CLI (agy) as a Paseo provider: streaming turns, tool rows with diffs, images, structured output, skills and slash commands, conversation import, opt-in MCP sharing, and multiple accounts with per-account usage quota.",
+  "description": "Antigravity CLI (agy) as a Paseo provider: streaming turns, tool rows with diffs, images, structured output, skills and slash commands, question cards for ask_question, conversation import, opt-in MCP sharing, and multiple accounts with per-account usage quota.",
   "license": "MIT",
   "author": "lefos13",
   "repository": {
