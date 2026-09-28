@@ -151,6 +151,10 @@ afterEach(async () => {
     "FAKE_EDIT_GATE",
     "FAKE_EDIT_SKIP_WRITE",
     "FAKE_BACKGROUND_GATE",
+    "FAKE_QUESTIONS",
+    "FAKE_QUESTION_TOOL",
+    "FAKE_QUESTION_GATE",
+    "FAKE_QUESTION_EFFECT",
     "PASEO_ANTIGRAVITY_BACKFILL_DELAY_MS",
   ]) {
     delete process.env[key];
@@ -3569,6 +3573,286 @@ describe("plan mode", () => {
     await waitFor(() => turns(events, "completed")[0], "the turn to complete");
     expect(permissions(events)).toEqual([]);
     expect(readPrompts()[0]).toBe("add a cache");
+  });
+});
+
+describe("questions agy skips", () => {
+  function permissions(events: ProviderEvent[]) {
+    return events.flatMap((event) => (event.type === "session.permission" ? [event.request] : []));
+  }
+  function resolved(events: ProviderEvent[]): string[] {
+    return events.flatMap((event) => (event.type === "session.permission_resolved" ? [event.permissionId] : []));
+  }
+  function questionRows(events: ProviderEvent[]) {
+    return timelineItems(events).filter((item) => item.type === "tool_call" && item.name === "ask_question");
+  }
+  function lastRowText(events: ProviderEvent[]): string {
+    const row = questionRows(events).at(-1);
+    return row?.type === "tool_call" && row.detail.type === "plain_text" ? (row.detail.text ?? "") : "";
+  }
+  /**
+   * The fake plays fixtures/17: the question, agy's own "User Skipped" answer in the transcript,
+   * and then a gate. Held there, it carries on and acts on the skip only if nobody stops it first.
+   */
+  function askingAgy(options: { hold?: boolean } = {}): void {
+    process.env.FAKE_SCENARIO = "ask-question";
+    if (options.hold !== false) process.env.FAKE_QUESTION_GATE = join(tempDir, "question-gate");
+    const home = join(tempDir, "home");
+    mkdirSync(home, { recursive: true });
+    process.env.HOME = home;
+  }
+  async function answer(
+    connection: ProviderConnection,
+    permissionId: string,
+    response: Extract<ProviderInput, { type: "session.permission" }>["response"],
+  ): Promise<void> {
+    await connection.send({ type: "session.permission", sessionId: "session-1", permissionId, response });
+  }
+
+  it("stops the turn at the skipped question and offers it as a question card", async () => {
+    askingAgy();
+    const effect = join(tempDir, "color.txt");
+    process.env.FAKE_QUESTION_EFFECT = effect;
+    const { connection, events } = await connect();
+    await openSession(connection);
+    await prompt(connection, "pick a colour");
+    const request = await waitFor(() => permissions(events)[0], "the question card");
+
+    expect(request).toMatchObject({
+      kind: "question",
+      name: "ask_question",
+      title: "Which colour do you prefer?",
+      input: {
+        questions: [
+          {
+            question: "Which colour do you prefer?",
+            header: "Question 1",
+            options: [{ label: "Red" }, { label: "Blue" }],
+            multiSelect: false,
+            allowOther: true,
+          },
+        ],
+      },
+    });
+    // The stop is the plugin's, so the turn completed rather than being cancelled by the user.
+    expect(turns(events, "completed")).toHaveLength(1);
+    expect(turns(events, "canceled")).toEqual([]);
+    expect(lastRowText(events)).toBe("Which colour do you prefer?\nRed, Blue");
+
+    // The CLI was stopped, not just ignored: opening its gate now must not let it act on the skip.
+    const count = events.length;
+    writeFileSync(process.env.FAKE_QUESTION_GATE ?? "", "");
+    // A real delay: what is asserted is that the stopped CLI does *nothing*, and there is no signal
+    // to await for something that must not happen.
+    await new Promise((resolve) => setTimeout(resolve, 300));
+    expect(existsSync(effect)).toBe(false);
+    expect(events.slice(count)).toEqual([]);
+  });
+
+  it("sends the answer as the next turn of the same conversation", async () => {
+    askingAgy();
+    const { connection, events } = await connect();
+    await openSession(connection);
+    await prompt(connection, "pick a colour");
+    const request = await waitFor(() => permissions(events)[0], "the question card");
+
+    await answer(connection, request.id, {
+      behavior: "allow",
+      updatedInput: { ...request.input, answers: { "Question 1": "Blue" } },
+    });
+    await waitFor(() => turns(events, "completed")[1], "the answer turn to complete");
+
+    expect(resolved(events)).toEqual([request.id]);
+    const sent = readPrompts()[1] ?? "";
+    // The conversation holds "User Skipped" as the call's result; the model is told it was the CLI.
+    expect(sent).toContain('returned "User Skipped"');
+    expect(sent).toContain("Which colour do you prefer?\nBlue");
+    const launches = readArgvLog();
+    expect(launches).toHaveLength(2);
+    expect(launches[1]).toEqual(expect.arrayContaining(["--conversation", "--disable-slash-commands"]));
+    expect(lastRowText(events)).toBe("Which colour do you prefer?\nBlue");
+    const shown = timelineItems(events).filter((item) => item.type === "user_message").at(-1);
+    expect(shown).toMatchObject({ text: "Answers to your questions:\n\nWhich colour do you prefer?\nBlue" });
+  });
+
+  it("offers every question of one call and returns each answer under its own question", async () => {
+    askingAgy();
+    process.env.FAKE_QUESTIONS = JSON.stringify([
+      { is_multi_select: true, options: ["Apple", "Pear", "Plum"], question: "Which fruits do you like?" },
+      { is_multi_select: false, options: ["Ace", "Bee"], question: "Which nickname should I use for you?" },
+    ]);
+    const { connection, events } = await connect();
+    await openSession(connection);
+    await prompt(connection, "ask me");
+    const request = await waitFor(() => permissions(events)[0], "the question card");
+    expect(request.input?.questions).toMatchObject([
+      { header: "Question 1", multiSelect: true },
+      { header: "Question 2", multiSelect: false },
+    ]);
+
+    // What Paseo's card submits: labels of a multi-select joined with ", ", a write-in as its text.
+    await answer(connection, request.id, {
+      behavior: "allow",
+      updatedInput: { answers: { "Question 1": "Apple, Plum", "Question 2": "Zed" } },
+    });
+    await waitFor(() => turns(events, "completed")[1], "the answer turn to complete");
+    expect(readPrompts()[1]).toContain(
+      "Which fruits do you like?\nApple, Plum\n\nWhich nickname should I use for you?\nZed",
+    );
+  });
+
+  it("leaves an unknown step that is not a skipped question alone", async () => {
+    askingAgy({ hold: false });
+    process.env.FAKE_QUESTION_TOOL = "list_tasks";
+    const { connection, events } = await connect();
+    await openSession(connection);
+    await prompt(connection, "list tasks");
+    await waitFor(() => turns(events, "completed")[0], "the turn to complete");
+
+    expect(paseoView(events).finalText).toBe("There are no tasks.");
+    expect(permissions(events)).toEqual([]);
+    expect(questionRows(events)).toEqual([]);
+  });
+
+  it("sends nothing when the question is dismissed", async () => {
+    askingAgy();
+    const { connection, events } = await connect();
+    await openSession(connection);
+    await prompt(connection, "pick a colour");
+    const request = await waitFor(() => permissions(events)[0], "the question card");
+
+    await answer(connection, request.id, { behavior: "deny" });
+
+    expect(resolved(events)).toEqual([request.id]);
+    expect(lastRowText(events)).toBe("Which colour do you prefer?\nRed, Blue\n\nDismissed");
+    expect(turns(events, "started")).toHaveLength(1);
+    expect(readArgvLog()).toHaveLength(1);
+  });
+
+  it("withdraws the question when a new message is sent instead", async () => {
+    askingAgy();
+    const { connection, events } = await connect();
+    await openSession(connection);
+    await prompt(connection, "pick a colour");
+    const request = await waitFor(() => permissions(events)[0], "the question card");
+
+    await prompt(connection, "use Red", "m2");
+    await waitFor(() => turns(events, "completed")[1], "the new message to complete");
+
+    const withdrawn = events.findIndex(
+      (event) => event.type === "session.permission_resolved" && event.permissionId === request.id,
+    );
+    const started = events.findIndex(
+      (event) => event.type === "session.turn" && event.state === "started" && event.turnId === turnIds(events, "started")[1],
+    );
+    expect(withdrawn).toBeGreaterThan(-1);
+    expect(withdrawn).toBeLessThan(started);
+    expect(readPrompts()[1]).toBe("use Red");
+    expect(lastRowText(events)).toContain("Dismissed");
+  });
+
+  it("runs a message queued behind the asking turn instead of asking", async () => {
+    askingAgy();
+    const { connection, events } = await connect();
+    await openSession(connection);
+    // Both lines reach the CLI before it reports the question, so the second is queued inside it.
+    await prompt(connection, "pick a colour");
+    await prompt(connection, "never mind, use Red", "m2");
+    await waitFor(() => turns(events, "completed")[1], "the queued message to complete");
+
+    expect(permissions(events)).toEqual([]);
+    expect(paseoView(events).finalText).toBe("echo:never mind, use Red\n");
+    const launches = readArgvLog();
+    expect(launches).toHaveLength(2);
+    expect(launches[1]).toContain("--conversation");
+    expect(lastRowText(events)).toContain("Dismissed");
+  });
+
+  it("withdraws an open question when the session closes", async () => {
+    askingAgy();
+    const { connection, events } = await connect();
+    await openSession(connection);
+    await prompt(connection, "pick a colour");
+    const request = await waitFor(() => permissions(events)[0], "the question card");
+
+    await connection.send({ type: "session.close", requestId: "close-1", sessionId: "session-1" });
+    const withdrawn = events.findIndex(
+      (event) => event.type === "session.permission_resolved" && event.permissionId === request.id,
+    );
+    const closed = events.findIndex((event) => event.type === "session.closed" && event.sessionId === "session-1");
+    expect(withdrawn).toBeGreaterThan(-1);
+    expect(withdrawn).toBeLessThan(closed);
+  });
+
+  it("answers a question from a command turn on a plain launch", async () => {
+    askingAgy();
+    const { connection, events } = await connect();
+    await openSession(connection);
+    await connection.send({
+      type: "session.prompt",
+      sessionId: "session-1",
+      prompt: {
+        clientMessageId: "c1",
+        delivery: "auto",
+        input: { type: "command", name: "teamwork-preview", arguments: "add a hello script" },
+      },
+    } as ProviderInput);
+    const request = await waitFor(() => permissions(events)[0], "the question card");
+    await answer(connection, request.id, { behavior: "allow", updatedInput: { answers: { "Question 1": "Red" } } });
+    await waitFor(() => turns(events, "completed")[1], "the answer turn to complete");
+
+    const launches = readArgvLog();
+    // `/teamwork-preview` needs expansion; its answer is a message and must not be expanded.
+    expect(launches[0]).not.toContain("--disable-slash-commands");
+    expect(launches[1]).toEqual(expect.arrayContaining(["--conversation", "--disable-slash-commands"]));
+  });
+
+  it("asks before the plan, and offers the plan once the answer is in", async () => {
+    askingAgy();
+    const { connection, events } = await connect();
+    await openSession(connection, { mode: "plan" });
+    await prompt(connection, "plan a greeting");
+    const request = await waitFor(() => permissions(events)[0], "the question card");
+    expect(request.kind).toBe("question");
+
+    await answer(connection, request.id, { behavior: "allow", updatedInput: { answers: { "Question 1": "Blue" } } });
+    const plan = await waitFor(() => permissions(events)[1], "the plan card");
+
+    // The stopped turn's text is no plan; the answer turn is still a plan-mode turn.
+    expect(permissions(events).map((entry) => entry.kind)).toEqual(["question", "plan"]);
+    expect(plan.kind).toBe("plan");
+    expect(readPrompts()[1]).toMatch(/^<plan_mode>[\s\S]*Which colour do you prefer\?\nBlue/);
+  });
+
+  it("lets agy settle the question on a structured-output turn", async () => {
+    askingAgy({ hold: false });
+    const { connection, events } = await connect();
+    await openSession(connection);
+    await promptContent(connection, [{ type: "text", text: "pick a colour" }], "m1", {
+      type: "object",
+      properties: { colour: { type: "string" } },
+    });
+    await waitFor(() => turns(events, "completed")[0], "the turn to complete");
+
+    expect(permissions(events)).toEqual([]);
+    expect(paseoView(events).finalText).toContain("so I picked Red");
+    expect(readArgvLog()).toHaveLength(1);
+  });
+
+  it("lets agy settle the question when the host cannot show a card", async () => {
+    askingAgy({ hold: false });
+    const connection = await createProvider().connect({
+      versions: [1],
+      capabilities: OFFERED.filter((capability) => capability !== "permission"),
+    });
+    openConnections.push(connection);
+    const events = watchConnection(connection);
+    await openSession(connection);
+    await prompt(connection, "pick a colour");
+    await waitFor(() => turns(events, "completed")[0], "the turn to complete");
+
+    expect(permissions(events)).toEqual([]);
+    expect(paseoView(events).finalText).toContain("so I picked Red");
   });
 });
 

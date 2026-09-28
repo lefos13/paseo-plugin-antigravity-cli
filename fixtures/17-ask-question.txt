@@ -1,0 +1,32 @@
+fixtures/17-ask-question.* and 17b-ask-question-multi.* — agy 1.2.12 ask_question probes
+Captured 2026-09-28. Scratch git repos /tmp/agy-question-probe and /tmp/agy-question-multi-probe
+(`git init`, no commits). Paths and the user name anonymized to /Users/dev and dev.
+
+Command (from the scratch repo), stdin one `{"event":"user","message":{…}}` line:
+
+  agy --input-format stream-json --output-format stream-json \
+    --add-dir "$PWD" --disable-slash-commands --print-timeout 0
+
+Prompts:
+  17   "Use the ask_question tool to ask me which colour I prefer, with the options Red and Blue.
+        Then create a file named color.txt containing exactly my answer. Do not run any terminal
+        commands."
+  17b  "Call the ask_question tool exactly once with two questions: first, which fruits I like, as a
+        multi-select with the options Apple, Pear and Plum; second, which nickname you should use
+        for me, with the options Ace and Bee. Then create a file named answers.txt containing my
+        answers."
+
+What they show: headless agy answers ask_question itself and the turn continues.
+  - stream: step 1 `agent_response` DONE (the planner step that made the call), then step 2
+    `{"step_type":"unknown","state":"DONE"}` with no tool_name, tool_info, or question text.
+  - transcript.jsonl: step 1 `PLANNER_RESPONSE` with
+      tool_calls:[{name:"ask_question", args:{questions:"<JSON string>", toolAction, toolSummary}}]
+    where `questions` decodes to [{question, options:[string], is_multi_select}];
+    step 2 `GENERIC` whose content ends in `A1: User Skipped` (17b: `A1: User Skipped\nA2: User Skipped`).
+  - The model then acts on the skip: 17 wrote color.txt = "User Skipped"; 17b wrote answers.txt
+    with "User Skipped" for both. Exit code 0, empty stderr.
+
+Separately probed the same day (not a fixture): SIGINT 10 ms after the `unknown` DONE line gave
+`result.error:"interrupted"` with no later step run, and the transcript already held both lines when
+that stream line arrived. Relaunching with `--conversation <id>` and sending the real answer made the
+model use it.

@@ -113,6 +113,11 @@ export const STEP_SYSTEM_MESSAGE = "system_message";
  * `tool_info`, and it arrives while the children are still running.
  */
 export const STEP_SUBAGENT = "subagent";
+/**
+ * What agy reports for a step it has no stream type for. On 1.2.12 that includes `ask_question`,
+ * which arrives with no tool name or parameters at all (fixtures/17-ask-question.ndjson).
+ */
+export const STEP_UNKNOWN = "unknown";
 
 export const STEP_STATE_ACTIVE = "ACTIVE";
 export const STEP_STATE_DONE = "DONE";

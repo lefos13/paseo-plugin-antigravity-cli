@@ -46,7 +46,8 @@ prompt sent while a turn runs is queued by the CLI as the next turn. Model, tier
 are launch flags, so a change restarts the CLI on the next turn and resumes the same conversation;
 Antigravity conversations can be imported read-only, the conversation id agy reports is persisted,
 each subagent becomes a child session ([Subagents](#subagents)), and `permission` covers plan approval
-only. Images go over by file, because a `stream-json` turn carries text only.
+and the questions agy cannot ask ([Questions](#questions-ask_question)). Images go over by file,
+because a `stream-json` turn carries text only.
 
 Models come from `agy models` (cached ten minutes; `force` rediscovers), so the composer offers one
 model per family with the tiers that family has — High, Medium and Low today. `providerOptions.effort`
@@ -65,6 +66,25 @@ answer is then offered as a plan (`kind: "plan"` permission) with **Implement** 
 *Implement* switches to *Accept edits* and sends `The plan is approved. Implement it now.`; *Keep
 planning*, or another message, withdraws it. It is an instruction, not a sandbox: a model that ignores
 it can still write files.
+
+### Questions (`ask_question`)
+
+Headless agy never shows an `ask_question` dialog. It answers the call itself with `User Skipped` and
+the model carries on, making the choice on its own. That is what happens to `/teamwork-preview`'s
+team-scale question, `/grill-me`'s interview, `/schedule`'s time, and any question the model decides
+to ask. The stream reports the call only as an `unknown` step, so the plugin reads the question from
+the conversation's transcript. It then stops the CLI before the model acts on the skip, completes the
+turn, and offers the questions as Paseo's question card (`kind: "question"`): single or multi-select,
+always with a write-in answer.
+
+- **Answer:** the answers go back as the next turn of the same conversation, in a fresh CLI. The model
+  is told the skip came from the CLI, not from you. A command turn's answer is a plain message.
+- **Dismiss:** nothing is sent. The model has "User Skipped", and the next message is yours.
+- **Another message instead:** the card is withdrawn and the message is sent as usual. The same
+  happens to a question whose turn already had a message queued behind it: that message runs, and
+  the question is not asked.
+
+In Plan mode the question comes first and the plan card follows the answer turn.
 
 ### Background commands
 
@@ -292,6 +312,11 @@ running subagent's transcript.
   appear in the picker, and a command it no longer expands is sent as ordinary text.
 - **Subagent sessions are read-only in Paseo**, and rely on agy's undocumented transcript file: if a
   CLI update changes it, subagents fall back to rows without a child session.
+- **Questions are relayed after the fact.** The plugin stops the CLI once agy has already answered
+  `User Skipped`, so any tool the model called in the same step as the question has already run. The
+  card lives in memory: a plugin reload or daemon restart drops it, and you answer in chat instead.
+  Questions asked inside a subagent, and on a structured-output turn, are not relayed, so agy settles
+  them itself. The relay reads agy's undocumented transcript file, like subagents do.
 
 ## Terms of service
 

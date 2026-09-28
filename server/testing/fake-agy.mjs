@@ -9,12 +9,22 @@
  *                        test tells an account's shadow home from the real one (or its absence)
  *   FAKE_SCENARIO        text (default) | tool | edit | edit-applied | queued | interrupt | error
  *                        | fail | tool-hang | stdin-closed | schema | schema-invalid | subagent
+ *                        | ask-question
  *   FAKE_SUBAGENT_COUNT       children the `subagent` scenario spawns (default 1)
  *   FAKE_SUBAGENT_TRANSCRIPT  what the `subagent` scenario writes for each child: valid (default),
  *                             malformed (unreadable lines only), missing (no file at all), or
  *                             unknown-type (valid, plus one step of a type nothing knows)
  *   FAKE_SUBAGENT_GATE        file the `subagent` scenario waits for before the parent's final
  *                             answer, so a test can watch a child stream while its turn runs
+ *   FAKE_QUESTIONS       JSON array the `ask-question` scenario asks, in agy's own shape
+ *                        ([{question, options, is_multi_select}]); default one Red/Blue question
+ *   FAKE_QUESTION_TOOL   tool the `ask-question` planner step calls (default ask_question); any
+ *                        other name plays an ordinary tool result on the same `unknown` step
+ *   FAKE_QUESTION_GATE   file the `ask-question` scenario waits for (up to 10 s) after the skipped
+ *                        question, which is the window a consumer has to interrupt it; unset, it
+ *                        carries on at once, as agy does when nobody intervenes
+ *   FAKE_QUESTION_EFFECT file the `ask-question` scenario writes "User Skipped" into when it carries
+ *                        on, the way the captured model wrote its skip into color.txt
  *   FAKE_SCHEMA_OUTPUT   JSON the `schema` scenario returns as structured_output
  *   FAKE_SCHEMA_GATE     file the `schema` scenario waits for before answering, so a test can act
  *                        while that turn is still running
@@ -471,12 +481,62 @@ function playQueued(text) {
   sendResult(turnResult(2, `${response}\n`));
 }
 
+/**
+ * The first turn of a fresh `ask-question` process plays fixtures/17-ask-question.*: the planner
+ * step that calls ask_question, then the call itself as an `unknown` step, with agy's own
+ * transcript lines written before either reaches stdout. agy answers the call with "User Skipped"
+ * and the turn carries on unless SIGINT arrives while the gate holds it.
+ */
+let questionAsked = false;
+/** A line that arrives while the question turn is held is queued by agy, so it gets no answer here. */
+let questionHolding = false;
+
+function questionTranscriptPath() {
+  return join(homedir(), ".gemini", "antigravity-cli", "brain", conversationId, ".system_generated", "logs", "transcript.jsonl");
+}
+
+async function playQuestion(text) {
+  questionAsked = true;
+  questionHolding = true;
+  const toolName = process.env.FAKE_QUESTION_TOOL ?? "ask_question";
+  const questions = JSON.parse(
+    process.env.FAKE_QUESTIONS ?? '[{"is_multi_select":false,"options":["Red","Blue"],"question":"Which colour do you prefer?"}]',
+  );
+  const planner = step;
+  const call = planner + 1;
+  step += 2;
+  const encode = (value) => JSON.stringify(value);
+  const args =
+    toolName === "ask_question"
+      ? { questions: encode(questions), toolAction: encode("Asking colour preference"), toolSummary: encode("Colour preference question") }
+      : { toolAction: encode("Listing tasks"), toolSummary: encode("Task list") };
+  const skipped = questions.map((_, index) => `A${index + 1}: User Skipped`).join("\n");
+  const stamp = "Created At: 2026-09-28T13:19:40+03:00\nCompleted At: 2026-09-28T13:19:40+03:00\n";
+  await writeChildLines(questionTranscriptPath(), [
+    encode({ step_index: planner - 1, source: "USER_EXPLICIT", type: "USER_INPUT", status: "DONE", content: `<USER_REQUEST>\n${text}\n</USER_REQUEST>` }),
+    encode({ step_index: planner, source: "MODEL", type: "PLANNER_RESPONSE", status: "DONE", tool_calls: [{ name: toolName, args }] }),
+    encode({ step_index: call, source: "MODEL", type: "GENERIC", status: "DONE", content: toolName === "ask_question" ? `${stamp}${skipped}` : `${stamp}No tasks.` }),
+  ]);
+  send(stepEvent(planner, "DONE", "agent_response", { duration_seconds: 3.3, usage: stepUsage }));
+  send(stepEvent(call, "DONE", "unknown", { duration_seconds: 0.0157 }));
+
+  await waitForGate("FAKE_QUESTION_GATE");
+  questionHolding = false;
+  if (process.env.FAKE_QUESTION_EFFECT) writeFileSync(process.env.FAKE_QUESTION_EFFECT, "User Skipped\n", "utf8");
+  const answer = toolName === "ask_question" ? "You skipped the question (User Skipped), so I picked Red." : "There are no tasks.";
+  const answerStep = step;
+  step += 1;
+  send(stepEvent(answerStep, "DONE", "agent_response", { text_delta: answer, duration_seconds: 0.1, usage: stepUsage }));
+  sendResult(turnResult(turns, `${answer}\n`));
+}
+
 // Registered before any output is written, so a consumer that has seen `init` can rely on
 // SIGINT being handled rather than terminating the process by default.
 const toolEnding = process.env.FAKE_TOOL_END ?? "interrupt";
 if (
   scenario === "interrupt" ||
   scenario === "subagent" ||
+  scenario === "ask-question" ||
   (scenario === "tool-hang" && toolEnding === "interrupt")
 ) {
   // Captured behaviour: SIGINT prints `error: interrupted` on stderr, emits a failed result
@@ -552,6 +612,8 @@ readline.createInterface({ input }).on("line", async (line) => {
     appendFileSync(process.env.FAKE_PROMPT_FILE, `${JSON.stringify(text)}\n`, "utf8");
   }
 
+  if (scenario === "ask-question" && questionHolding) return;
+
   if (scenario === "fail") {
     // Mirrors a rejected --model: agy writes to stderr and exits without a result event.
     process.stderr.write(
@@ -586,6 +648,13 @@ readline.createInterface({ input }).on("line", async (line) => {
 
   // Stay silent so the turn stays running until the test interrupts it.
   if (scenario === "interrupt") return;
+
+  // A relaunch that resumes the conversation answers the user's reply as plain text, and so does
+  // every later turn of the process that asked.
+  if (scenario === "ask-question" && !questionAsked && !argv.includes("--conversation")) {
+    await playQuestion(text);
+    return;
+  }
 
   if (scenario === "subagent") {
     const requested = Number.parseInt(process.env.FAKE_SUBAGENT_COUNT ?? "1", 10);

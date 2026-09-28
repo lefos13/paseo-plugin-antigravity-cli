@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { existsSync } from "node:fs";
-import { mkdir, rm, stat, writeFile } from "node:fs/promises";
+import { mkdir, readFile, rm, stat, writeFile } from "node:fs/promises";
+import { setTimeout as sleep } from "node:timers/promises";
 import { dirname, isAbsolute } from "node:path";
 import {
   negotiateProviderCapabilities,
@@ -60,6 +61,7 @@ import {
   STEP_STATE_DONE,
   STEP_SUBAGENT,
   STEP_TOOL,
+  STEP_UNKNOWN,
   isInterrupted,
   parseAgyErrorLine,
   type AgyErrorReport,
@@ -70,8 +72,18 @@ import {
 } from "./protocol";
 import { injectMcpServers, mcpConfigPath, releaseMcpServers, sweepMcpLedger } from "./mcp";
 import { pluginDataDir, unsafePathChars } from "./plugindata";
+import {
+  answerPrompt,
+  answerShown,
+  findSkippedQuestion,
+  questionRequest,
+  questionRow,
+  readAnswers,
+  type AgyQuestion,
+  type SkippedQuestion,
+} from "./questions";
 import { listConversations } from "./sessions";
-import { SubagentTranscript, transcriptFilePath, type ChildRender } from "./subagents";
+import { SubagentTranscript, parseTranscriptLines, transcriptFilePath, type ChildRender } from "./subagents";
 import { TranscriptStore, transcriptExists } from "./transcript";
 import { hasEditContent, mapToolDetail, snapshotDiff } from "./tools";
 
@@ -90,6 +102,12 @@ const BACKFILL_DELAY_MS = 5_000;
 const PLAN_MODE_ID = "plan";
 /** The mode an approved plan is implemented in. */
 const IMPLEMENT_MODE_ID = "accept-edits";
+/**
+ * How often the transcript is read for a question's step before giving up. The line was already on
+ * disk when the stream reported the step in every probe; the retries cover a slow flush.
+ */
+const QUESTION_READ_ATTEMPTS = 5;
+const QUESTION_READ_RETRY_MS = 100;
 /**
  * agy's `--mode plan` is never passed (`ensureProcess` explains why): it takes effect only while
  * slash-command expansion is on, and with expansion on the CLI approves its own plan review and
@@ -273,7 +291,12 @@ interface Session {
   detached: AgyProcess | null;
   /** The plan a plan-mode turn ended with, while the user has not approved or dismissed it. */
   pendingPlan: { id: string; text: string } | null;
-  /** Whether the host negotiated `permission`, without which a plan cannot be offered. */
+  /** The questions a stopped turn asked, while the user has not answered or dismissed them. */
+  pendingQuestion: { id: string; callId: string; questions: readonly AgyQuestion[] } | null;
+  /**
+   * Whether the host negotiated `permission`, without which neither a plan nor a question card can
+   * be offered.
+   */
   readonly planApproval: boolean;
 }
 
@@ -679,6 +702,7 @@ async function openSession(
     closing: false,
     detached: null,
     pendingPlan: null,
+    pendingQuestion: null,
     planApproval: state.capabilities.includes("permission"),
   };
   state.sessions.set(input.sessionId, session);
@@ -1092,6 +1116,8 @@ async function promptSession(
   // Typing a new message instead of answering the plan prompt is the user choosing to keep
   // planning, so the prompt is withdrawn rather than left to answer a plan that moved on.
   resolvePendingPlan(session, emit);
+  // The same holds for a question: the message is the user's answer, in their own words.
+  resolvePendingQuestion(session, emit);
 
   // What the timeline shows the user typed, and what the CLI is actually sent. A native command
   // is expanded by the CLI, so both are the same `/<name> <arguments>`; a plugin-expanded skill is
@@ -1480,9 +1506,116 @@ function resolvePendingPlan(session: Session, emit: Emit): void {
   emit({ type: "session.permission_resolved", sessionId: session.sessionId, permissionId: plan.id });
 }
 
+/** Withdraws the question card, if one is open, and marks its row dismissed. */
+function resolvePendingQuestion(session: Session, emit: Emit): void {
+  const question = session.pendingQuestion;
+  if (!question) return;
+  session.pendingQuestion = null;
+  publish(session, emit, questionRow(question.callId, question.questions, { kind: "dismissed" }));
+  emit({ type: "session.permission_resolved", sessionId: session.sessionId, permissionId: question.id });
+}
+
 /**
- * The user's answer to a plan prompt. Approving leaves plan mode for `accept-edits` — plan mode
- * would only have the model plan again — and sends the turn that implements the plan.
+ * Checks whether the `unknown` step at `callStep` is an `ask_question` call that agy answered with
+ * "User Skipped", and if so stops the turn and asks the user instead. Headless agy cannot show the
+ * question, and the stream carries nothing but the step type, so the conversation transcript is
+ * the only place the question can be read from.
+ */
+async function relaySkippedQuestion(
+  session: Session,
+  turn: PendingTurn,
+  callStep: number,
+  emit: Emit,
+): Promise<void> {
+  // A schema turn must end in the decoded answer, and without `permission` there is no card to
+  // show; agy settles the question itself in both, as it always did.
+  if (!session.planApproval || turn.schema || session.conversationId === null) return;
+  const path = conversationTranscriptPath(accountGeminiRoot(session.accountId), session.conversationId);
+  let skipped: SkippedQuestion | null = null;
+  let seen = false;
+  for (let attempt = 0; attempt < QUESTION_READ_ATTEMPTS && !seen; attempt += 1) {
+    if (attempt > 0) await sleep(QUESTION_READ_RETRY_MS);
+    const text = await readFile(path, "utf8").catch(() => "");
+    const { entries } = parseTranscriptLines(text);
+    seen = entries.some((entry) => entry.stepIndex === callStep);
+    if (seen) skipped = findSkippedQuestion(entries, callStep);
+  }
+  if (!seen) {
+    console.error(`[antigravity] step ${callStep} never reached ${path}; not checking it for a question`);
+    return;
+  }
+  // The turn may have ended, or been replaced, while the file was read.
+  if (skipped === null || session.closing || session.pendingTurns[0] !== turn) return;
+  stopForQuestion(session, turn, skipped, emit);
+}
+
+/**
+ * Stops the CLI before the model acts on "User Skipped" and completes the turn: the stop is the
+ * plugin's, not the user's, so the turn is not reported as interrupted. The process is detached
+ * first, which leaves its interrupted result and its exit to no turn at all. The next turn resumes
+ * the conversation in a fresh CLI.
+ */
+function stopForQuestion(session: Session, turn: PendingTurn, skipped: SkippedQuestion, emit: Emit): void {
+  const stopped = session.process;
+  session.process = null;
+  void stopped?.interrupt();
+  stopBackfill(turn);
+  const queued = session.pendingTurns.slice(1);
+  session.pendingTurns = [];
+  console.log(
+    `[antigravity] stopped ${turn.turnId} at step ${skipped.callStep}: agy skipped ${skipped.questions.length} question(s)`,
+  );
+
+  finalizeToolCalls(session, emit, turn, { status: "completed" });
+  emit({ type: "session.turn", sessionId: session.sessionId, turnId: turn.turnId, state: "completed" });
+  const callId = itemId(turn, skipped.callStep, "tool");
+  if (queued.length > 0) {
+    // A message the user sent while the turn ran already moved the conversation on, so it goes to
+    // the fresh CLI and the question is not asked. Their `started` was already announced.
+    publish(session, emit, questionRow(callId, skipped.questions, { kind: "dismissed" }));
+    void resendQueued(session, emit, queued);
+    return;
+  }
+  publish(session, emit, questionRow(callId, skipped.questions, { kind: "pending" }));
+  const id = `question:${turn.turnId}:${skipped.callStep}`;
+  session.pendingQuestion = { id, callId, questions: skipped.questions };
+  emit({ type: "session.permission", sessionId: session.sessionId, request: questionRequest(id, skipped.questions) });
+}
+
+/**
+ * The user's reply to a question card. An answer goes back as the next turn, on a plain launch
+ * whatever launched the turn that asked: `/teamwork-preview`'s answer is a message, not a command.
+ * A dismissal sends nothing; the model already holds "User Skipped" and the user types next.
+ */
+async function answerQuestion(
+  session: Session,
+  response: Extract<ProviderInput, { type: "session.permission" }>["response"],
+  emit: Emit,
+): Promise<void> {
+  const question = session.pendingQuestion;
+  if (!question) return;
+  if (response.behavior !== "allow") {
+    resolvePendingQuestion(session, emit);
+    return;
+  }
+  session.pendingQuestion = null;
+  emit({ type: "session.permission_resolved", sessionId: session.sessionId, permissionId: question.id });
+  const answers = readAnswers(question.questions, response);
+  publish(session, emit, questionRow(question.callId, question.questions, { kind: "answered", answers }));
+
+  session.launchPending = { schema: false, commands: false, skillDir: null };
+  await releaseDetached(session);
+  await startTurn(session, emit, {
+    shown: answerShown(question.questions, answers),
+    text: answerPrompt(question.questions, answers),
+    verbatim: false,
+  });
+}
+
+/**
+ * The user's answer to a plan prompt or a question card. Approving a plan leaves plan mode for
+ * `accept-edits` — plan mode would only have the model plan again — and sends the turn that
+ * implements the plan.
  */
 async function respondToPermission(
   input: Extract<ProviderInput, { type: "session.permission" }>,
@@ -1490,6 +1623,10 @@ async function respondToPermission(
   emit: Emit,
 ): Promise<void> {
   const session = requireSession(state, input.sessionId);
+  if (session.pendingQuestion?.id === input.permissionId) {
+    await answerQuestion(session, input.response, emit);
+    return;
+  }
   const plan = session.pendingPlan;
   if (!plan || plan.id !== input.permissionId) {
     console.error(`[antigravity] ignoring an answer to unknown permission ${input.permissionId}`);
@@ -1525,6 +1662,8 @@ async function closeSession(
   const detached = session.detached;
   session.detached = null;
   for (const turn of session.pendingTurns) stopBackfill(turn);
+  // Before the timeline is flushed, so the question's row is stored as dismissed.
+  resolvePendingQuestion(session, emit);
   state.sessions.delete(input.sessionId);
 
   // Children first — those being followed and those a replay re-opened with no tailer behind them
@@ -1796,6 +1935,12 @@ function handleStepUpdate(session: Session, step: AgyStepUpdate, emit: Emit): vo
     if (!turn.schema) scheduleBackfill(session, turn, emit);
     if (target) turn.snapshots.set(callId, readSnapshot(target));
     publish(session, emit, { type: "tool_call", ...tool, status: "running", error: null });
+    return;
+  }
+
+  // `ask_question` arrives as a bare `unknown` step; whether it was one is in the transcript.
+  if (step.step_type === STEP_UNKNOWN && step.state === STEP_STATE_DONE && turn) {
+    void relaySkippedQuestion(session, turn, step.step_index, emit);
     return;
   }
 
