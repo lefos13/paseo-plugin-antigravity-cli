@@ -83,7 +83,13 @@ import {
   type SkippedQuestion,
 } from "./questions";
 import { listConversations } from "./sessions";
-import { SubagentTranscript, parseTranscriptLines, transcriptFilePath, type ChildRender } from "./subagents";
+import {
+  SubagentTranscript,
+  parseTranscriptLines,
+  transcriptFilePath,
+  type ChildRender,
+  type ChildSpawn,
+} from "./subagents";
 import { TranscriptStore, transcriptExists } from "./transcript";
 import { hasEditContent, mapToolDetail, snapshotDiff } from "./tools";
 
@@ -100,6 +106,8 @@ const OBSERVED_LIMIT = 32;
 const BACKFILL_DELAY_MS = 5_000;
 
 const PLAN_MODE_ID = "plan";
+/** The slash command that runs as a plugin plan-mode turn instead of agy's own `/plan` workflow. */
+const PLAN_COMMAND = "plan";
 /** The mode an approved plan is implemented in. */
 const IMPLEMENT_MODE_ID = "accept-edits";
 /**
@@ -286,13 +294,22 @@ interface Session {
    * A CLI whose last turn was settled from the conversation transcript while its stream was still
    * held behind a background task (see `backfill.ts`). It is kept alive — the task it holds is
    * often a dev server the answer just told the user about — but it can never take another turn:
-   * a line written to it would queue behind that task. The next prompt or close disposes it.
+   * a line written to it would queue behind that task. It is not idle either: when a background
+   * task ends, agy hands the model its result and the settled turn carries on, unseen. So its
+   * transcript is watched, and the first step past the settled answer disposes it
+   * (`stopIfResumed`), as does the next prompt or close.
    */
-  detached: AgyProcess | null;
+  detached: DetachedCli | null;
   /** The plan a plan-mode turn ended with, while the user has not approved or dismissed it. */
   pendingPlan: { id: string; text: string } | null;
   /** The questions a stopped turn asked, while the user has not answered or dismissed them. */
-  pendingQuestion: { id: string; callId: string; questions: readonly AgyQuestion[] } | null;
+  pendingQuestion: {
+    id: string;
+    callId: string;
+    questions: readonly AgyQuestion[];
+    /** The asking turn was a plan, so the turn that answers it is one too. */
+    plan: boolean;
+  } | null;
   /**
    * Whether the host negotiated `permission`, without which neither a plan nor a question card can
    * be offered.
@@ -311,6 +328,12 @@ interface LaunchProfile {
   commands: boolean;
   /** The skill directory this process may read, for a plugin-expanded skill's turn, else null. */
   skillDir: string | null;
+}
+
+/** A CLI left holding a background task, and the watch that stops it once its model resumes. */
+interface DetachedCli {
+  readonly process: AgyProcess;
+  readonly watch: TranscriptPoller;
 }
 
 /**
@@ -396,6 +419,11 @@ interface SubagentRow {
   metadata: Record<string, JsonValue>;
   /** The turn that published it, so a child can be attributed to the turn that spawned it. */
   readonly turnId: string | null;
+  /**
+   * The follow of the child whose own timeline this row is drawn in, or null for a row of the
+   * conversation itself. A subagent that starts subagents of its own nests them here.
+   */
+  readonly host: ChildFollow | null;
   readonly stepIndex: number;
   info: SubagentInfo;
   /** The report the child sent, once it has one; the prompt until then. */
@@ -447,6 +475,18 @@ interface ChildFollow {
   opened: boolean;
   /** Whether the child reached its own last word. */
   done: boolean;
+  /** The follow of the child that started this one, or null when the conversation itself did. */
+  readonly host: ChildFollow | null;
+  /** The session whose timeline holds the row naming this child: the conversation, or its host. */
+  readonly hostSessionId: string;
+  /** The conversation this child reports to: the conversation itself, or its host. */
+  readonly parentConversationId: string;
+  /** How many children above this one there are; 0 for a child of the conversation. */
+  readonly depth: number;
+  /** Rows of the subagents this child started that are still to finish. */
+  readonly nested: Set<string>;
+  /** The child said its last word while subagents of its own were still running. */
+  closePending: boolean;
 }
 
 /** The error a failed turn reports, and whether retrying is likely to help. */
@@ -494,9 +534,9 @@ function createConnection(capabilities: readonly ProviderCapability[]): Provider
       for (const session of state.sessions.values()) {
         session.closing = true;
         if (session.process) running.push(session.process);
-        if (session.detached) running.push(session.detached);
+        const detached = takeDetached(session);
+        if (detached) running.push(detached);
         session.process = null;
-        session.detached = null;
         for (const turn of session.pendingTurns) stopBackfill(turn);
         if (session.transcript) flushing.push(session.transcript.flush());
         // A child is followed by a watcher and a timer of its own, and its rows live in a store of
@@ -808,6 +848,13 @@ function readSubagentInfo(item: ProviderTimelineItem): SubagentInfo | null {
   };
 }
 
+/** Where a stored row is replayed to: the session holding it, and that session's follow if any. */
+interface ReplayHost {
+  readonly sessionId: string;
+  /** Null for the conversation itself, and for a child that is not being followed any more. */
+  readonly follow: ChildFollow | null;
+}
+
 /**
  * Republishes one stored row, and with it the child session the row spawned.
  *
@@ -820,14 +867,15 @@ async function replayItem(
   session: Session,
   emit: Emit,
   item: ProviderTimelineItem,
+  host: ReplayHost = { sessionId: session.sessionId, follow: null },
 ): Promise<void> {
   const info = readSubagentInfo(item);
   if (item.type !== "tool_call" || info === null || info.conversationId === undefined) {
-    emit({ type: "timeline.item", sessionId: session.sessionId, item });
+    emit({ type: "timeline.item", sessionId: host.sessionId, item });
     return;
   }
   try {
-    await replaySubagentItem(session, emit, item, { ...info, conversationId: info.conversationId });
+    await replaySubagentItem(session, emit, item, { ...info, conversationId: info.conversationId }, host);
   } catch (error) {
     // Replaying a child is best-effort like everything else of B: failing `session.open` over it
     // would be worse than opening without the child.
@@ -842,6 +890,7 @@ async function replaySubagentItem(
   emit: Emit,
   item: Extract<ProviderTimelineItem, { type: "tool_call" }>,
   info: SubagentInfo & { conversationId: string },
+  host: ReplayHost,
 ): Promise<void> {
   // The child's rows were stored under the child's own conversation, which is what the row's
   // metadata names; a subagent row whose child kept nothing is replayed without a link, since the
@@ -857,6 +906,7 @@ async function replaySubagentItem(
     detail: detail ?? { type: "sub_agent", log: "" },
     metadata: {},
     turnId: null,
+    host: host.follow,
     stepIndex: typeof item.metadata?.stepIndex === "number" ? item.metadata.stepIndex : 0,
     info,
     log: detail?.log ?? info.prompt ?? "",
@@ -867,17 +917,20 @@ async function replaySubagentItem(
     published: null,
   };
   refreshSubagentRow(row);
+  // Kept even when the child is over: a child that is still going re-renders every row it ever
+  // started, and a row that is already known is not started a second time.
+  session.subagents.set(row.id, row);
   // Published with `emit`, not `publish`: replaying a row must not write it again, which would
   // move it to the end of the store and reorder the rows of the next replay.
   const rendered = subagentItem(row);
   row.published = JSON.stringify(rendered);
-  emit({ type: "timeline.item", sessionId: session.sessionId, item: rendered });
+  emit({ type: "timeline.item", sessionId: host.sessionId, item: rendered });
   if (childItems.length === 0) return;
 
   emit({
     type: "session.opened",
     sessionId: childId,
-    parentSessionId: session.sessionId,
+    parentSessionId: host.sessionId,
     toolCallId: row.id,
     capabilities: [],
     restoration: "parent",
@@ -893,7 +946,22 @@ async function replaySubagentItem(
     turnId: childTurnId(info.conversationId),
     state: "started",
   });
-  for (const child of childItems) emit({ type: "timeline.item", sessionId: childId, item: child });
+
+  // A child that never finished is followed on, when its transcript is still there to follow. The
+  // follow exists before the child's rows are replayed because the subagents *it* started are
+  // replayed with them, and are hosted by it.
+  const path = info.done === true || info.logUri === undefined ? null : transcriptFilePath(info.logUri);
+  const followable =
+    path !== null &&
+    existsSync(path) &&
+    !session.closing &&
+    (host.follow !== null || host.sessionId === session.sessionId);
+  const follow = followable
+    ? createChildFollow(session, emit, row, info.conversationId, info.logUri ?? "", info.workspaceUris, stored, true)
+    : null;
+  for (const child of childItems) {
+    await replayItem(session, emit, child, { sessionId: childId, follow });
+  }
   if (info.done === true) {
     // The child had already finished when it was stored, so its session is closed with its turn:
     // a child the host still counts as live is one it reports as failed on the next reload.
@@ -906,11 +974,8 @@ async function replaySubagentItem(
     emit({ type: "session.closed", sessionId: childId });
     return;
   }
-
-  // The child never finished. Its transcript is still being written if it is still there, and the
-  // rows it holds are the ones this replay just published, so a later read only adds to them.
-  const path = info.logUri === undefined ? null : transcriptFilePath(info.logUri);
-  if (path === null || !existsSync(path)) {
+  if (session.closing) return;
+  if (follow === null) {
     // Nothing left to follow, and a child cannot stay open forever: it ends where its stored rows
     // do, with the reason it can go no further.
     emit({
@@ -920,36 +985,10 @@ async function replaySubagentItem(
     });
     return;
   }
-  if (session.closing) return;
-  // Followed from here on, so the parent's own close still covers it if it never finishes.
+  // The rows it holds are the ones just published, so a later read only adds to them. Followed
+  // from here on, so the parent's own close still covers it if it never finishes.
   session.childSessions.add(childId);
-  session.subagents.set(row.id, row);
-  const follow: ChildFollow = {
-    rowId: row.id,
-    childConversationId: info.conversationId,
-    childId,
-    turnId: null,
-    cwd: resolveChildCwd(session.config.cwd, info.workspaceUris),
-    store: stored,
-    opened: true,
-    done: false,
-    transcript: null as unknown as SubagentTranscript,
-  };
-  follow.transcript = new SubagentTranscript(
-    {
-      logUri: info.logUri ?? "",
-      childConversationId: info.conversationId,
-      parentConversationId: session.conversationId ?? "",
-      cwd: follow.cwd,
-    },
-    {
-      onRender: (render, changed) => handleChildRender(session, emit, follow, render, changed),
-      onDegrade: (reason) =>
-        console.error(`[antigravity] not following subagent ${info.conversationId}: ${reason}`),
-      onLost: (reason) => handleChildLost(session, emit, follow, reason),
-    },
-  );
-  session.follows.set(row.id, follow);
+  registerFollow(session, follow);
   follow.transcript.start();
 }
 
@@ -1053,11 +1092,16 @@ async function promptSession(
     });
     return;
   }
+  // `/plan` is never the CLI's own: its workflow approves its own plan review in a headless run
+  // and implements in the same turn (observed 2026-09-29: "The user has automatically approved the
+  // artifact through their review policy. Proceed to execution."). It becomes a plan-mode turn of
+  // the plugin's instead — the preamble and the plan card — whatever mode the session is in.
+  const planCommand = command !== null && skill === null && command.name === PLAN_COMMAND;
   const profile: LaunchProfile = {
     schema: prompt.outputSchema !== undefined,
     // A plugin-expanded skill never reaches the CLI as a slash name, so it needs no expansion —
     // and must not have it, or a body containing `/...` could be parsed as a command.
-    commands: command !== null && skill === null,
+    commands: command !== null && skill === null && !planCommand,
     skillDir: skill?.dir ?? null,
   };
   // `--json-schema`, `--add-dir` and `--disable-slash-commands` belong to the process, not the
@@ -1128,7 +1172,7 @@ async function promptSession(
     const args = command.arguments.trim();
     // The leading `/name` is what the CLI expands, so it goes out as the first token of the turn.
     typed = args.length > 0 ? `/${command.name} ${args}` : `/${command.name}`;
-    text = expanded ?? typed;
+    text = planCommand ? args : (expanded ?? typed);
   } else if (prompt.input.type === "message") {
     try {
       text = await renderPromptContent(session, prompt.input.content);
@@ -1148,13 +1192,15 @@ async function promptSession(
     return;
   }
 
+  // The CLI expands `/name` only as the first token of a turn, so nothing may be put before a
+  // command the CLI expands itself.
+  const verbatim = command !== null && expanded === null && !planCommand;
   await startTurn(session, emit, {
     shown: typed.length > 0 ? typed : text,
     text,
     clientMessageId: prompt.clientMessageId,
-    // The CLI expands `/name` only as the first token of a turn, so nothing may be put before a
-    // command the CLI expands itself.
-    verbatim: command !== null && expanded === null,
+    verbatim,
+    plan: planCommand || (session.selection.mode === PLAN_MODE_ID && !verbatim),
   });
 }
 
@@ -1167,11 +1213,13 @@ interface TurnRequest {
   clientMessageId?: string;
   /** Written exactly as given: no system prompt and no plan-mode preamble in front of it. */
   verbatim: boolean;
+  /** A plan-mode turn: the preamble goes in front of the text and its answer is offered as a plan. */
+  plan: boolean;
 }
 
 async function startTurn(session: Session, emit: Emit, request: TurnRequest): Promise<void> {
   session.turnCounter += 1;
-  const plan = session.selection.mode === PLAN_MODE_ID && !request.verbatim;
+  const plan = request.plan;
   const turn: PendingTurn = {
     turnId: `turn-${session.turnCounter}-${randomUUID().slice(0, 8)}`,
     assistant: new Map(),
@@ -1335,11 +1383,22 @@ async function applyPendingRestart(session: Session): Promise<void> {
   await process.dispose();
 }
 
+/**
+ * Takes the CLI left holding a background task out of the session and stops watching it. The
+ * caller disposes the process that is returned.
+ */
+function takeDetached(session: Session): AgyProcess | null {
+  const detached = session.detached;
+  if (!detached) return null;
+  session.detached = null;
+  detached.watch.stop();
+  return detached.process;
+}
+
 /** Disposes the CLI left holding a background task, so a fresh one serves the next turn. */
 async function releaseDetached(session: Session): Promise<void> {
-  const detached = session.detached;
+  const detached = takeDetached(session);
   if (!detached) return;
-  session.detached = null;
   console.log("[antigravity] stopping the CLI that was still holding a background task");
   await detached.dispose();
 }
@@ -1424,7 +1483,7 @@ function applyBackfill(
     publish(session, emit, item);
   }
   if (render.finalStep !== null && turn.backfilled.has(render.finalStep)) {
-    settleFromTranscript(session, turn, emit);
+    settleFromTranscript(session, turn, render.finalStep, emit);
   }
 }
 
@@ -1432,8 +1491,9 @@ function applyBackfill(
  * Completes a turn whose answer only the transcript has. The CLI serving it still owes that turn's
  * `result`, and will not read another line until its background task ends, so it is detached:
  * nothing it prints is used any more, and a fresh CLI resumes the conversation for the next turn.
+ * Its transcript stays watched past `finalStep`, the settled answer (see `stopIfResumed`).
  */
-function settleFromTranscript(session: Session, turn: PendingTurn, emit: Emit): void {
+function settleFromTranscript(session: Session, turn: PendingTurn, finalStep: number, emit: Emit): void {
   stopBackfill(turn);
   const queued = session.pendingTurns.filter((pending) => pending !== turn);
   session.pendingTurns = [];
@@ -1446,9 +1506,23 @@ function settleFromTranscript(session: Session, turn: PendingTurn, emit: Emit): 
 
   const stuck = session.process;
   session.process = null;
-  if (stuck) {
-    if (session.detached) void session.detached.dispose();
-    session.detached = stuck;
+  const previous = takeDetached(session);
+  if (previous) void previous.dispose();
+  const conversationId = session.conversationId;
+  if (stuck && conversationId !== null) {
+    const detached: DetachedCli = {
+      process: stuck,
+      watch: new TranscriptPoller(
+        conversationTranscriptPath(accountGeminiRoot(session.accountId), conversationId),
+        (entries) => stopIfResumed(session, detached, finalStep, entries, emit),
+      ),
+    };
+    session.detached = detached;
+    detached.watch.start();
+  } else if (stuck) {
+    // Unreachable — the transcript that settled the turn is the conversation's — but a CLI nobody
+    // watches must not be left running.
+    void stuck.dispose();
   }
   emitNotice(
     session,
@@ -1456,7 +1530,7 @@ function settleFromTranscript(session: Session, turn: PendingTurn, emit: Emit): 
     "agy-background-task",
     "info",
     "A background command is still running",
-    "Antigravity left a command running in the background (for example a dev server) after its answer. It keeps running until your next message, which resumes this conversation in a fresh Antigravity CLI and stops it.",
+    "Antigravity left a command running in the background (for example a dev server) after its answer. It keeps running until your next message, which resumes this conversation in a fresh Antigravity CLI and stops it. If Antigravity starts working again on its own before that, it is stopped.",
   );
   // Turns written behind the settled one were queued inside the detached CLI and would never run
   // there, so they go to the fresh one instead. Their `started` was already announced.
@@ -1466,6 +1540,38 @@ function settleFromTranscript(session: Session, turn: PendingTurn, emit: Emit): 
 async function resendQueued(session: Session, emit: Emit, queued: readonly PendingTurn[]): Promise<void> {
   await releaseDetached(session);
   for (const turn of queued) await writePendingTurn(session, emit, turn);
+}
+
+/**
+ * Stops a detached CLI whose conversation moved past the answer its turn was settled with. That
+ * is agy carrying the settled turn on by itself — typically handed a background task's result
+ * when the task ended — and nothing it does from there would be seen: its stream is no longer
+ * read. Observed 2026-09-29: after "I will continue as soon as initialization completes", the
+ * detached CLI built an entire app and started its dev server. Nothing may run without the user's
+ * next message, so the CLI is stopped, and that message resumes the conversation in a fresh one.
+ */
+function stopIfResumed(
+  session: Session,
+  detached: DetachedCli,
+  finalStep: number,
+  entries: readonly { stepIndex: number }[],
+  emit: Emit,
+): void {
+  if (session.closing || session.detached !== detached) return;
+  if (!entries.some((entry) => entry.stepIndex > finalStep)) return;
+  takeDetached(session);
+  console.log(
+    `[antigravity] the detached CLI's conversation moved past step ${finalStep} on its own; stopping it`,
+  );
+  void detached.process.dispose();
+  emitNotice(
+    session,
+    emit,
+    "agy-background-resumed",
+    "warning",
+    "Antigravity was stopped",
+    "Antigravity started working again on its own after its answer, usually because a background command it was waiting for finished. The plugin stopped it, and its background commands with it, so nothing runs without your say. Send a message, such as \"continue\", to resume the conversation.",
+  );
 }
 
 /** The turn's last assistant text: what a plan-mode turn offers as its plan. */
@@ -1578,7 +1684,7 @@ function stopForQuestion(session: Session, turn: PendingTurn, skipped: SkippedQu
   }
   publish(session, emit, questionRow(callId, skipped.questions, { kind: "pending" }));
   const id = `question:${turn.turnId}:${skipped.callStep}`;
-  session.pendingQuestion = { id, callId, questions: skipped.questions };
+  session.pendingQuestion = { id, callId, questions: skipped.questions, plan: turn.plan };
   emit({ type: "session.permission", sessionId: session.sessionId, request: questionRequest(id, skipped.questions) });
 }
 
@@ -1609,13 +1715,16 @@ async function answerQuestion(
     shown: answerShown(question.questions, answers),
     text: answerPrompt(question.questions, answers),
     verbatim: false,
+    // An answer is a plain message, so plan mode makes it a plan turn like any other.
+    plan: question.plan || session.selection.mode === PLAN_MODE_ID,
   });
 }
 
 /**
- * The user's answer to a plan prompt or a question card. Approving a plan leaves plan mode for
- * `accept-edits` — plan mode would only have the model plan again — and sends the turn that
- * implements the plan.
+ * The user's answer to a plan prompt or a question card. Approving a plan sent in plan mode leaves
+ * it for `accept-edits` — plan mode would only have the model plan again — while a `/plan` turn's
+ * plan is implemented in the mode the session already had. Either way the turn that implements
+ * the plan follows.
  */
 async function respondToPermission(
   input: Extract<ProviderInput, { type: "session.permission" }>,
@@ -1636,8 +1745,10 @@ async function respondToPermission(
   resolvePendingPlan(session, emit);
   if (input.response.behavior !== "allow") return;
 
-  session.selection.mode = IMPLEMENT_MODE_ID;
-  emit({ type: "session.config", sessionId: session.sessionId, config: configState(session) });
+  if (session.selection.mode === PLAN_MODE_ID) {
+    session.selection.mode = IMPLEMENT_MODE_ID;
+    emit({ type: "session.config", sessionId: session.sessionId, config: configState(session) });
+  }
   // The mode is a launch flag, and the implementing turn is a plain message.
   session.launchPending = { schema: false, commands: false, skillDir: null };
   if (session.process?.running) session.needsRestart = true;
@@ -1647,6 +1758,7 @@ async function respondToPermission(
     shown: IMPLEMENT_PLAN_TEXT,
     text: IMPLEMENT_PLAN_TEXT,
     verbatim: false,
+    plan: false,
   });
 }
 
@@ -1659,8 +1771,7 @@ async function closeSession(
   session.closing = true;
   const process = session.process;
   session.process = null;
-  const detached = session.detached;
-  session.detached = null;
+  const detached = takeDetached(session);
   for (const turn of session.pendingTurns) stopBackfill(turn);
   // Before the timeline is flushed, so the question's row is stored as dismissed.
   resolvePendingQuestion(session, emit);
@@ -2023,7 +2134,7 @@ function handleSubagentStep(
     const id = `agy:subagent:${turn.turnId}:${step.step_index}:${index}`;
     const row =
       session.subagents.get(id) ??
-      createSubagentRow(name, id, turn.turnId, step.step_index, index);
+      createSubagentRow(name, id, turn.turnId, step.step_index, index, null);
 
     // The tool line's child and the subagent line's are the same child, so every field is set by
     // whichever line has it: the DONE line adds the conversation and its transcript's location to
@@ -2050,9 +2161,10 @@ function handleSubagentStep(
 function createSubagentRow(
   name: string,
   id: string,
-  turnId: string,
+  turnId: string | null,
   stepIndex: number,
   index: number,
+  host: ChildFollow | null,
 ): SubagentRow {
   return {
     id,
@@ -2061,6 +2173,7 @@ function createSubagentRow(
     detail: { type: "sub_agent", log: "" },
     metadata: {},
     turnId,
+    host,
     stepIndex,
     info: { index },
     log: "",
@@ -2121,7 +2234,17 @@ function publishSubagent(session: Session, emit: Emit, row: SubagentRow): void {
   const json = JSON.stringify(item);
   if (json === row.published) return;
   row.published = json;
-  publish(session, emit, item);
+  const host = row.host;
+  if (host === null) {
+    publish(session, emit, item);
+    return;
+  }
+  // The row of a subagent's own subagent lives in that subagent's timeline, stored with it. A
+  // host that is no longer open has nowhere to show it, but what the row says is still history.
+  host.store?.upsert(item);
+  if (host.opened && session.childSessions.has(host.childId)) {
+    emit({ type: "timeline.item", sessionId: host.childId, item });
+  }
 }
 
 function childSessionId(parentSessionId: string, childConversationId: string): string {
@@ -2150,11 +2273,40 @@ function closeChildSession(
   // Several paths settle the same child — the child finishing, the turn ending, the transcript
   // being given up on — and only the first of them may close the session.
   if (!session.childSessions.delete(follow.childId)) return;
+  follow.closePending = false;
   emit({
     type: "session.closed",
     sessionId: follow.childId,
     ...(error !== undefined ? { error } : {}),
   });
+  releaseFromHost(session, emit, follow);
+}
+
+/**
+ * Closes a child that said its last word, unless subagents it started are still running: their
+ * rows are drawn in its session, so it stays open until the last of them is over.
+ */
+function requestChildClose(session: Session, emit: Emit, follow: ChildFollow): void {
+  if (follow.nested.size > 0) {
+    follow.closePending = true;
+    return;
+  }
+  closeChildSession(session, emit, follow);
+}
+
+/** A child is over; the child that started it may now be closable. */
+function releaseFromHost(session: Session, emit: Emit, follow: ChildFollow): void {
+  releaseNested(session, emit, follow.host, follow.rowId);
+}
+
+function releaseNested(
+  session: Session,
+  emit: Emit,
+  host: ChildFollow | null,
+  rowId: string,
+): void {
+  if (host === null || !host.nested.delete(rowId)) return;
+  if (host.closePending && host.nested.size === 0) closeChildSession(session, emit, host);
 }
 
 /**
@@ -2195,6 +2347,9 @@ async function startChildFollow(
     console.error(
       `[antigravity] could not follow subagent ${childConversationId}: ${describe(error)}`,
     );
+    // No follow was left behind, so nothing will ever report this child over: it must not hold
+    // its host open.
+    if (!session.follows.has(row.id)) releaseNested(session, emit, row.host, row.id);
   }
 }
 
@@ -2223,6 +2378,31 @@ async function followChildTranscript(
   // The await above is long enough for the session to have closed under us.
   if (session.closing || session.follows.has(row.id)) return;
 
+  const follow = createChildFollow(
+    session,
+    emit,
+    row,
+    childConversationId,
+    logUri,
+    workspaceUris,
+    store,
+    false,
+  );
+  registerFollow(session, follow);
+  follow.transcript.start();
+}
+
+function createChildFollow(
+  session: Session,
+  emit: Emit,
+  row: SubagentRow,
+  childConversationId: string,
+  logUri: string,
+  workspaceUris: readonly string[] | undefined,
+  store: TranscriptStore | null,
+  opened: boolean,
+): ChildFollow {
+  const host = row.host;
   const follow: ChildFollow = {
     rowId: row.id,
     childConversationId,
@@ -2230,28 +2410,42 @@ async function followChildTranscript(
     turnId: row.turnId,
     cwd: resolveChildCwd(session.config.cwd, workspaceUris),
     store,
-    opened: false,
+    opened,
     done: false,
+    host,
+    hostSessionId: host?.childId ?? session.sessionId,
+    parentConversationId: host?.childConversationId ?? session.conversationId ?? "",
+    depth: host === null ? 0 : host.depth + 1,
+    nested: new Set(),
+    closePending: false,
     transcript: null as unknown as SubagentTranscript,
   };
   follow.transcript = new SubagentTranscript(
     {
       logUri,
       childConversationId,
-      parentConversationId: session.conversationId ?? "",
+      parentConversationId: follow.parentConversationId,
       cwd: follow.cwd,
     },
     {
       onRender: (render, changed) => handleChildRender(session, emit, follow, render, changed),
       // A transcript that cannot be followed at all leaves the row exactly as A published it,
       // which is why this degrades to that rather than removing or failing anything.
-      onDegrade: (reason) =>
-        console.error(`[antigravity] not following subagent ${childConversationId}: ${reason}`),
+      onDegrade: (reason) => {
+        console.error(`[antigravity] not following subagent ${childConversationId}: ${reason}`);
+        releaseFromHost(session, emit, follow);
+      },
       onLost: (reason) => handleChildLost(session, emit, follow, reason),
+      isBusy: () => follow.nested.size > 0,
     },
   );
-  session.follows.set(row.id, follow);
-  follow.transcript.start();
+  return follow;
+}
+
+/** Follows a child from now on, so its host does not close while it runs. */
+function registerFollow(session: Session, follow: ChildFollow): void {
+  session.follows.set(follow.rowId, follow);
+  follow.host?.nested.add(follow.rowId);
 }
 
 /** Publishes what a child has done since the last read, and settles it when it is finished. */
@@ -2274,7 +2468,8 @@ function handleChildRender(
     emit({
       type: "session.opened",
       sessionId: follow.childId,
-      parentSessionId: session.sessionId,
+      // A subagent started by another subagent hangs off that one, not off the conversation.
+      parentSessionId: follow.hostSessionId,
       toolCallId: follow.rowId,
       capabilities: [],
       restoration: "parent",
@@ -2292,7 +2487,15 @@ function handleChildRender(
     });
   }
 
+  const spawns = new Map(render.spawns.map((spawn) => [spawn.id, spawn]));
   for (const item of changed) {
+    // The call that started a subagent is drawn as the row this plugin keeps for it, in the place
+    // the call held among the child's rows.
+    const spawn = spawns.get(item.id);
+    if (spawn !== undefined) {
+      handleSpawn(session, emit, follow, spawn);
+      continue;
+    }
     if (follow.store) follow.store.upsert(item);
     emit({ type: "timeline.item", sessionId: follow.childId, item });
   }
@@ -2318,7 +2521,7 @@ function handleChildRender(
       turnId: childTurnId(follow.childConversationId),
       state: "completed",
     });
-    closeChildSession(session, emit, follow);
+    requestChildClose(session, emit, follow);
     follow.transcript.stop();
     // The child's rows are complete here, so they no longer have to wait out the write debounce:
     // a session closed right after this still replays everything the child said.
@@ -2326,22 +2529,53 @@ function handleChildRender(
   }
 }
 
+/**
+ * A subagent that a child started: a row in that child's session, and — once the call's result
+ * names the conversation it runs in — a child session of its own, followed like any other.
+ */
+function handleSpawn(session: Session, emit: Emit, host: ChildFollow, spawn: ChildSpawn): void {
+  const row =
+    session.subagents.get(spawn.id) ??
+    createSubagentRow(INVOKE_SUBAGENT, spawn.id, host.turnId, spawn.stepIndex, spawn.index, host);
+  if (spawn.typeName !== undefined) row.info.typeName = spawn.typeName;
+  if (spawn.role !== undefined) row.info.role = spawn.role;
+  if (spawn.prompt !== undefined) row.info.prompt = spawn.prompt;
+  if (spawn.conversationId !== undefined) row.info.conversationId = spawn.conversationId;
+  if (spawn.logUri !== undefined) row.info.logUri = spawn.logUri;
+  if (spawn.workspaceUris !== undefined) row.info.workspaceUris = spawn.workspaceUris;
+  if (spawn.prompt !== undefined && row.log.length === 0) row.log = spawn.prompt;
+
+  refreshSubagentRow(row);
+  session.subagents.set(spawn.id, row);
+  publishSubagent(session, emit, row);
+
+  if (row.status === "running" && spawn.conversationId !== undefined && spawn.logUri !== undefined) {
+    // Counted as running from now, not from when its follow exists: that takes a read of the
+    // store, and the host may say its last word before then.
+    host.nested.add(row.id);
+    void startChildFollow(session, emit, row, spawn.conversationId, spawn.logUri, row.info.workspaceUris);
+  }
+}
+
 /** The child stopped writing before finishing: its own turn is canceled, never completed. */
 function handleChildLost(session: Session, emit: Emit, follow: ChildFollow, reason: string): void {
   console.error(`[antigravity] stopped following subagent ${follow.childConversationId}`);
-  if (session.closing || !follow.opened || follow.done) return;
-  const error: ProviderError = { message: reason };
-  emit({
-    type: "session.turn",
-    sessionId: follow.childId,
-    turnId: childTurnId(follow.childConversationId),
-    state: "canceled",
-    error,
-  });
-  // What the child did say is its history whatever ended it, so it is written out now rather than
-  // left to a debounce that may never fire.
-  void follow.store?.flush();
-  closeChildSession(session, emit, follow, error);
+  if (session.closing) return;
+  if (follow.opened && !follow.done) {
+    const error: ProviderError = { message: reason };
+    emit({
+      type: "session.turn",
+      sessionId: follow.childId,
+      turnId: childTurnId(follow.childConversationId),
+      state: "canceled",
+      error,
+    });
+    // What the child did say is its history whatever ended it, so it is written out now rather
+    // than left to a debounce that may never fire.
+    void follow.store?.flush();
+    closeChildSession(session, emit, follow, error);
+  }
+  releaseFromHost(session, emit, follow);
 }
 
 /**
@@ -2356,8 +2590,16 @@ async function settleChildFollows(
   turn: PendingTurn,
   outcome: { state: "canceled"; error: ProviderError } | { state: "failed"; error: ProviderError },
 ): Promise<void> {
-  for (const follow of [...session.follows.values()]) {
-    if (follow.turnId !== turn.turnId) continue;
+  // Deepest first: a child's session stays open for as long as the subagents it started, so those
+  // are settled before it is. A read can reveal subagents nobody had seen yet, which is why the
+  // next one is chosen afresh each time rather than taken from a list made up front.
+  for (;;) {
+    let follow: ChildFollow | undefined;
+    for (const candidate of session.follows.values()) {
+      if (candidate.turnId !== turn.turnId) continue;
+      if (follow === undefined || candidate.depth > follow.depth) follow = candidate;
+    }
+    if (follow === undefined) return;
     session.follows.delete(follow.rowId);
     try {
       await follow.transcript.readFinal();
@@ -2370,15 +2612,29 @@ async function settleChildFollows(
     // The child said everything it is going to say, so its rows are written out now rather than
     // left to a debounce this session may not live long enough to see.
     void follow.store?.flush();
-    if (session.closing || follow.done || !follow.opened) continue;
-    emit({
-      type: "session.turn",
-      sessionId: follow.childId,
-      turnId: childTurnId(follow.childConversationId),
-      state: outcome.state,
-      error: outcome.error,
-    });
-    closeChildSession(session, emit, follow, outcome.error);
+    if (session.closing) continue;
+    // A top-level row is settled with the tools of its turn; a nested one is in no turn's tools.
+    const row = session.subagents.get(follow.rowId);
+    if (follow.host !== null && row !== undefined && row.status === "running") {
+      if (outcome.state === "failed") {
+        row.status = "failed";
+        row.error = toErrorJson(outcome.error);
+      } else {
+        row.status = "canceled";
+      }
+      publishSubagent(session, emit, row);
+    }
+    if (!follow.done && follow.opened) {
+      emit({
+        type: "session.turn",
+        sessionId: follow.childId,
+        turnId: childTurnId(follow.childConversationId),
+        state: outcome.state,
+        error: outcome.error,
+      });
+      closeChildSession(session, emit, follow, outcome.error);
+    }
+    releaseFromHost(session, emit, follow);
   }
 }
 

@@ -201,6 +201,79 @@ describe("renderChild on the captured transcripts", () => {
     expect(render.done).toBe(true);
   });
 
+  it("reads the subagent a child started from its own transcript", () => {
+    // fixtures/18, captured 2026-09-29: a child that called `invoke_subagent` itself. Nothing but
+    // this transcript says so — the parent's stream names its direct children and no others.
+    const text = readFileSync(`${fixturesDir}/18-nested-subagent.transcript.jsonl`, "utf8");
+    const parsed = parseTranscriptLines(text);
+    expect(parsed.malformed).toBe(0);
+    const render = renderChild(parsed.entries, {
+      childConversationId: "11c90f78-b152-4237-b51e-50ad3fb29ca7",
+      parentConversationId: "e607a446-ebe2-4d91-995a-49f26c1b1e64",
+      cwd: "/Users/dev/Documents/agy-nested-probe",
+    });
+
+    expect(render.unknownTypes).toEqual([]);
+    expect(render.spawns).toEqual([
+      {
+        id: "agy-sub:11c90f78-b152-4237-b51e-50ad3fb29ca7:2:spawn:0:0",
+        index: 0,
+        stepIndex: 2,
+        typeName: "DeepCoderWorkerL0",
+        role: "Layer 0 Coding Worker",
+        prompt:
+          "<original_task>\nTask: review/enhance the UI (better spacing, better readability, better nav bar, more organized sections etc)\n</original_task>",
+        conversationId: "06e9f6db-4881-44ec-9eb7-bfa241dd08ff",
+        logUri:
+          "file:///Users/dev/.gemini/antigravity-cli/brain/06e9f6db-4881-44ec-9eb7-bfa241dd08ff/.system_generated/logs/transcript.jsonl",
+        workspaceUris: [
+          "file:///Users/dev/.paseo/plugin-data/antigravity-cli/attachments/75045ef9-b5d2-49b2-8b7b-d86374776b95",
+          "file:///Users/dev/Documents/agy-nested-probe",
+        ],
+      },
+    ]);
+    // The call is a placeholder at the step it was made, not an ordinary tool row beside the
+    // spawn: the host draws the spawn as a row of its own.
+    expect(render.items.filter((item) => item.type === "tool_call")).toEqual([
+      expect.objectContaining({
+        id: "agy-sub:11c90f78-b152-4237-b51e-50ad3fb29ca7:2:spawn:0:0",
+        name: "invoke_subagent",
+        metadata: {
+          conversationId: "06e9f6db-4881-44ec-9eb7-bfa241dd08ff",
+          logUri: expect.stringContaining("06e9f6db-4881-44ec-9eb7-bfa241dd08ff"),
+        },
+      }),
+    ]);
+  });
+
+  it("names the subagents of a call whose result has not arrived from what the model asked for", () => {
+    const render = renderChild(
+      [
+        {
+          stepIndex: 1,
+          type: "PLANNER_RESPONSE",
+          toolCalls: [
+            {
+              name: "invoke_subagent",
+              args: {
+                Subagents: JSON.stringify([
+                  { Prompt: "one", Role: "A", TypeName: "t" },
+                  { Prompt: "two", Role: "B", TypeName: "t" },
+                ]),
+              },
+            },
+          ],
+        },
+      ],
+      context(CHILD_A),
+    );
+
+    expect(render.spawns.map((spawn) => [spawn.id, spawn.role, spawn.conversationId])).toEqual([
+      [`agy-sub:${CHILD_A}:1:spawn:0:0`, "A", undefined],
+      [`agy-sub:${CHILD_A}:1:spawn:0:1`, "B", undefined],
+    ]);
+  });
+
   it("renders the same rows however the lines arrived", () => {
     // Captured from real streams: a child writes several steps at once and may write step 2 before
     // step 1. The render must not depend on file order.

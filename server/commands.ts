@@ -31,8 +31,10 @@ export interface AgyCommand {
  */
 const SYSTEM_COMMANDS: readonly AgyCommand[] = [
   {
+    // Listed for the picker, but never sent to the CLI: agy's own `/plan` approves its own plan
+    // review headless, so the provider runs it as its own plan-mode turn instead.
     name: "plan",
-    description: "Plan the task before making changes (Antigravity's plan mode).",
+    description: "Plan the task and offer the plan for approval before making any changes.",
   },
   {
     name: "goal",

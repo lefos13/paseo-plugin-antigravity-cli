@@ -63,9 +63,13 @@ expansion is disabled, or approves its own plan review — nobody can answer tha
 and implements in the same turn. Plan mode is therefore the plugin's own: a plan-mode turn is prefixed
 with a `<plan_mode>` block telling the model to investigate read-only and end with a plan, and its last
 answer is then offered as a plan (`kind: "plan"` permission) with **Implement** and **Keep planning**.
-*Implement* switches to *Accept edits* and sends `The plan is approved. Implement it now.`; *Keep
-planning*, or another message, withdraws it. It is an instruction, not a sandbox: a model that ignores
-it can still write files.
+*Implement* switches a Plan-mode session to *Accept edits* and sends `The plan is approved. Implement
+it now.`; *Keep planning*, or another message, withdraws it. It is an instruction, not a sandbox: a
+model that ignores it can still write files.
+
+`/plan <task>` is the same plan turn in whatever mode the session is in, and never agy's own `/plan`
+workflow, which approves its own plan review headless and implements straight away. Its *Implement*
+keeps the session's mode.
 
 ### Questions (`ask_question`)
 
@@ -94,6 +98,11 @@ steps, and completes the turn as soon as the transcript shows the final answer. 
 command is left running, so the server stays up (a notice says so), but it cannot take another turn:
 your next message stops it, and the command with it, and resumes the conversation in a fresh CLI.
 
+That answer is not always the end: when a background command finishes, agy hands its result to the
+model, which carries on in the same turn. The plugin watches the transcript for that and stops the
+CLI at the first step past the answer, with a notice, so nothing runs that you cannot see. Send a
+message such as "continue" to pick up from there.
+
 ## Subagents
 
 `invoke_subagent` starts each subagent as its own conversation while the parent turn stays open. The
@@ -102,6 +111,11 @@ finishes) and a **child session per subagent** following the transcript agy name
 each tool call with its result, and the final answer. A child spawned with `Workspace: branch` runs in
 its own git worktree, which becomes that child session's working directory; a `Workspace: inherit`
 child keeps the parent's.
+
+A subagent that starts subagents of its own nests them: its timeline gets a row per grandchild, and
+each grandchild is a child session of that subagent, to any depth. agy's stream only names the
+conversations the parent started, so these are read from the subagent's own transcript (the result of
+its `invoke_subagent` call). A subagent's session stays open while the subagents it started still run.
 
 The transcript is agy-internal and undocumented, so a child session is best-effort: a missing,
 unreadable, or unrecognised transcript leaves the row above in place and never affects the parent turn.
@@ -115,7 +129,8 @@ turn relaunches with it.
 
 | Command | Source |
 |---|---|
-| `/plan`, `/goal`, `/grill-me`, `/teamwork-preview`, `/learn`, `/schedule`, `/boost`, `/browser` | The CLI's own workflows. `/learn` records a behaviour in the workspace's `GEMINI.md`, `/schedule` sets up a recurring run, and `/boost` and `/browser` are the deep-thinking and browser-agent flows. |
+| `/plan` | Paseo's plan turn, run by the plugin rather than the CLI ([Plan mode](#plan-mode)). |
+| `/goal`, `/grill-me`, `/teamwork-preview`, `/learn`, `/schedule`, `/boost`, `/browser` | The CLI's own workflows. `/learn` records a behaviour in the workspace's `GEMINI.md`, `/schedule` sets up a recurring run, and `/boost` and `/browser` are the deep-thinking and browser-agent flows. |
 | `/<name>` | A skill, either in the workspace's customization roots (`.agents/skills/<name>/SKILL.md`, and the same under `.agent/`, `_agents/`, `_agent/`) or installed for every workspace under `~/.gemini/antigravity-cli/skills/`, `~/.gemini/config/skills/`, `~/.gemini/skills/`, in that precedence. The name is the skill's frontmatter `name`, and the CLI's own built-ins are listed too. |
 | `<plugin>:<name>` | A plugin's skill, under `~/.gemini/config/plugins/<plugin>/skills/`. A plugin holding one skill directly in `skills/` is addressed with a `..` placeholder: `/android-cli-plugin:..:android-cli`. |
 

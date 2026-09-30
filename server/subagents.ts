@@ -46,6 +46,9 @@ const TRANSCRIPT_EPHEMERAL_MESSAGE = "EPHEMERAL_MESSAGE";
 /** The tool a child reports to its parent with; the parent conversation id is the recipient. */
 const SEND_MESSAGE = "send_message";
 
+/** The tool that starts subagents. A child may call it too, which is how subagents nest. */
+const INVOKE_SUBAGENT = "invoke_subagent";
+
 export interface TranscriptToolCall {
   readonly name: string;
   readonly args: Record<string, unknown>;
@@ -197,6 +200,12 @@ export interface ChildRender {
   /** The child's report to its parent, else whatever it said last. */
   readonly report: string;
   readonly actions: readonly ChildAction[];
+  /**
+   * The subagents this child started itself, one per child of each `invoke_subagent` call. The call
+   * is not also a row of `items`: the host draws each spawn as its own row, linked to its own
+   * session, exactly as it does for the children of the top-level conversation.
+   */
+  readonly spawns: readonly ChildSpawn[];
   /** Step types this plugin does not know, reported rather than guessed at. */
   readonly unknownTypes: readonly string[];
 }
@@ -214,6 +223,7 @@ export function renderChild(
 ): ChildRender {
   const sorted = [...entries].sort((left, right) => left.stepIndex - right.stepIndex);
   const items: ProviderTimelineItem[] = [];
+  const spawns: ChildSpawn[] = [];
   const actions: ChildAction[] = [];
   const unknownTypes: string[] = [];
   let report = "";
@@ -257,6 +267,25 @@ export function renderChild(
       entry.toolCalls.forEach((call, index) => {
         const decoded = decodeArgs(call.args);
         const output = results[index];
+        const spawned =
+          call.name === INVOKE_SUBAGENT
+            ? readSpawns(childItemId(context, entry.stepIndex, "spawn"), entry.stepIndex, index, decoded.parameters, output)
+            : [];
+        if (spawned.length > 0) {
+          spawns.push(...spawned);
+          // Placeholders, so the row lands where the call was made among the child's other rows.
+          // The provider replaces each with the row it keeps for that spawn; what makes a
+          // placeholder change — and be handed over again — is the conversation the call's result
+          // adds, so that is carried in its metadata.
+          for (const spawn of spawned) items.push(spawnPlaceholder(spawn, call.name));
+          actions.push({
+            index: actionIndex,
+            toolName: call.name,
+            ...(decoded.toolSummary !== undefined ? { summary: decoded.toolSummary } : {}),
+          });
+          actionIndex += 1;
+          return;
+        }
         const id = `${childItemId(context, entry.stepIndex, "tool")}:${index}`;
         const detail = mapToolDetail(
           call.name,
@@ -307,8 +336,138 @@ export function renderChild(
     done,
     report: report.length > 0 ? report : lastText,
     actions,
+    spawns,
     unknownTypes,
   };
+}
+
+/**
+ * One subagent a child started. `conversationId` and `logUri` arrive with the call's result, so a
+ * spawn whose call is still running has only what the model asked for.
+ */
+export interface ChildSpawn {
+  /** Stable across renders and unique per child of a call: derived from the step, never arrival. */
+  readonly id: string;
+  readonly index: number;
+  readonly stepIndex: number;
+  readonly typeName?: string;
+  readonly role?: string;
+  readonly prompt?: string;
+  readonly conversationId?: string;
+  readonly logUri?: string;
+  readonly workspaceUris?: readonly string[];
+}
+
+interface CreatedSubagent {
+  readonly conversationId: string;
+  readonly logUri?: string;
+  readonly workspaceUris?: readonly string[];
+}
+
+/**
+ * The children of one `invoke_subagent` call: what the model asked for (`Subagents`, decoded) paired
+ * by position with what the result says was created. An `invoke_subagent` that names no child at
+ * all yields none, and is left to render as the ordinary tool call it then is.
+ */
+function readSpawns(
+  idBase: string,
+  stepIndex: number,
+  callIndex: number,
+  parameters: Record<string, unknown>,
+  result: string | undefined,
+): ChildSpawn[] {
+  const call = parameters as { Subagents?: unknown };
+  if (call.Subagents === undefined && result === undefined) return [];
+  const requested = Array.isArray(call.Subagents) ? call.Subagents : [];
+  const created = result === undefined ? [] : parseCreatedSubagents(result);
+  const spawns: ChildSpawn[] = [];
+  for (let index = 0; index < Math.max(requested.length, created.length); index += 1) {
+    const asked = requested[index];
+    const record =
+      typeof asked === "object" && asked !== null && !Array.isArray(asked)
+        ? (asked as Record<string, unknown>)
+        : {};
+    const made = created[index];
+    spawns.push({
+      id: `${idBase}:${callIndex}:${index}`,
+      index,
+      stepIndex,
+      ...(typeof record.TypeName === "string" ? { typeName: record.TypeName } : {}),
+      ...(typeof record.Role === "string" ? { role: record.Role } : {}),
+      ...(typeof record.Prompt === "string" ? { prompt: record.Prompt } : {}),
+      ...(made !== undefined ? { conversationId: made.conversationId } : {}),
+      ...(made?.logUri !== undefined ? { logUri: made.logUri } : {}),
+      ...(made?.workspaceUris !== undefined ? { workspaceUris: made.workspaceUris } : {}),
+    });
+  }
+  return spawns;
+}
+
+function spawnPlaceholder(spawn: ChildSpawn, name: string): ProviderTimelineItem {
+  return {
+    type: "tool_call",
+    id: spawn.id,
+    callId: spawn.id,
+    name,
+    detail: { type: "sub_agent", log: spawn.prompt ?? "" },
+    status: "running",
+    error: null,
+    metadata: {
+      ...(spawn.conversationId !== undefined ? { conversationId: spawn.conversationId } : {}),
+      ...(spawn.logUri !== undefined ? { logUri: spawn.logUri } : {}),
+    },
+  };
+}
+
+/**
+ * The children an `invoke_subagent` result names. agy prints "Created the following subagents:"
+ * and then one pretty-printed JSON object per child, back to back (captured 2026-09-23 through
+ * 2026-09-29, one to three children), so the objects are cut out by balancing braces rather than
+ * parsed as a document.
+ */
+function parseCreatedSubagents(text: string): CreatedSubagent[] {
+  const created: CreatedSubagent[] = [];
+  let depth = 0;
+  let start = -1;
+  let inString = false;
+  let escaped = false;
+  for (let position = 0; position < text.length; position += 1) {
+    const char = text[position];
+    if (inString) {
+      if (escaped) escaped = false;
+      else if (char === "\\") escaped = true;
+      else if (char === '"') inString = false;
+      continue;
+    }
+    if (char === '"' && depth > 0) inString = true;
+    else if (char === "{") {
+      if (depth === 0) start = position;
+      depth += 1;
+    } else if (char === "}" && depth > 0) {
+      depth -= 1;
+      if (depth === 0) {
+        try {
+          const value: unknown = JSON.parse(text.slice(start, position + 1));
+          if (typeof value === "object" && value !== null && !Array.isArray(value)) {
+            const record = value as Record<string, unknown>;
+            if (typeof record.conversationId === "string" && record.conversationId.length > 0) {
+              const uris = record.workspaceUris;
+              created.push({
+                conversationId: record.conversationId,
+                ...(typeof record.logAbsoluteUri === "string" ? { logUri: record.logAbsoluteUri } : {}),
+                ...(Array.isArray(uris) && uris.every((uri) => typeof uri === "string")
+                  ? { workspaceUris: uris as string[] }
+                  : {}),
+              });
+            }
+          }
+        } catch {
+          // Braces in the surrounding prose are not a child.
+        }
+      }
+    }
+  }
+  return created;
 }
 
 /**
@@ -356,6 +515,11 @@ export interface SubagentTranscriptHandlers {
   onDegrade(reason: string): void;
   /** Following stopped while the child was still going. */
   onLost(reason: string): void;
+  /**
+   * Whether something the child is waiting on is still running. A child that waits for its own
+   * subagents writes nothing meanwhile, and silence alone must not read as a child that is gone.
+   */
+  isBusy?(): boolean;
 }
 
 export interface SubagentTranscriptConfig extends ChildContext {
@@ -545,7 +709,12 @@ export class SubagentTranscript {
       if (now - this.startedAt > NO_ENTRY_MS) this.degrade("no step appeared in its transcript");
       return;
     }
-    if (now - this.lastGrowthAt > NO_GROWTH_MS) this.lose();
+    if (now - this.lastGrowthAt <= NO_GROWTH_MS) return;
+    if (this.handlers.isBusy?.() === true) {
+      this.lastGrowthAt = now;
+      return;
+    }
+    this.lose();
   }
 
   private degrade(reason: string): void {

@@ -145,12 +145,15 @@ afterEach(async () => {
     "FAKE_SUBAGENT_COUNT",
     "FAKE_SUBAGENT_TRANSCRIPT",
     "FAKE_SUBAGENT_GATE",
+    "FAKE_SUBAGENT_NESTED",
+    "FAKE_SUBAGENT_NESTED_GATE",
     "FAKE_EDIT_FILE",
     "FAKE_EDIT_TOOL",
     "FAKE_EDIT_AFTER",
     "FAKE_EDIT_GATE",
     "FAKE_EDIT_SKIP_WRITE",
     "FAKE_BACKGROUND_GATE",
+    "FAKE_BACKGROUND_RESUME",
     "FAKE_QUESTIONS",
     "FAKE_QUESTION_TOOL",
     "FAKE_QUESTION_GATE",
@@ -2389,12 +2392,12 @@ describe("slash commands", () => {
     const { connection, events } = await connect();
     await openSession(connection);
 
-    await commandPrompt(connection, "plan", "say ok");
+    await commandPrompt(connection, "goal", "say ok");
     await waitFor(() => turns(events, "completed")[0], "the command turn to complete");
 
     // The command reaches the CLI as the first token of the turn, which is what expands it, and
     // the process carrying it must not disable expansion.
-    expect(readPrompts()).toEqual(["/plan say ok"]);
+    expect(readPrompts()).toEqual(["/goal say ok"]);
     const [commandLaunch] = readArgvLog();
     expect(commandLaunch).not.toContain("--disable-slash-commands");
 
@@ -2409,14 +2412,14 @@ describe("slash commands", () => {
     expect(launches[1]?.[launches[1].indexOf("--conversation") + 1]).toBe(
       "11111111-2222-3333-4444-555555555555",
     );
-    expect(readPrompts()).toEqual(["/plan say ok", "/skills reload"]);
+    expect(readPrompts()).toEqual(["/goal say ok", "/skills reload"]);
 
     // A second command reuses the expansion process rather than restarting again.
     await commandPrompt(connection, "grill-me", "say ok", "c3");
     await waitFor(() => turns(events, "completed")[2], "the second command turn to complete");
     expect(readArgvLog()).toHaveLength(3);
     expect(readArgvLog()[2]).not.toContain("--disable-slash-commands");
-    expect(readPrompts()).toEqual(["/plan say ok", "/skills reload", "/grill-me say ok"]);
+    expect(readPrompts()).toEqual(["/goal say ok", "/skills reload", "/grill-me say ok"]);
   });
 
   it("never prepends the system prompt in front of a command", async () => {
@@ -2445,7 +2448,7 @@ describe("slash commands", () => {
       "the CLI to start",
     );
 
-    await commandPrompt(connection, "plan", "say ok", "c2");
+    await commandPrompt(connection, "goal", "say ok", "c2");
     const refusal = await waitFor(
       () =>
         events.find(
@@ -2631,7 +2634,7 @@ describe("slash commands", () => {
     process.env.FAKE_SCENARIO = "interrupt";
     const { connection, events } = await connect();
     await openSession(connection);
-    await commandPrompt(connection, "plan", "say ok", "c1");
+    await commandPrompt(connection, "goal", "say ok", "c1");
     await waitFor(
       () => events.find((event) => event.type === "session.persistence"),
       "the CLI to start",
@@ -2658,7 +2661,7 @@ describe("slash commands", () => {
       () => (readPrompts().length > 0 ? true : undefined),
       "the command turn's prompt to reach the CLI",
     );
-    expect(readPrompts()).toEqual(["/plan say ok"]);
+    expect(readPrompts()).toEqual(["/goal say ok"]);
     expect(readArgvLog()).toHaveLength(1);
 
     await connection.send({ type: "session.interrupt", requestId: "i1", sessionId: "session-1" });
@@ -3156,6 +3159,81 @@ describe("subagents", () => {
     });
   });
 
+  it("opens a subagent that a subagent started under that subagent, and holds it open until then", async () => {
+    // The first child starts a subagent of its own, which only its own transcript reports. The
+    // gate holds that grandchild's last word back, so the child is done while it still runs.
+    const GRANDCHILD = "bbbbbbbb-0000-4000-8000-000000000000";
+    const nestedGate = join(tempDir, "nested-gate");
+    process.env.FAKE_SUBAGENT_NESTED = "1";
+    process.env.FAKE_SUBAGENT_NESTED_GATE = nestedGate;
+    const { events } = await startedTurn();
+    const childId = childIdOf(events);
+    const grandchildId = `session-1:subagent:${GRANDCHILD}`;
+    const spawnRowId = `agy-sub:${CHILD_A}:5:spawn:0:0`;
+
+    // Linked to the row in the child's timeline, and under the child rather than the conversation.
+    const opened = await waitFor(
+      () => childSessions(events).find((event) => event.sessionId === grandchildId),
+      "the nested subagent's session to open",
+    );
+    expect(opened).toMatchObject({
+      parentSessionId: childId,
+      toolCallId: spawnRowId,
+      capabilities: [],
+      restoration: "parent",
+      title: "Nested Worker",
+      description: "Summarise what you find.",
+    });
+    const row = await waitFor(
+      () =>
+        itemsFor(events, childId)
+          .filter((item) => item.id === spawnRowId)
+          .find((item) => item.type === "tool_call" && item.detail.type === "sub_agent" && item.detail.childSessionId === grandchildId),
+      "the nested subagent's row to link its session",
+    );
+    expect(row).toMatchObject({ name: "invoke_subagent", status: "running" });
+    // One row for the call, not a row for the call and another for the subagent it started.
+    expect(
+      new Set(
+        itemsFor(events, childId).flatMap((item) =>
+          item.type === "tool_call" && item.name === "invoke_subagent" ? [item.id] : [],
+        ),
+      ),
+    ).toEqual(new Set([spawnRowId]));
+
+    // The child said its last word, but its subagent is still going: its session stays open.
+    await waitFor(
+      () => (turnIndex(events, childId, "completed") >= 0 ? true : undefined),
+      "the child's turn to complete",
+    );
+    await waitOutAPoll();
+    expect(closedSessions(events, childId)).toEqual([]);
+
+    writeFileSync(nestedGate, "", "utf8");
+    await waitFor(
+      () => (closedSessions(events, childId).length > 0 ? true : undefined),
+      "the child's session to close",
+    );
+    expect(turnIndex(events, grandchildId, "completed")).toBeGreaterThan(-1);
+    expect(closedSessions(events, grandchildId)).toEqual([{ sessionId: grandchildId }]);
+    expect(closedSessions(events, childId)).toEqual([{ sessionId: childId }]);
+    // The subagent's session closes before the one hosting it.
+    expect(
+      events.findIndex((event) => event.type === "session.closed" && event.sessionId === grandchildId),
+    ).toBeLessThan(
+      events.findIndex((event) => event.type === "session.closed" && event.sessionId === childId),
+    );
+    expect(
+      itemsFor(events, childId)
+        .filter((item) => item.id === spawnRowId)
+        .at(-1),
+    ).toMatchObject({ status: "completed", detail: { childSessionId: grandchildId } });
+    expect(itemsFor(events, grandchildId).map((item) => item.type)).toEqual([
+      "user_message",
+      "assistant_message",
+    ]);
+  });
+
   it("cancels a running subagent and stops following its transcript on interrupt", async () => {
     // The gate holds the parent's answer, so the child is still running when the interrupt lands.
     process.env.FAKE_SUBAGENT_GATE = join(tempDir, "subagent-gate");
@@ -3394,6 +3472,64 @@ describe("subagents", () => {
       { sessionId: "session-replay" },
     ]);
   });
+
+  it("replays a subagent's own subagent under the subagent that started it", async () => {
+    const GRANDCHILD = "bbbbbbbb-0000-4000-8000-000000000000";
+    process.env.FAKE_SUBAGENT_NESTED = "1";
+    const { connection, events } = await startedTurn();
+    const grandchildId = `session-1:subagent:${GRANDCHILD}`;
+    await waitFor(
+      () => (turnIndex(events, grandchildId, "completed") >= 0 ? true : undefined),
+      "the nested subagent to finish",
+    );
+    await waitFor(() => turns(events, "completed")[0], "the parent's turn to complete");
+    await waitFor(
+      () => (closedSessions(events, childIdOf(events)).length > 0 ? true : undefined),
+      "the child's session to close",
+    );
+    await connection.send({ type: "session.close", requestId: "close-1", sessionId: "session-1" });
+    await waitFor(
+      () => events.find((event) => event.type === "session.closed" && event.sessionId === "session-1"),
+      "the session to close",
+    );
+
+    const replayConnection = await createProvider().connect({ versions: [1], capabilities: OFFERED });
+    openConnections.push(replayConnection);
+    const replayed = watchConnection(replayConnection);
+    await replayConnection.send({
+      type: "session.open",
+      requestId: "open-replay",
+      sessionId: "session-replay",
+      config: sessionConfig(),
+      history: "replay",
+      persistence: { version: 1, data: { conversationId: CONVERSATION_ID } },
+    } as ProviderInput);
+
+    const replayChildId = `session-replay:subagent:${CHILD_A}`;
+    const replayGrandchildId = `session-replay:subagent:${GRANDCHILD}`;
+    const spawnRowId = `agy-sub:${CHILD_A}:5:spawn:0:0`;
+    // The row sits in the child's replayed timeline and links to the subagent's session, which
+    // hangs off the child and not off the conversation.
+    expect(
+      itemsFor(replayed, replayChildId)
+        .filter((item) => item.id === spawnRowId)
+        .at(-1),
+    ).toMatchObject({
+      name: "invoke_subagent",
+      status: "completed",
+      detail: { type: "sub_agent", childSessionId: replayGrandchildId },
+    });
+    expect(
+      replayed.find((event) => event.type === "session.opened" && event.sessionId === replayGrandchildId),
+    ).toMatchObject({ parentSessionId: replayChildId, toolCallId: spawnRowId });
+    expect(itemsFor(replayed, replayGrandchildId).map((item) => item.type)).toEqual([
+      "user_message",
+      "assistant_message",
+    ]);
+    // Both ended with their stored turns, before the conversation said it was ready.
+    expect(closedSessions(replayed, replayGrandchildId)).toEqual([{ sessionId: replayGrandchildId }]);
+    expect(closedSessions(replayed, replayChildId)).toEqual([{ sessionId: replayChildId }]);
+  });
 });
 
 
@@ -3454,6 +3590,41 @@ describe("background commands", () => {
     const launches = readArgvLog();
     expect(launches).toHaveLength(2);
     expect(launches[1]).toContain("--conversation");
+  });
+
+  it("stops the detached CLI as soon as its model carries on without the user", async () => {
+    heldTurn();
+    const pidFile = join(tempDir, "resumed.pid");
+    process.env.FAKE_BACKGROUND_RESUME = pidFile;
+    const { connection, events } = await connect();
+    await openSession(connection);
+    await prompt(connection, "scaffold it");
+    await waitFor(() => turns(events, "completed")[0], "the held turn to complete");
+
+    // The background task ends, and the transcript shows the model working past its answer.
+    writeFileSync(process.env.FAKE_BACKGROUND_GATE ?? "", "");
+    const pid = Number(await waitFor(() => (existsSync(pidFile) ? readFileSync(pidFile, "utf8") : undefined), "the model to resume"));
+    await waitFor(
+      () => events.find((event) => event.type === "session.notice" && event.notice.id === "agy-background-resumed"),
+      "the resumed CLI to be stopped",
+    );
+    const alive = (): boolean => {
+      try {
+        process.kill(pid, 0);
+        return true;
+      } catch {
+        return false;
+      }
+    };
+    await waitFor(() => (alive() ? undefined : true), "the resumed CLI to exit");
+    expect(turns(events, "started")).toHaveLength(1);
+
+    // The next message resumes the conversation in a fresh CLI.
+    process.env.FAKE_SCENARIO = "text";
+    await prompt(connection, "continue", "m2");
+    await waitFor(() => turns(events, "completed")[1], "the next turn to complete");
+    expect(readArgvLog()).toHaveLength(2);
+    expect(readArgvLog()[1]).toContain("--conversation");
   });
 });
 
@@ -3573,6 +3744,43 @@ describe("plan mode", () => {
     await waitFor(() => turns(events, "completed")[0], "the turn to complete");
     expect(permissions(events)).toEqual([]);
     expect(readPrompts()[0]).toBe("add a cache");
+  });
+
+  it("runs /plan as the plugin's plan turn, never the CLI's self-approving workflow", async () => {
+    const { connection, events } = await connect();
+    await openSession(connection);
+    await connection.send({
+      type: "session.prompt",
+      sessionId: "session-1",
+      prompt: {
+        clientMessageId: "c1",
+        delivery: "auto",
+        input: { type: "command", name: "plan", arguments: "add a cache" },
+      },
+    } as ProviderInput);
+    const request = await waitFor(() => permissions(events)[0], "the plan prompt");
+
+    // Observed 2026-09-29: agy's own `/plan` approved its own plan review and implemented it.
+    // So the command is never expanded by the CLI: the preamble carries it, expansion stays off.
+    expect(readPrompts()[0]).toMatch(/^<plan_mode>[\s\S]*<\/plan_mode>\n\nadd a cache$/);
+    expect(readArgv()).toContain("--disable-slash-commands");
+    expect(request.kind).toBe("plan");
+    const shown = timelineItems(events).find((item) => item.type === "user_message");
+    expect(shown?.type === "user_message" && shown.text).toBe("/plan add a cache");
+
+    // The session was never in plan mode, so implementing keeps the mode it had.
+    const configsBefore = events.filter((event) => event.type === "session.config").length;
+    await connection.send({
+      type: "session.permission",
+      sessionId: "session-1",
+      permissionId: request.id,
+      response: { behavior: "allow", selectedActionId: "implement" },
+    });
+    await waitFor(() => turns(events, "completed")[1], "the implementing turn to complete");
+    expect(events.filter((event) => event.type === "session.config")).toHaveLength(configsBefore);
+    expect(readPrompts()[1]).toBe("The plan is approved. Implement it now.");
+    expect(readArgvLog().at(-1)).not.toContain("--mode");
+    expect(permissions(events)).toHaveLength(1);
   });
 });
 
@@ -4053,7 +4261,7 @@ describe("accounts", () => {
       prompt: {
         clientMessageId: "c1",
         delivery: "auto",
-        input: { type: "command", name: "plan", arguments: "say ok" },
+        input: { type: "command", name: "goal", arguments: "say ok" },
       },
     } as ProviderInput);
     await waitFor(() => turns(events, "completed")[1], "the command turn to complete");
@@ -4127,7 +4335,7 @@ describe("accounts", () => {
       prompt: {
         clientMessageId: "c1",
         delivery: "auto",
-        input: { type: "command", name: "plan", arguments: "say ok" },
+        input: { type: "command", name: "goal", arguments: "say ok" },
       },
     } as ProviderInput);
     const failed = await waitFor(() => turns(events, "failed")[0], "the failed turn");
