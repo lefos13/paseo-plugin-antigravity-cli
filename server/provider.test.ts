@@ -1557,6 +1557,55 @@ describe("structured output", () => {
     expect(timelineItems(events).filter((item) => item.type === "assistant_message")).toEqual([]);
   });
 
+  it("refuses a schema agy cannot start with, without replacing the running CLI", async () => {
+    const { connection, events } = await connect();
+    await openSession(connection);
+    await prompt(connection, "hello", "m1");
+    await waitFor(() => turns(events, "completed")[0], "the plain turn");
+
+    const refused = [
+      { type: "array", items: { type: "string" } },
+      { anyOf: [{ type: "string" }] },
+      "string",
+    ];
+    for (const [index, schema] of refused.entries()) {
+      await promptContent(connection, [{ type: "text", text: "answer" }], `s${index}`, schema);
+      const answer = await waitFor(
+        () =>
+          events.find(
+            (event) =>
+              event.type === "session.prompt_result" && event.clientMessageId === `s${index}`,
+          ),
+        "the schema prompt to be answered",
+      );
+      expect(answer).toMatchObject({
+        result: {
+          type: "failed",
+          error: { code: "schema_unsupported", message: expect.stringContaining('"type": "object"') },
+        },
+      });
+    }
+
+    // The CLI that answered the plain turn is the only one ever launched, and it still answers.
+    await prompt(connection, "again", "m2");
+    await waitFor(() => turns(events, "completed")[1], "the second plain turn");
+    expect(readArgvLog()).toHaveLength(1);
+    expect(readPrompts()).toEqual(["hello", "again"]);
+  });
+
+  it("adds the object type to a schema that only lists properties", async () => {
+    process.env.FAKE_SCENARIO = "schema";
+    const { connection, events } = await connect();
+    await openSession(connection);
+    const { type: _type, ...untyped } = SCHEMA;
+    await promptContent(connection, [{ type: "text", text: "which color?" }], "m1", untyped);
+    await waitFor(() => turns(events, "completed")[0], "the turn to complete");
+
+    const argv = readArgv();
+    const schemaPath = argv[argv.indexOf("--json-schema") + 1];
+    expect(JSON.parse(readFileSync(schemaPath, "utf8"))).toEqual(SCHEMA);
+  });
+
   it("fails a schema turn when the turn itself fails", async () => {
     process.env.FAKE_SCENARIO = "error";
     const { connection, events } = await connect();
@@ -1570,7 +1619,7 @@ describe("structured output", () => {
   });
 });
 
-describe("image attachments", () => {
+describe("image and file attachments", () => {
   /** Enough of a PNG to prove the bytes survive the base64 round trip. */
   const PNG = Buffer.from("89504e470d0a1a0a0000000d49484452", "hex");
 
@@ -1648,6 +1697,74 @@ describe("image attachments", () => {
     // Nothing reached the CLI and no turn was started.
     expect(readPrompts()).toEqual([]);
     expect(turns(events, "started")).toEqual([]);
+  });
+
+  it("puts an uploaded file where agy may read it, numbered after the images", async () => {
+    // Probed on 1.2.14 (fixtures/25): without `allowNonWorkspaceAccess`, a headless read of a file
+    // under ~/.paseo/uploads is auto-denied, while one inside an --add-dir is read.
+    const upload = join(tempDir, "paseo-uploads", "upload_1", "Q3 report.pdf");
+    mkdirSync(dirname(upload), { recursive: true });
+    writeFileSync(upload, "%PDF-1.4 probe");
+    const { connection, events } = await connect();
+    await openSession(connection);
+    await promptContent(connection, [
+      { type: "text", text: "summarise" },
+      { type: "image", data: PNG.toString("base64"), mimeType: "image/png" },
+      {
+        type: "uploaded_file",
+        id: "u1",
+        fileName: "Q3 report.pdf",
+        mimeType: "application/pdf",
+        size: 14,
+        path: upload,
+      },
+    ]);
+    await waitFor(() => turns(events, "completed")[0], "the turn to complete");
+
+    const placed = join(attachmentsPath(), "2-Q3_report.pdf");
+    expect(readPrompts()[0]).toBe(
+      [
+        "summarise",
+        "",
+        `[image attached: ${join(attachmentsPath(), "1.png")} — view it with view_file]`,
+        "",
+        `[uploaded file: ${placed} (Q3 report.pdf, application/pdf)]`,
+      ].join("\n"),
+    );
+    expect(readFileSync(placed, "utf8")).toBe("%PDF-1.4 probe");
+
+    // Closing the session removes the placed copy, never the upload Paseo owns.
+    await connection.send({ type: "session.close", requestId: "close-1", sessionId: "session-1" });
+    await waitFor(() => events.find((event) => event.type === "session.closed"), "the session to close");
+    expect(existsSync(placed)).toBe(false);
+    expect(readFileSync(upload, "utf8")).toBe("%PDF-1.4 probe");
+  });
+
+  it("fails the prompt when the uploaded file is gone", async () => {
+    const { connection, events } = await connect();
+    await openSession(connection);
+    await promptContent(connection, [
+      { type: "text", text: "summarise" },
+      {
+        type: "uploaded_file",
+        id: "u1",
+        fileName: "gone.pdf",
+        mimeType: "application/pdf",
+        size: 1,
+        path: join(tempDir, "missing", "gone.pdf"),
+      },
+    ]);
+    const refusal = await waitFor(
+      () =>
+        events.find(
+          (event) => event.type === "session.prompt_result" && event.result.type === "failed",
+        ),
+      "the prompt to be refused",
+    );
+    expect(refusal).toMatchObject({
+      result: { type: "failed", error: { code: "attachment_failed", message: expect.stringContaining("ENOENT") } },
+    });
+    expect(readPrompts()).toEqual([]);
   });
 });
 

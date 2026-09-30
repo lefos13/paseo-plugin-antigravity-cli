@@ -7,7 +7,7 @@ already installed and signed in on your machine.
 
 - Provider id: `antigravity-cli`
 - Requires: Paseo ≥ 0.9.1 (provider protocol version 1), Node 24 for the plugin process, and
-  Antigravity CLI 1.2.9–1.2.11 for the behaviour described below. The plugin also ships a client
+  Antigravity CLI 1.2.9–1.2.14 for the behaviour described below. The plugin also ships a client
   entry (the [accounts screen](#multiple-accounts)), so the connected Paseo **app** must satisfy the
   same minimum — a compatible daemon does not make an older app compatible.
 
@@ -46,8 +46,8 @@ prompt sent while a turn runs is queued by the CLI as the next turn. Model, tier
 are launch flags, so a change restarts the CLI on the next turn and resumes the same conversation;
 Antigravity conversations can be imported read-only, the conversation id agy reports is persisted,
 each subagent becomes a child session ([Subagents](#subagents)), and `permission` covers plan approval
-and the questions agy cannot ask ([Questions](#questions-ask_question)). Images go over by file,
-because a `stream-json` turn carries text only.
+and the questions agy cannot ask ([Questions](#questions-ask_question)). Images and uploaded files go
+over by file, because a `stream-json` turn carries text only.
 
 Models come from `agy models` (cached ten minutes; `force` rediscovers), so the composer offers one
 model per family with the tiers that family has — High, Medium and Low today. `providerOptions.effort`
@@ -115,7 +115,8 @@ message such as "continue" to pick up from there.
 `invoke_subagent` starts each subagent as its own conversation while the parent turn stays open. The
 plugin shows a **row per subagent** in the parent timeline (type, role, prompt, *running* until it
 finishes) and a **child session per subagent** following the transcript agy names for it: the prompt,
-each tool call with its result, and the final answer. A child spawned with `Workspace: branch` runs in
+each tool call with its result, the errors agy recorded in the subagent's run, where its context was
+compacted, and the final answer. A child spawned with `Workspace: branch` runs in
 its own git worktree, which becomes that child session's working directory; a `Workspace: inherit`
 child keeps the parent's.
 
@@ -139,7 +140,7 @@ turn relaunches with it.
 | `/plan` | Paseo's plan turn, run by the plugin rather than the CLI ([Plan mode](#plan-mode)). |
 | `/goal`, `/grill-me`, `/teamwork-preview`, `/learn`, `/schedule`, `/boost`, `/browser` | The CLI's own workflows. `/learn` records a behaviour in the workspace's `GEMINI.md`, `/schedule` sets up a recurring run, and `/boost` and `/browser` are the deep-thinking and browser-agent flows. |
 | `/<name>` | A skill, either in the workspace's customization roots (`.agents/skills/<name>/SKILL.md`, and the same under `.agent/`, `_agents/`, `_agent/`) or installed for every workspace under `~/.gemini/antigravity-cli/skills/`, `~/.gemini/config/skills/`, `~/.gemini/skills/`, in that precedence. The name is the skill's frontmatter `name`, and the CLI's own built-ins are listed too. |
-| `<plugin>:<name>` | A plugin's skill, under `~/.gemini/config/plugins/<plugin>/skills/`. A plugin holding one skill directly in `skills/` is addressed with a `..` placeholder: `/android-cli-plugin:..:android-cli`. |
+| `<plugin>:<name>` | A plugin's skill, under `~/.gemini/config/plugins/<plugin>/skills/`. A plugin holding one skill directly in `skills/` is addressed with a `..` placeholder: `/android-cli-plugin:..:android-cli`. A frontmatter `name` that already starts with `<plugin>:` is addressed with the prefix once, as agy does: `name: firebase:basics` is `/firebase:basics`. |
 
 - **Disabled plugins** are left out: `"enabled": false` in `~/.gemini/config/config.json`, or
   `"disabled": true` in a `plugin.json` with no `config.json` entry (an entry there always wins).
@@ -153,7 +154,11 @@ turn relaunches with it.
 ## What it cannot do, and why
 
 - **Steering** is impossible: a line written to agy's stdin while a turn runs is queued as the *next*
-  turn, so Paseo replaces the active turn instead of offering to steer it.
+  turn — even with `"queuedMessages": "send-immediately"`, which agy 1.2.14 applies in its terminal UI
+  only — so Paseo replaces the active turn instead of offering to steer it.
+- **Structured output needs an object**: agy 1.2.14 refuses a `--json-schema` whose root is not
+  `"type": "object"`, so such a prompt fails with `code: "schema_unsupported"` before the CLI is
+  touched. A root that lists `properties` without a `type` gets `"type": "object"` added.
 - **Tool permission prompts** cannot be surfaced either — agy resolves tool approval internally from
   its own `toolPermission` setting. Choose the behaviour in session settings.
 - **Rewind**: Antigravity's `/rewind` is interactive-only; nothing in `stream-json` exposes it.
@@ -171,13 +176,19 @@ turn relaunches with it.
 | **Agent profile** | An optional select of the custom agents `agy` has here; *Default* passes no `--agent`. |
 
 The select only offers what `agy` will launch: agents under the workspace's `.agents/agents/` and its
-global agent roots, `<name>.md` or `<name>/agent.md`, with a frontmatter `name` and `description`.
-`mainAgent: false` agents are skipped, hidden ones are offered, and workspace agents need that workspace
-trusted in `antigravity-cli/settings.json` (`trustedWorkspaces`) — the real
+global agent roots, `<name>.md` or `<name>/agent.md`, with a frontmatter `name` and `description`, plus
+those an `agents.json` names — in any workspace root (`.agents/agents.json`, …) and
+`~/.gemini/config/agents.json` — in the `skills.json` shape, where a filter names an agent with or
+without its `.md`, an entry may name a single agent file, and `~/` paths are not expanded.
+`mainAgent: false` agents are skipped, hidden ones are offered, and workspace agents (from either
+source) need that exact workspace trusted in `antigravity-cli/settings.json` (`trustedWorkspaces`) —
+on 1.2.14 a parent directory, the home directory included, trusts nothing below it — using the real
 `~/.gemini/antigravity-cli/settings.json` for the Default account, and each other account's own copy
-([Multiple accounts](#multiple-accounts)) — an unknown `--agent` name
-silently runs the default agent. The two Off/On settings are selects rather than toggles, because a
-Paseo plugin toggle has no visible state; older `true`/`false` values read as *On*/*Off*.
+([Multiple accounts](#multiple-accounts)). An unknown `--agent` name
+silently runs the default agent, and so does a profile picked after the conversation's first turn:
+agy 1.2.14 ignores `--agent` when it resumes a conversation that started without it. The two Off/On
+settings are selects rather than toggles, because a Paseo plugin toggle has no visible state; older
+`true`/`false` values read as *On*/*Off*.
 
 ## providerOptions
 
@@ -311,7 +322,8 @@ Under `$PASEO_HOME` (default `~/.paseo`), in `plugin-data/antigravity-cli/`:
 | Path | Contents |
 |---|---|
 | `transcripts/<conversationId>.jsonl` | Timeline rows of a conversation — a subagent's child session under its own id — so `history: "replay"` can restore them. Not written with `persist: false`. |
-| `attachments/<sessionId>/`, `schemas/<sessionId>.json` | Images decoded from prompts, and the JSON Schema a structured-output turn was launched with; both deleted on `session.close`. |
+| `attachments/<sessionId>/` | Images decoded from prompts, and each uploaded file placed there (a hard link, or a copy across volumes), because a headless agy without `allowNonWorkspaceAccess` refuses to read a file outside the directories it was given; deleted on `session.close`, which never touches Paseo's own upload. |
+| `schemas/<sessionId>.json` | The JSON Schema a structured-output turn was launched with; deleted on `session.close`. |
 | `accounts.json` | The account store: the active account's id and every account's id and name. Missing or unparsable means Default only. |
 | `accounts/<id>/home/` | The account's shadow home: its links into the real home, its own `.gemini` (sign-in, history, brain), its keychain and its `settings.json`. |
 | `accounts/<id>/sign-in.command` | The macOS sign-in launcher written when an account is added or signed in again: `export HOME=<shadow home>`, unlock the account's keychain, `exec agy`. Mode 0700. |
@@ -333,7 +345,9 @@ running subagent's transcript.
 - **The command list is read from disk, not from the CLI**, so a skill the CLI would refuse to load can
   appear in the picker, and a command it no longer expands is sent as ordinary text.
 - **Subagent sessions are read-only in Paseo**, and rely on agy's undocumented transcript file: if a
-  CLI update changes it, subagents fall back to rows without a child session.
+  CLI update changes it, subagents fall back to rows without a child session. agy's `@<subagent>`
+  prompt syntax is terminal-UI only: over `stream-json` it is an ordinary turn to the parent, which
+  the parent model may or may not relay, so the plugin offers no way to message a subagent directly.
 - **Questions are relayed after the fact.** The plugin stops the CLI once agy has already answered
   `User Skipped`, so any tool the model called in the same step as the question has already run. The
   card lives in memory: a plugin reload or daemon restart drops it, and you answer in chat instead.

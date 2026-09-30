@@ -1,0 +1,31 @@
+agy 1.2.14 — plugin skills whose frontmatter `name` already carries the plugin prefix (Task 5)
+Probed 2026-09-30 on macOS. Scratch plugins under ~/.gemini/config/plugins, no config.json entry
+(config.json checksum identical before/after; both scratch plugins deleted afterwards):
+
+  zzprobe/plugin.json              {"name":"zzprobe","version":"0.0.1","description":"probe"}
+  zzprobe/skills/foo/SKILL.md      name: zzprobe:foo   body: reply exactly SKILL-FOO-OK
+  zzprobe/skills/baz/SKILL.md      name: baz           body: reply exactly SKILL-BAZ-OK
+  zzflat/plugin.json               {"name":"zzflat",...}
+  zzflat/skills/SKILL.md           name: zzflat:bar    body: reply exactly SKILL-BAR-OK
+
+Each name was run as `agy -p "<name>" --model gemini-3.8-flash-low --output-format json
+--log-file <f>`. The answer alone is NOT evidence: agy lists the plugin's skills in the system
+prompt, and the model reads an unexpanded skill's SKILL.md itself and answers from it. Only the
+log line `Print mode: expanded slash command "<name>" (skill)` shows the CLI expanded it.
+
+  sent                                 log: expanded as            answer
+  /zzprobe:foo                         "zzprobe:foo" (skill)       SKILL-FOO-OK
+  /zzprobe:zzprobe:foo                 —                           SKILL-FOO-OK (model found it)
+  /zzprobe:nope                        —                           "does not exist in the zzprobe…"
+  /zzflat:bar                          —                           SKILL-BAR-OK (model found it)
+  /zzflat:..:bar                       "zzflat:..:bar" (skill)     SKILL-BAR-OK
+  /android-cli-plugin:android-cli      —                           prose (model found it)
+  /android-cli-plugin:..:android-cli   "android-cli-plugin:..:android-cli" (skill)
+
+  (An earlier run without --log-file also had /zzprobe:baz answer SKILL-BAZ-OK; the unprefixed
+  directory form is the case fixtures already cover.)
+
+VERDICT: agy strips a leading `<plugin dir>:` from a plugin skill's frontmatter name and then
+names it exactly like an unprefixed one — `<plugin>:<rest>` for a skill directory,
+`<plugin>:..:<rest>` for a flat skills/SKILL.md. Before this fix the plugin dropped such skills
+altogether (`COMMAND_NAME` rejects `:`), rather than double-prefixing them as the audit assumed.

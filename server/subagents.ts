@@ -36,12 +36,20 @@ import { mapToolDetail } from "./tools";
  *
  * `EPHEMERAL_MESSAGE` carries no content: the step holds its own metadata and nothing else, so it
  * is skipped like `GENERIC` rather than reported.
+ *
+ * `ERROR_MESSAGE` is a failure agy reported inside the child's run (a model or tool error), with
+ * the bare text in `error` and `Error: <text>` in `content`; the child usually carries on after it.
+ * `CHECKPOINT` is where agy compacted the child's context, its `content` the summary it resumed
+ * from — model-facing, so only the fact of the compaction becomes a row. Both are written since
+ * agy 1.2.4 (fixtures/20-transcript-error-checkpoint.jsonl, from a real 1.2.12 child).
  */
 const TRANSCRIPT_USER_INPUT = "USER_INPUT";
 const TRANSCRIPT_PLANNER_RESPONSE = "PLANNER_RESPONSE";
 const TRANSCRIPT_GENERIC = "GENERIC";
 const TRANSCRIPT_SYSTEM_MESSAGE = "SYSTEM_MESSAGE";
 const TRANSCRIPT_EPHEMERAL_MESSAGE = "EPHEMERAL_MESSAGE";
+const TRANSCRIPT_ERROR_MESSAGE = "ERROR_MESSAGE";
+const TRANSCRIPT_CHECKPOINT = "CHECKPOINT";
 
 /** The tool a child reports to its parent with; the parent conversation id is the recipient. */
 const SEND_MESSAGE = "send_message";
@@ -59,6 +67,8 @@ export interface TranscriptEntry {
   /** The line's `type`, exactly as written. */
   readonly type: string;
   readonly content?: string;
+  /** The failure text of an `ERROR_MESSAGE` step. */
+  readonly error?: string;
   readonly toolCalls: readonly TranscriptToolCall[];
 }
 
@@ -109,6 +119,7 @@ export function parseTranscriptLines(text: string): ParsedTranscript {
       stepIndex,
       type,
       ...(typeof record.content === "string" ? { content: record.content } : {}),
+      ...(typeof record.error === "string" ? { error: record.error } : {}),
       toolCalls: readToolCalls(record.tool_calls),
     });
   }
@@ -314,6 +325,26 @@ export function renderChild(
         if (recipient === context.parentConversationId && typeof message === "string") {
           report = message;
         }
+      });
+      continue;
+    }
+
+    if (entry.type === TRANSCRIPT_ERROR_MESSAGE) {
+      const message = (entry.error ?? entry.content ?? "").trim();
+      items.push({
+        type: "error",
+        id: childItemId(context, entry.stepIndex, "error"),
+        message: message.length > 0 ? message : "Antigravity reported an error",
+      });
+      continue;
+    }
+
+    if (entry.type === TRANSCRIPT_CHECKPOINT) {
+      items.push({
+        type: "compaction",
+        id: childItemId(context, entry.stepIndex, "compaction"),
+        status: "completed",
+        trigger: "auto",
       });
       continue;
     }

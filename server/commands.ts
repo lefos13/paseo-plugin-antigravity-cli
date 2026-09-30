@@ -162,8 +162,8 @@ export async function discoverCommands(cwd: string): Promise<DiscoveredCommands>
   const readConfigs = new Set<string>();
   for (const root of WORKSPACE_ROOTS) {
     await collectSkills(join(cwd, root, "skills"), commands);
-    const configs = await collectJsonConfigSkills(join(cwd, root, "skills.json"), repoRoot, readConfigs);
-    for (const { skill } of configs) remember(commands, skill);
+    const configs = await collectJsonConfig(join(cwd, root, "skills.json"), repoRoot, readConfigs, SKILL_CONFIG);
+    for (const { value } of configs) remember(commands, value);
   }
   // A global skill is addressed by its own name and outranks the CLI's own skills, which is why
   // these are read before the plugins and the built-in set. The global `skills.json` scores in the
@@ -171,21 +171,23 @@ export async function discoverCommands(cwd: string): Promise<DiscoveredCommands>
   for (const root of GLOBAL_ROOTS) {
     await collectSkills(join(homedir(), root), commands);
     if (root === GLOBAL_CONFIG_ROOT) {
-      const configs = await collectJsonConfigSkills(join(homedir(), GLOBAL_CONFIG_FILE), repoRoot, readConfigs);
-      for (const { skill } of configs) remember(commands, skill);
+      const configs = await collectJsonConfig(join(homedir(), GLOBAL_CONFIG_FILE), repoRoot, readConfigs, SKILL_CONFIG);
+      for (const { value } of configs) remember(commands, value);
     }
   }
   // Verified 2026-09-23: `/firebase:firebase-basics` expanded, so a plugin's skills are addressed
   // by the plugin's directory name and the skill's own name. A plugin that keeps its one skill
   // directly in `skills/` is addressed with a `..` placeholder instead of a directory:
   // `/android-cli-plugin:..:android-cli` expanded, while `/android-cli-plugin:android-cli` did not.
+  // A frontmatter name that already starts with `<plugin>:` has it stripped first, in both shapes
+  // (fixtures/21-plugin-skill-prefix.txt, 1.2.14).
   const configPlugins = await readConfigPlugins();
   const plugins = join(homedir(), ".gemini", "config", "plugins");
   for (const plugin of await subdirectories(plugins)) {
     if (await isPluginDisabled(plugin, configPlugins)) continue;
     const prefix = `${basename(plugin)}:`;
     const root = join(plugin, "skills");
-    const flat = await readSkill(join(root, "SKILL.md"));
+    const flat = await readSkill(join(root, "SKILL.md"), prefix);
     if (flat !== null) {
       remember(commands, { name: `${prefix}..:${flat.name}`, description: flat.description });
     }
@@ -247,7 +249,7 @@ async function collectSkills(
   prefix = "",
 ): Promise<void> {
   for (const dir of await subdirectories(root)) {
-    const skill = await readSkill(join(dir, "SKILL.md"));
+    const skill = await readSkill(join(dir, "SKILL.md"), prefix);
     if (skill === null) continue;
     remember(commands, { name: `${prefix}${skill.name}`, description: skill.description });
   }
@@ -278,8 +280,11 @@ async function subdirectories(root: string): Promise<string[]> {
  * the composer needs are taken from the frontmatter. A file whose frontmatter names no usable
  * command is skipped: the CLI does not expand one either (probed 2026-09-23 with a
  * frontmatter-less SKILL.md and with a directory whose name differs from its own `name`).
+ *
+ * `pluginPrefix` is `<plugin dir>:` for a plugin's skill: agy drops it from the front of the
+ * frontmatter name before naming the command, so the name returned here is without it.
  */
-async function readSkill(path: string): Promise<AgyCommand | null> {
+async function readSkill(path: string, pluginPrefix = ""): Promise<AgyCommand | null> {
   let head: string;
   try {
     head = (await readFile(path)).subarray(0, SKILL_HEAD_BYTES).toString("utf8");
@@ -289,7 +294,9 @@ async function readSkill(path: string): Promise<AgyCommand | null> {
   const match = FRONTMATTER.exec(head);
   if (!match) return null;
   const block = match[1] ?? "";
-  const name = field(block, "name");
+  const declared = field(block, "name");
+  // An empty prefix strips nothing, so a skill outside a plugin keeps its name as written.
+  const name = declared?.startsWith(pluginPrefix) ? declared.slice(pluginPrefix.length) : declared;
   if (name === null || !COMMAND_NAME.test(name)) return null;
   return { name, description: describeSkill(field(block, "description") ?? "") };
 }
@@ -372,28 +379,66 @@ async function isPluginDisabled(
   return false;
 }
 
-interface SkillConfigEntry {
-  /** The source the entry names: absolute, `~/`-relative, or relative to the repository root. */
+/** One `inherits` or `entries` item of a customization file (`skills.json`, `agents.json`). */
+interface ConfigEntry {
+  /** The source the entry names: absolute, `~/`-relative (skills only), or relative to the repository root. */
   path?: string;
   /** Item names to keep; one carrying a `/` is a nested item's own relative path. */
   include_only?: readonly string[];
-  /** Item names to skip, as a nested item's relative path or as its own directory name. */
+  /** Item names to skip, as a nested item's relative path or as its own item name. */
   exclude?: readonly string[];
 }
 
-interface SkillConfigFile {
-  inherits?: readonly SkillConfigEntry[];
-  entries?: readonly SkillConfigEntry[];
+interface ConfigFile {
+  inherits?: readonly ConfigEntry[];
+  entries?: readonly ConfigEntry[];
 }
 
 /**
- * A skill a `skills.json` names, with the item name the file's filters match it under: the
- * one-level directory name, or the nested path the file wrote out in full.
+ * An item a customization file names, with the item name the file's filters match it under: the
+ * one-level item name, or the nested path the file wrote out in full.
  */
-interface ConfiguredSkill {
+interface ConfiguredItem<T> {
   readonly item: string;
-  readonly skill: AgyCommand;
+  readonly value: T;
 }
+
+/**
+ * What differs between the customization files agy reads in the same `inherits`/`entries` shape.
+ * The shape, the one-level scan, the exact-name filters and the repository-root resolution are
+ * shared; how an item looks on disk, how a filter names it, and whether `~/` expands are not.
+ */
+interface ConfigKind<T> {
+  /** The items directly inside an entry's directory, each under its one-level item name. */
+  scan(dir: string): Promise<ConfiguredItem<T>[]>;
+  /** A nested item, from its path under the entry's directory as `include_only` names it. */
+  readNested(path: string): Promise<T | null>;
+  /** An entry whose `path` names one item file rather than a directory; null when the kind has none. */
+  readFile: ((path: string) => Promise<T | null>) | null;
+  /** The item name a filter string refers to. */
+  filterName(name: string): string;
+  /** Whether a `~/…` path is expanded to the home directory. */
+  expandHome: boolean;
+}
+
+/**
+ * `skills.json`: an item is a directory holding `SKILL.md`. `~/` expands as the CLI's docs state —
+ * unprobed for skills; `agents.json` was probed not to (fixtures/23), so this may be too generous.
+ */
+const SKILL_CONFIG: ConfigKind<AgyCommand> = {
+  async scan(dir) {
+    const found: ConfiguredItem<AgyCommand>[] = [];
+    for (const sub of await subdirectories(dir)) {
+      const skill = await readSkill(join(sub, "SKILL.md"));
+      if (skill !== null) found.push({ item: basename(sub), value: skill });
+    }
+    return found;
+  },
+  readNested: (path) => readSkill(join(path, "SKILL.md")),
+  readFile: null,
+  filterName: (name) => name,
+  expandHome: true,
+};
 
 /**
  * Where the CLI resolves a relative path in a `skills.json`: the repository root — the nearest
@@ -417,9 +462,9 @@ async function repositoryRoot(cwd: string): Promise<string> {
   }
 }
 
-function resolveConfigPath(repoRoot: string, targetPath: string): string {
+function resolveConfigPath(repoRoot: string, targetPath: string, expandHome: boolean): string {
   if (targetPath.startsWith("/")) return targetPath;
-  if (targetPath.startsWith("~/")) return join(homedir(), targetPath.slice(2));
+  if (expandHome && targetPath.startsWith("~/")) return join(homedir(), targetPath.slice(2));
   return join(repoRoot, targetPath);
 }
 
@@ -435,9 +480,13 @@ function resolveConfigPath(repoRoot: string, targetPath: string): string {
  * `exclude: ["skill-.*"]` excluded nothing, while `["deep"]` and `["nested/deep"]` both excluded the
  * nested item `nested/deep`.
  */
-function applyFilters(items: readonly ConfiguredSkill[], entry: SkillConfigEntry): readonly ConfiguredSkill[] {
-  const names = stringNames(entry.include_only);
-  const exclude = stringNames(entry.exclude);
+function applyFilters<T>(
+  items: readonly ConfiguredItem<T>[],
+  entry: ConfigEntry,
+  kind: ConfigKind<T>,
+): readonly ConfiguredItem<T>[] {
+  const names = stringNames(entry.include_only).map(kind.filterName);
+  const exclude = stringNames(entry.exclude).map(kind.filterName);
   return items.filter(
     (item) =>
       !exclude.some((name) => name === item.item || name === basename(item.item)) &&
@@ -445,25 +494,26 @@ function applyFilters(items: readonly ConfiguredSkill[], entry: SkillConfigEntry
   );
 }
 
-/** The string entries of a `skills.json` list; a name of any other type is not one the CLI can use. */
+/** The string entries of a config list; a name of any other type is not one the CLI can use. */
 function stringNames(value: unknown): string[] {
   return Array.isArray(value) ? value.filter((name): name is string => typeof name === "string") : [];
 }
 
 /**
- * The skills one `skills.json` names, in the order the file names them. An `inherits` entry is read
- * first and its own filters cover everything the inherited file produced, that file's `inherits`
- * included; the visited set is what keeps a cycle from reading a file twice.
+ * The items one customization file names, in the order the file names them. An `inherits` entry is
+ * read first and its own filters cover everything the inherited file produced, that file's
+ * `inherits` included; the visited set is what keeps a cycle from reading a file twice.
  */
-async function collectJsonConfigSkills(
+async function collectJsonConfig<T>(
   configPath: string,
   repoRoot: string,
   visited: Set<string>,
-): Promise<readonly ConfiguredSkill[]> {
+  kind: ConfigKind<T>,
+): Promise<readonly ConfiguredItem<T>[]> {
   if (visited.has(configPath)) return [];
   visited.add(configPath);
 
-  let parsed: SkillConfigFile;
+  let parsed: ConfigFile;
   try {
     const raw = await readFile(configPath, "utf8");
     parsed = JSON.parse(raw);
@@ -471,39 +521,47 @@ async function collectJsonConfigSkills(
     return [];
   }
 
-  const skills: ConfiguredSkill[] = [];
+  const items: ConfiguredItem<T>[] = [];
   const inherits = Array.isArray(parsed?.inherits) ? parsed.inherits : [];
   for (const inherit of inherits) {
     if (typeof inherit?.path !== "string") continue;
-    const inherited = await collectJsonConfigSkills(resolveConfigPath(repoRoot, inherit.path), repoRoot, visited);
-    skills.push(...applyFilters(inherited, inherit));
+    const inheritedPath = resolveConfigPath(repoRoot, inherit.path, kind.expandHome);
+    const inherited = await collectJsonConfig(inheritedPath, repoRoot, visited, kind);
+    items.push(...applyFilters(inherited, inherit, kind));
   }
 
   const entries = Array.isArray(parsed?.entries) ? parsed.entries : [];
   for (const entry of entries) {
     if (typeof entry?.path !== "string") continue;
-    skills.push(...(await collectEntry(resolveConfigPath(repoRoot, entry.path), entry)));
+    items.push(...(await collectEntry(resolveConfigPath(repoRoot, entry.path, kind.expandHome), entry, kind)));
   }
-  return skills;
+  return items;
 }
 
 /**
- * The skills one `entries` entry names. 1.2.10 loads the items directly inside its `path` and no
+ * The items one `entries` entry names. 1.2.10 loads the items directly inside its `path` and no
  * deeper, so an item further down is reached only by naming its whole relative path in
- * `include_only` — which is why the nested names are read here and the rest are scanned.
+ * `include_only` — which is why the nested names are read here and the rest are scanned. An
+ * `agents.json` entry may also name a single agent file (fixtures/23).
  */
-async function collectEntry(entryDir: string, entry: SkillConfigEntry): Promise<readonly ConfiguredSkill[]> {
-  const found: ConfiguredSkill[] = [];
-  for (const item of stringNames(entry.include_only)) {
-    if (!item.includes("/")) continue;
-    const skill = await readSkill(join(entryDir, item, "SKILL.md"));
-    if (skill !== null) found.push({ item, skill });
+async function collectEntry<T>(
+  entryPath: string,
+  entry: ConfigEntry,
+  kind: ConfigKind<T>,
+): Promise<readonly ConfiguredItem<T>[]> {
+  const single = kind.readFile === null ? null : await kind.readFile(entryPath);
+  if (single !== null) {
+    return applyFilters([{ item: kind.filterName(basename(entryPath)), value: single }], entry, kind);
   }
-  for (const dir of await subdirectories(entryDir)) {
-    const skill = await readSkill(join(dir, "SKILL.md"));
-    if (skill !== null) found.push({ item: basename(dir), skill });
+  const found: ConfiguredItem<T>[] = [];
+  for (const name of stringNames(entry.include_only)) {
+    if (!name.includes("/")) continue;
+    const item = kind.filterName(name);
+    const value = await kind.readNested(join(entryPath, item));
+    if (value !== null) found.push({ item, value });
   }
-  return applyFilters(found, entry);
+  found.push(...(await kind.scan(entryPath)));
+  return applyFilters(found, entry, kind);
 }
 
 export interface DiscoveredAgent {
@@ -517,6 +575,24 @@ export interface DiscoveredAgent {
  */
 const GLOBAL_AGENT_ROOTS = [".gemini/antigravity-cli/agents", ".gemini/config/agents"] as const;
 
+/** The global `agents.json`, read whether or not the workspace is trusted (fixtures/23). */
+const GLOBAL_AGENT_CONFIG_FILE = ".gemini/config/agents.json";
+
+/**
+ * `agents.json` (probed on 1.2.14, fixtures/23): an item is `<name>.md` or `<name>/agent.md`, a
+ * filter names it with or without its `.md`, an entry may name one agent file, and `~/` is not
+ * expanded — such a path lists nothing.
+ */
+const AGENT_CONFIG: ConfigKind<DiscoveredAgent> = {
+  scan: scanAgents,
+  async readNested(path) {
+    return (await readAgent(`${path}.md`)) ?? readAgent(join(path, "agent.md"));
+  },
+  readFile: readAgent,
+  filterName: (name) => (name.endsWith(".md") ? name.slice(0, -".md".length) : name),
+  expandHome: false,
+};
+
 /**
  * The custom agents the composer offers, in the order `agy agents` lists them. `geminiRoot` is the
  * root whose `settings.json` decides whether the workspace is trusted: the session's account one,
@@ -526,23 +602,32 @@ const GLOBAL_AGENT_ROOTS = [".gemini/antigravity-cli/agents", ".gemini/config/ag
  * `.agents`, `.agent` and `_agents` were verified for agents, and `_agent` is read on the strength
  * of the skill probe — and are hidden until that workspace is trusted, while the global roots are
  * always read. An agent is `<name>.md` or `<name>/agent.md`, with the frontmatter `name` deciding
- * what `--agent` is called with.
+ * what `--agent` is called with. Each root's `agents.json`, and the global one, name more agents in
+ * the `skills.json` shape (1.2.14, fixtures/23); the workspace files are gated by trust too.
  */
 export async function discoverAgents(
   cwd: string,
   geminiRoot: string,
 ): Promise<readonly DiscoveredAgent[]> {
   const agents = new Map<string, DiscoveredAgent>();
+  const keep = (found: readonly ConfiguredItem<DiscoveredAgent>[]) => {
+    for (const { value } of found) if (!agents.has(value.name)) agents.set(value.name, value);
+  };
+  // Relative paths in an `agents.json` resolve from the repository root, as in a `skills.json`.
+  const repoRoot = await repositoryRoot(cwd);
+  const readConfigs = new Set<string>();
 
-  if (await isWorkspaceTrusted(geminiRoot, cwd)) {
+  if (isWorkspaceTrusted(geminiRoot, cwd)) {
     for (const root of WORKSPACE_ROOTS) {
-      await collectAgents(join(cwd, root, "agents"), agents);
+      keep(await scanAgents(join(cwd, root, "agents")));
+      keep(await collectJsonConfig(join(cwd, root, "agents.json"), repoRoot, readConfigs, AGENT_CONFIG));
     }
   }
 
   for (const root of GLOBAL_AGENT_ROOTS) {
-    await collectAgents(join(homedir(), root), agents);
+    keep(await scanAgents(join(homedir(), root)));
   }
+  keep(await collectJsonConfig(join(homedir(), GLOBAL_AGENT_CONFIG_FILE), repoRoot, readConfigs, AGENT_CONFIG));
 
   return [...agents.values()].sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0));
 }
@@ -550,50 +635,43 @@ export async function discoverAgents(
 /**
  * Whether the CLI reads the workspace's own agents: with the workspace untrusted, `agy agents`
  * printed nothing and `--agent <workspace agent>` answered as the default agent (probed
- * 2026-09-25). The store's `isUnder` and `matchedPrefixLen` (jetski 1.2.11) compare the workspace
- * against each `trustedWorkspaces` entry, so an entry covers the paths beneath it — which is what
- * makes the entry this machine's settings file holds, a directory of many checkouts, useful at all.
- * Read off the binary rather than probed, and paths are compared as written: another spelling of
- * the same directory, through a symlink, is not trusted.
+ * 2026-09-25). On 1.2.14 only an entry naming the workspace itself trusts it: a parent directory,
+ * the home directory included, does not (probed 2026-09-30, fixtures/23). Paths are compared as
+ * written, so another spelling of the same directory, through a symlink, is not trusted.
  */
-async function isWorkspaceTrusted(geminiRoot: string, cwd: string): Promise<boolean> {
-  const parsed = readSettingsFile(geminiRoot);
-  if (parsed === null) return false;
-  const trusted = parsed.trustedWorkspaces;
+function isWorkspaceTrusted(geminiRoot: string, cwd: string): boolean {
+  const trusted = readSettingsFile(geminiRoot)?.trustedWorkspaces;
   if (!Array.isArray(trusted)) return false;
   const workspace = resolve(cwd);
-  return trusted.some((entry) => isUnder(workspace, entry));
-}
-
-/** A trusted path covers the workspace itself and anything below it, but not a sibling prefix. */
-function isUnder(workspace: string, entry: unknown): boolean {
-  if (typeof entry !== "string" || entry.length === 0) return false;
-  const base = entry.endsWith("/") ? entry.slice(0, -1) : entry;
-  return workspace === base || workspace.startsWith(`${base}/`);
+  return trusted.some(
+    (entry) =>
+      typeof entry === "string" && entry.length > 0 && resolve(entry) === workspace,
+  );
 }
 
 /**
- * The agents of one root, in the two shapes the CLI reads: `<name>.md` and `<name>/agent.md`. Only
- * `mainAgent: false` is filtered, because the CLI lists those neither way; `hidden: true` agents are
- * listed and launchable. `.agents/subagents/` is not an agent root, and is never read.
+ * The agents directly inside one directory, in the two shapes the CLI reads: `<name>.md` and
+ * `<name>/agent.md`, each under its item name without the `.md`. Only `mainAgent: false` is
+ * filtered, because the CLI lists those neither way; `hidden: true` agents are listed and
+ * launchable. `.agents/subagents/` is not an agent root, and is never read.
  */
-async function collectAgents(root: string, agents: Map<string, DiscoveredAgent>): Promise<void> {
+async function scanAgents(root: string): Promise<ConfiguredItem<DiscoveredAgent>[]> {
+  const found: ConfiguredItem<DiscoveredAgent>[] = [];
   try {
     const entries = await readdir(root, { withFileTypes: true });
     for (const entry of entries) {
       if (entry.name.startsWith(".")) continue;
-      const path = entry.isDirectory()
-        ? join(root, entry.name, "agent.md")
+      const agent = entry.isDirectory()
+        ? await readAgent(join(root, entry.name, "agent.md"))
         : entry.isFile() && entry.name.endsWith(".md")
-          ? join(root, entry.name)
+          ? await readAgent(join(root, entry.name))
           : null;
-      if (path === null) continue;
-      const agent = await readAgent(path);
-      if (agent !== null && !agents.has(agent.name)) agents.set(agent.name, agent);
+      if (agent !== null) found.push({ item: AGENT_CONFIG.filterName(entry.name), value: agent });
     }
   } catch {
     // missing or unreadable directory
   }
+  return found;
 }
 
 /**

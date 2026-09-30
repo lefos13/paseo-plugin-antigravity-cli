@@ -180,6 +180,35 @@ describe("discoverCommands", () => {
     });
   });
 
+  it("names a plugin skill whose frontmatter already carries the plugin prefix once", async () => {
+    // Probed 2026-09-30 on 1.2.14 (fixtures/21): agy strips `<plugin>:` from the front of the
+    // frontmatter name, so only `/zzprobe:foo` and `/zzflat:..:bar` expanded — never the doubled
+    // names, and never `/zzflat:bar`.
+    const plugins = join(home, ".gemini", "config", "plugins");
+    mkdirSync(join(plugins, "zzprobe", "skills", "foo"), { recursive: true });
+    writeFileSync(
+      join(plugins, "zzprobe", "skills", "foo", "SKILL.md"),
+      skill("name: zzprobe:foo\ndescription: Prefixed"),
+      "utf8",
+    );
+    mkdirSync(join(plugins, "zzflat", "skills"), { recursive: true });
+    writeFileSync(
+      join(plugins, "zzflat", "skills", "SKILL.md"),
+      skill("name: zzflat:bar\ndescription: Prefixed flat"),
+      "utf8",
+    );
+    // Another plugin's prefix is not stripped, and a name with `:` left in it is no command.
+    mkdirSync(join(plugins, "zzother", "skills", "baz"), { recursive: true });
+    writeFileSync(
+      join(plugins, "zzother", "skills", "baz", "SKILL.md"),
+      skill("name: zzprobe:baz\ndescription: Foreign prefix"),
+      "utf8",
+    );
+
+    const names = (await discoverCommands(workspace)).commands.map((command) => command.name);
+    expect(names.filter((name) => name.startsWith("zz"))).toEqual(["zzflat:..:bar", "zzprobe:foo"]);
+  });
+
   it("lists the skills the CLI ships with", async () => {
     // Probed 2026-09-23: `/migrate-workflows` expanded from the CLI's own unpacked skills.
     const path = join(home, ".gemini", "antigravity-cli", "builtin", "skills", "migrate-workflows");
@@ -565,15 +594,83 @@ describe("discoverCommands", () => {
     expect(await agentNames()).toEqual(["flat-one", "global-dir", "global-flat"]);
   });
 
-  it("trusts a workspace under a listed directory, but not a sibling with its prefix", async () => {
+  it("trusts only an entry naming the workspace itself", async () => {
     writeAgent(join(workspace, ".agents", "agents", "flat-one.md"), "flat-one", "Workspace probe");
 
-    // The settings file on this machine lists a directory holding many checkouts, so an entry has
-    // to cover what is below it; `workspaceX` is a different directory that merely shares a prefix.
+    // Probed 2026-09-30 on 1.2.14 (fixtures/23): a parent directory — the home directory included —
+    // does not trust what is below it, and neither does a sibling that shares the prefix.
     trustWorkspaces(dirname(workspace));
-    expect(await agentNames()).toEqual(["flat-one"]);
-
+    expect(await agentNames()).toEqual([]);
     trustWorkspaces(`${workspace}-sibling`);
     expect(await agentNames()).toEqual([]);
+
+    trustWorkspaces(workspace);
+    expect(await agentNames()).toEqual(["flat-one"]);
+  });
+
+  it("lists the agents a trusted workspace's agents.json names, one level deep", async () => {
+    // Probed 2026-09-30 on 1.2.14 (fixtures/23), in the skills.json shape.
+    const custom = join(workspace, "custom-agents");
+    writeAgent(join(custom, "a-flat.md"), "a-flat", "Flat");
+    writeAgent(join(custom, "a-dir", "agent.md"), "a-dir", "Dir");
+    writeAgent(join(custom, "nested", "deep.md"), "n-deep", "Nested flat");
+    writeAgent(join(custom, "nested", "deepdir", "agent.md"), "n-deepdir", "Nested dir");
+    writeAgent(join(custom, "sub-only.md"), "sub-only", "Subagent", "mainAgent: false\n");
+    const write = (config: unknown, root = ".agents") => {
+      mkdirSync(join(workspace, root), { recursive: true });
+      writeFileSync(join(workspace, root, "agents.json"), JSON.stringify(config), "utf8");
+    };
+
+    write({ entries: [{ path: "custom-agents" }] });
+    expect(await agentNames()).toEqual([]);
+    trustWorkspaces(workspace);
+    expect(await agentNames()).toEqual(["a-dir", "a-flat"]);
+
+    // A filter names an item with or without its `.md`; a nested one by its relative path.
+    write({ entries: [{ path: "custom-agents", include_only: ["a-flat.md", "nested/deep", "nested/deepdir"] }] });
+    expect(await agentNames()).toEqual(["a-flat", "n-deep", "n-deepdir"]);
+    write({ entries: [{ path: "custom-agents", exclude: ["a-flat.md"] }] });
+    expect(await agentNames()).toEqual(["a-dir"]);
+
+    // An entry may name one agent file, and every workspace root's file is read.
+    rmSync(join(workspace, ".agents"), { recursive: true });
+    write({ entries: [{ path: "custom-agents/a-flat.md" }] }, "_agent");
+    expect(await agentNames()).toEqual(["a-flat"]);
+  });
+
+  it("follows agents.json inherits, and resolves paths from the repository root without ~", async () => {
+    const repo = join(workspace, "repo");
+    const sub = join(repo, "sub");
+    mkdirSync(join(repo, ".git"), { recursive: true });
+    writeAgent(join(repo, "shared", "o-one.md"), "o-one", "One");
+    writeAgent(join(repo, "shared", "o-two.md"), "o-two", "Two");
+    writeAgent(join(sub, "shared", "local.md"), "local", "Beside the launch directory");
+    writeFileSync(join(repo, "shared.json"), JSON.stringify({ entries: [{ path: "shared" }] }), "utf8");
+    mkdirSync(join(sub, ".agents"), { recursive: true });
+    const configPath = join(sub, ".agents", "agents.json");
+    trustWorkspaces(sub);
+    const listed = async () => (await discoverAgents(sub, join(home, ".gemini"))).map((agent) => agent.name);
+
+    writeFileSync(configPath, JSON.stringify({ inherits: [{ path: "shared.json", exclude: ["o-one"] }] }), "utf8");
+    expect(await listed()).toEqual(["o-two"]);
+
+    // `shared` is the repository root's, not the launch directory's.
+    writeFileSync(configPath, JSON.stringify({ entries: [{ path: "shared" }] }), "utf8");
+    expect(await listed()).toEqual(["o-one", "o-two"]);
+
+    writeAgent(join(home, "home-agents", "h.md"), "home-agent", "Home");
+    writeFileSync(configPath, JSON.stringify({ entries: [{ path: "~/home-agents" }] }), "utf8");
+    expect(await listed()).toEqual([]);
+  });
+
+  it("reads the global agents.json whether or not the workspace is trusted", async () => {
+    writeAgent(join(home, "installed-agents", "g.md"), "global-json", "Global file");
+    mkdirSync(join(home, ".gemini", "config"), { recursive: true });
+    writeFileSync(
+      join(home, ".gemini", "config", "agents.json"),
+      JSON.stringify({ entries: [{ path: join(home, "installed-agents") }] }),
+      "utf8",
+    );
+    expect(await agentNames()).toEqual(["global-json"]);
   });
 });

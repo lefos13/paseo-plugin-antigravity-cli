@@ -246,6 +246,39 @@ describe("renderChild on the captured transcripts", () => {
     ]);
   });
 
+  it("shows the errors and compactions agy recorded in a child's run", () => {
+    // fixtures/20, trimmed from a real 1.2.12 child: a model-output `ERROR_MESSAGE` the child
+    // recovered from (step 68), and a `CHECKPOINT` where agy compacted its context (step 159).
+    const text = readFileSync(`${fixturesDir}/20-transcript-error-checkpoint.jsonl`, "utf8");
+    const parsed = parseTranscriptLines(text);
+    expect(parsed.malformed).toBe(0);
+    const child = "06e9f6db-4881-44ec-9eb7-bfa241dd08ff";
+    const render = renderChild(parsed.entries, {
+      childConversationId: child,
+      parentConversationId: "11c90f78-b152-4237-b51e-50ad3fb29ca7",
+      cwd: "/Users/dev/Documents/agy-nested-probe",
+    });
+
+    expect(render.unknownTypes).toEqual([]);
+    const shown = render.items.filter((item) => item.type === "error" || item.type === "compaction");
+    expect(shown).toEqual([
+      {
+        type: "error",
+        id: `agy-sub:${child}:68:error`,
+        message:
+          "model output error: model output must contain either output text or tool calls, these cannot both be empty, please try again",
+      },
+      { type: "compaction", id: `agy-sub:${child}:159:compaction`, status: "completed", trigger: "auto" },
+    ]);
+    // In step order: the error sits after the response that caused it and before the retry's call.
+    const ids = render.items.map((item) => item.id);
+    expect(ids.indexOf(`agy-sub:${child}:68:error`)).toBeLessThan(
+      ids.indexOf(`agy-sub:${child}:69:tool:0`),
+    );
+    // Neither step ends the child: it carried on after both.
+    expect(render.done).toBe(false);
+  });
+
   it("names the subagents of a call whose result has not arrived from what the model asked for", () => {
     const render = renderChild(
       [

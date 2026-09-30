@@ -1,0 +1,22 @@
+agy 1.2.14 — do plugins whose MCP server needs configuration variables start disabled? (Task 6)
+Probed 2026-09-30 on macOS. The 1.2.11 changelog: "a plugin whose MCP server needs configuration
+variables now starts disabled until you enable it". Neither the CLI's own docs
+(builtin/skills/agy-customizations/docs/plugins.md, mcp_servers.md) nor the binary's strings name
+the syntax a variable is declared with, so the two plausible forms were tried. Scratch plugins
+under ~/.gemini/config/plugins, no config.json entry, deleted afterwards; config.json checksum
+identical before and after (agy wrote no `enabled` entry for either).
+
+  zzvarenv   mcp_config.json {"mcpServers":{"s":{"command":"cat","env":{"K":"${ZZ_TOKEN}"}}}}
+  zzvaruc    plugin.json "userConfig":{"token":{"type":"string","required":true,"sensitive":true}}
+             mcp_config.json {"mcpServers":{"s":{"command":"cat","env":{"K":"${user_config.token}"}}}}
+  zzplain    no MCP server (control)
+
+`agy plugin validate` reported each [ok] (mcpServers: 1 processed); `agy plugin list` lists only
+imported plugins ("No imported plugins.") and says nothing about these.
+
+  agy -p "/zzvarenv:zzvarenv-skill" --log-file …  → expanded slash command "zzvarenv:zzvarenv-skill" (skill)
+  agy -p "/zzvaruc:zzvaruc-skill"   --log-file …  → expanded slash command "zzvaruc:zzvaruc-skill" (skill)
+
+VERDICT: neither form turns the plugin off; its skills still expand. The gate could not be
+reproduced with any syntax we could find, so `isPluginDisabled` is unchanged. If a real plugin
+shows the gate, its manifest is the fixture to add.

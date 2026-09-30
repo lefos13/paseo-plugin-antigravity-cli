@@ -30,7 +30,7 @@ import {
   syncShadowHome,
 } from "./accounts";
 import { AgyProcess } from "./agy";
-import { attachmentsDir, clearAttachments, writeAttachment } from "./attachments";
+import { attachmentsDir, clearAttachments, linkUpload, writeAttachment } from "./attachments";
 import { readToolPermission } from "./agysettings";
 import {
   isObservedTool,
@@ -139,7 +139,8 @@ const UNAVAILABLE_PATTERN = /\bUNAVAILABLE\b|\b503\b/;
 
 /**
  * `prompt.steer` is deliberately absent: a line written to agy stdin while a turn is running is
- * queued into a following turn rather than applied to the running one, so Paseo replaces the
+ * queued into a following turn rather than applied to the running one — whatever the account's
+ * `queuedMessages` setting (probed on 1.2.14, see `AgyProcess`) — so Paseo replaces the
  * active turn instead. agy resolves tool approvals internally and cannot surface them over this
  * protocol, so the only permission this provider ever requests is the plugin's own plan approval.
  *
@@ -244,9 +245,9 @@ interface Session {
   launchPending: LaunchProfile;
   /** What the running CLI was actually launched with. */
   launchActive: LaunchProfile;
-  /** Extra `--add-dir` holding attached images; null when the folder could not be created. */
+  /** Extra `--add-dir` holding attached images and uploads; null when the folder could not be created. */
   readonly attachmentsDir: string | null;
-  /** Number of images written for this session, so filenames stay unique within it. */
+  /** Number of images and uploads placed for this session, so filenames stay unique within it. */
   attachmentCount: number;
   /**
    * Where the workspace's `.agents/mcp_config.json` stands for this session: `applied` when the
@@ -1102,8 +1103,19 @@ async function promptSession(
   // artifact through their review policy. Proceed to execution."). It becomes a plan-mode turn of
   // the plugin's instead — the preamble and the plan card — whatever mode the session is in.
   const planCommand = command !== null && skill === null && command.name === PLAN_COMMAND;
+  // agy 1.2.14 exits 1 at startup for a schema whose root is not `"type": "object"`, so such a
+  // prompt is refused here, before the running CLI is replaced for a launch that cannot start.
+  const schema =
+    prompt.outputSchema === undefined ? null : objectRootSchema(prompt.outputSchema);
+  if (schema !== null && "refusal" in schema) {
+    failPrompt(session, emit, prompt.clientMessageId, {
+      message: schema.refusal,
+      code: "schema_unsupported",
+    });
+    return;
+  }
   const profile: LaunchProfile = {
-    schema: prompt.outputSchema !== undefined,
+    schema: schema !== null,
     // A plugin-expanded skill never reaches the CLI as a slash name, so it needs no expansion —
     // and must not have it, or a body containing `/...` could be parsed as a command.
     commands: command !== null && skill === null && !planCommand,
@@ -1139,7 +1151,7 @@ async function promptSession(
   if (profile.schema) {
     try {
       await mkdir(dirname(session.schemaPath), { recursive: true });
-      await writeFile(session.schemaPath, JSON.stringify(prompt.outputSchema), "utf8");
+      await writeFile(session.schemaPath, JSON.stringify(schema?.schema), "utf8");
     } catch (error) {
       failPrompt(session, emit, prompt.clientMessageId, {
         message: `Could not write the output schema for Antigravity: ${describe(error)}`,
@@ -1183,7 +1195,7 @@ async function promptSession(
       text = await renderPromptContent(session, prompt.input.content);
     } catch (error) {
       failPrompt(session, emit, prompt.clientMessageId, {
-        message: `Could not attach the prompt's image: ${describe(error)}`,
+        message: `Could not attach the prompt's file: ${describe(error)}`,
         code: "attachment_failed",
       });
       return;
@@ -1288,6 +1300,29 @@ async function writePendingTurn(session: Session, emit: Emit, turn: PendingTurn)
       error: { message: describe(error), code: "agy_launch_failed" },
     });
   }
+}
+
+/**
+ * The schema agy is given, or why it cannot be. agy 1.2.14 requires the root to declare
+ * `"type": "object"` (probed 2026-09-30: an array root, a `properties`-only root and plain text all
+ * exit 1). A root with `properties` and no `type` can only describe an object, so it gets the type
+ * added; any other root is refused rather than rewritten into a different answer shape.
+ */
+function objectRootSchema(schema: unknown): { schema: Record<string, unknown> } | { refusal: string } {
+  const refuse = (got: string) => ({
+    refusal: `Antigravity only accepts a structured-output schema whose root is "type": "object", and this one ${got}. Wrap the value in an object property and send it again.`,
+  });
+  if (typeof schema !== "object" || schema === null || Array.isArray(schema)) {
+    return refuse(`is ${Array.isArray(schema) ? "an array" : `a ${schema === null ? "null" : typeof schema}`}`);
+  }
+  const root = schema as Record<string, unknown>;
+  if (root.type === "object") return { schema: root };
+  if (root.type === undefined && typeof root.properties === "object" && root.properties !== null) {
+    return { schema: { type: "object", ...root } };
+  }
+  return refuse(
+    root.type === undefined ? 'declares no "type"' : `has "type": ${JSON.stringify(root.type)}`,
+  );
 }
 
 /**
@@ -3272,7 +3307,8 @@ function buildOutgoingText(session: Session, text: string): string {
 /**
  * Renders the prompt's parts for agy's text-only stream input. An image part is written to the
  * session's attachments folder and referenced by absolute path: agy rejects image content blocks
- * outright, but reads an image file with `view_file` (probed 2026-09-23).
+ * outright, but reads an image file with `view_file` (probed 2026-09-23). An uploaded file is put
+ * in the same folder, because agy may only read it from a directory it was given (`linkUpload`).
  */
 async function renderPromptContent(
   session: Session,
@@ -3280,11 +3316,15 @@ async function renderPromptContent(
 ): Promise<string> {
   const parts: string[] = [];
   for (const part of content) {
+    if (part.type !== "image" && part.type !== "uploaded_file") {
+      parts.push(renderPart(part));
+      continue;
+    }
+    if (session.attachmentsDir === null) {
+      throw new Error("the attachments folder could not be created");
+    }
+    session.attachmentCount += 1;
     if (part.type === "image") {
-      if (session.attachmentsDir === null) {
-        throw new Error("the attachments folder could not be created");
-      }
-      session.attachmentCount += 1;
       const path = await writeAttachment(
         session.sessionId,
         session.attachmentCount,
@@ -3294,17 +3334,16 @@ async function renderPromptContent(
       parts.push(`[image attached: ${path} — view it with view_file]`);
       continue;
     }
-    parts.push(renderPart(part));
+    const path = await linkUpload(session.sessionId, session.attachmentCount, part.path, part.fileName);
+    parts.push(`[uploaded file: ${path} (${part.fileName}, ${part.mimeType})]`);
   }
   return parts.filter((part) => part.length > 0).join("\n\n");
 }
 
-function renderPart(part: Exclude<ProviderContent, { type: "image" }>): string {
+function renderPart(part: Exclude<ProviderContent, { type: "image" | "uploaded_file" }>): string {
   switch (part.type) {
     case "text":
       return part.text;
-    case "uploaded_file":
-      return `[uploaded file: ${part.path}]`;
     case "review":
       return renderReview(part);
     case "forge_change_request":

@@ -1,0 +1,33 @@
+agy 1.2.14 — does `@<subagent> <message>` reach a subagent over stream-json? (Task 8)
+Probed 2026-09-30 on macOS, Default account, the plugin's own launch flags plus
+--dangerously-skip-permissions and --model gemini-3.8-flash-high. Files:
+  24-at-subagent.ndjson               parent stream, cases A and B
+  24b-at-subagent-relaunch.ndjson     parent stream after a relaunch with --conversation (case C)
+  24-at-subagent.transcript.jsonl     the subagent's own transcript, all cases
+  24-at-subagent.timeline.txt         what was written to stdin and when, beside both streams
+
+Turn 1 asked the parent to start one `self` subagent, Role "Scout", that sleeps 40 s and reports
+SLEPT with send_message, and to end its turn at once. (The parent turn stayed open until the
+report arrived anyway: result #1 at 146 s.)
+
+  A  parent mid-turn, child running   "@Scout When you report, also include the word PINGED-A."
+     written at 40 s, as soon as the subagent step was DONE. It became the parent's NEXT turn
+     (step 6 user_input, after result #1). The parent model called manage_subagents then
+     send_message, and the child's transcript got a SYSTEM_MESSAGE (step 8) with content
+     "When you report, also include the word PINGED-A." → child replied "SLEPT PINGED-A".
+  B  parent idle, child completed     "@Scout Reply to me with the single word PINGED-B."
+     parent turn (step 14 user_input) → parent's send_message → child SYSTEM_MESSAGE step 12
+     "Reply to me with the single word PINGED-B." → child replied PINGED-B → parent result #3.
+  C  parent relaunched (--conversation <parent>), child long finished
+     "@Scout Reply to me with the single word RELAUNCHED." → parent turn (step 20) → the
+     parent's manage_subagents + send_message → child steps 16 (the message) and 17 ("[Notice]
+     All your subagents and background tasks have been stopped due to server restart…") →
+     child replied RELAUNCHED → parent result.
+
+VERDICT: NO native routing. stream-json treats `@<name> …` as an ordinary user turn to the parent;
+the `@` syntax is terminal-UI only. The message reached the subagent in every case only because
+the parent MODEL chose to relay it with its own `send_message` tool, verbatim each time here, at
+the cost of one parent turn per message (queued behind a running parent turn, like any line). The
+subagent is addressed by conversation id (send_message `Recipient`), which the plugin already has
+for every child; its reply goes to the parent as a SYSTEM_MESSAGE, and it appears in the subagent's
+own transcript as a send_message call.

@@ -1,0 +1,28 @@
+agy 1.2.14 — can a headless turn read a file the user uploaded to Paseo? (Task 10)
+Probed 2026-09-30 on macOS. Paseo stores uploads outside every workspace, as
+`~/.paseo/uploads/upload_<uuid>/<file name>`, and the plugin used to pass that path as
+`[uploaded file: <path>]`. The probe ran the plugin's own flags (stream-json, --add-dir <cwd>,
+--disable-slash-commands, --print-timeout 0, no --dangerously-skip-permissions) under a secondary
+plugin account whose own settings.json was edited for the run and restored (checksum OK). The
+prompt: "[uploaded file: <upload dir>/…pdf]\n\nWhat is the secret word in the attached PDF?"
+
+1. A hand-written uncompressed PDF (text visible in the bytes), toolPermission always-proceed,
+   allowNonWorkspaceAccess removed:
+     no --add-dir for the upload       view_file DONE ("33 lines, 602 bytes") → ZEBRA-42
+     --add-dir <upload dir>            view_file DONE                         → ZEBRA-42
+   always-proceed lets the read through, and view_file took the file as plain text: this pair
+   proves neither the permission nor the PDF path.
+
+2. A real PDF from `cupsfilter` (PDF 1.3, compressed: `grep OKAPI` on it finds nothing),
+   toolPermission request-review, allowNonWorkspaceAccess removed:
+     no --add-dir for the upload       view_file ERROR "permission check failed for read_file …
+                                       user denied permission"; stderr "jetski: no output produced —
+                                       a tool required the "read_file" permission that headless mode
+                                       cannot prompt for, so it was auto-denied"; result SUCCESS with
+                                       response "" and denied_actions [{"action":"read_file"}]
+     --add-dir <upload dir>            view_file DONE → OKAPI-77
+
+VERDICT: an upload outside the workspace is only readable when a directory the CLI was given
+holds it. The plugin now puts each upload in the session's attachments folder (already on every
+launch's --add-dir): a hard link, or a copy across volumes. The prompt points at that path and
+names the original file and its type.

@@ -1,0 +1,29 @@
+agy 1.2.14 — does `"queuedMessages": "send-immediately"` change a stream-json CLI? (Task 1)
+Probed 2026-09-30 on macOS with a secondary plugin account's own settings.json (backed up,
+edited, restored; checksums of that copy and of the real ~/.gemini/antigravity-cli/settings.json
+matched before and after). Launch: the plugin's own flags —
+  agy --input-format stream-json --output-format stream-json --add-dir <cwd>
+      --disable-slash-commands --print-timeout 0 --dangerously-skip-permissions
+
+1. MID-STREAM (19-queued-send-immediately.ndjson)
+   Turn 1: "Count from 1 to 150, one number per line". The second stdin line ("Reply with exactly
+   the word PONG") was written on the first of 26 text_delta events of step 1, ~40 s in.
+   send-immediately: step 1 finished the full 1..150, result SUCCESS; then step 2 user_input,
+   step 3 "PONG", second result SUCCESS; exit 0, empty stderr.
+   Without the setting (default Queue): the same sequence, event for event.
+
+2. MID-TOOL (19b-queued-send-immediately-mid-tool.ndjson)
+   Turn 1: "Run `sleep 25 && echo SLEPT` with run_command". The second line was written on the
+   first `tool` / run_command / ACTIVE event (step 2). send-immediately: the turn ran on through
+   steps 2–23 (the model wandered through more commands) and ended with result SUCCESS; the
+   queued line then became step 24 user_input → step 25 "PONG" → second result SUCCESS.
+   No "interrupted" result anywhere.
+
+VERDICT: stream-json ignores queuedMessages; a line written mid-turn is always queued into the
+next turn. The setting is a TUI (/config) behaviour only. The plugin's pendingTurns model holds;
+no plugin-side hold is needed (Task 2 not done).
+
+3. VERBOSITY (same tool turn: view_file a.txt, run `ls`, reply DONE)
+   Default vs `"verbosity": "low"`: identical step sequence — user_input, agent_response,
+   view_file ACTIVE/DONE(output), agent_response, run_command ACTIVE/DONE(output),
+   agent_response, result SUCCESS. Verbosity does not change the stream; no session setting.

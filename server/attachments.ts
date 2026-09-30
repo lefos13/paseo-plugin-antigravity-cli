@@ -1,5 +1,5 @@
-import { mkdir, rm, writeFile } from "node:fs/promises";
-import { join } from "node:path";
+import { copyFile, link, mkdir, rm, writeFile } from "node:fs/promises";
+import { basename, join } from "node:path";
 import { pluginDataDir, unsafePathChars } from "./plugindata";
 
 /**
@@ -30,6 +30,32 @@ export async function writeAttachment(
   await mkdir(dir, { recursive: true });
   const path = join(dir, `${index}.${EXTENSIONS[mimeType] ?? "bin"}`);
   await writeFile(path, Buffer.from(data, "base64"));
+  return path;
+}
+
+/**
+ * Puts one file the user uploaded to Paseo into the session's attachments folder and returns the
+ * path the prompt must point at. Paseo keeps uploads outside every workspace
+ * (`~/.paseo/uploads/upload_<id>/<name>`), and a headless agy without `allowNonWorkspaceAccess`
+ * auto-denies reading one there: the turn ends empty with `denied_actions: read_file` (probed on
+ * 1.2.14, fixtures/25-uploaded-pdf.txt). The attachments folder is on every launch's `--add-dir`.
+ * A hard link costs nothing on the same volume; a copy is the fallback across volumes.
+ */
+export async function linkUpload(
+  sessionId: string,
+  index: number,
+  source: string,
+  fileName: string,
+): Promise<string> {
+  const dir = attachmentsDir(sessionId);
+  await mkdir(dir, { recursive: true });
+  const path = join(dir, `${index}-${basename(fileName).replace(unsafePathChars, "_")}`);
+  try {
+    await link(source, path);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "EXDEV") throw error;
+    await copyFile(source, path);
+  }
   return path;
 }
 

@@ -189,10 +189,17 @@ describe("captured agy fixtures", () => {
     expect(turns).toBeGreaterThan(0);
   });
 
-  it("reports queued follow-up input as a separate turn, never as a steer", () => {
-    const events = loadFixture("04-queued-second-line.ndjson");
+  // 19/19b were recorded with `"queuedMessages": "send-immediately"` (agy 1.2.14), mid-stream and
+  // mid-tool: stream-json queues regardless of that TUI setting.
+  it.each([
+    "04-queued-second-line.ndjson",
+    "19-queued-send-immediately.ndjson",
+    "19b-queued-send-immediately-mid-tool.ndjson",
+  ])("%s reports queued follow-up input as a separate turn, never as a steer", (name) => {
+    const events = loadFixture(name);
     const results = events.filter((event) => event.kind === "result");
     expect(results.length).toBe(2);
+    expect(results.every((event) => event.kind === "result" && !isInterrupted(event.result))).toBe(true);
 
     // The first turn runs to completion before the second input begins, which is why the
     // provider does not advertise prompt.steer.

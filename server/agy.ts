@@ -109,7 +109,9 @@ const SIGKILL_GRACE_MS = 5_000;
  * Paseo session: each stdin line is one turn, and agy emits exactly one `result` per turn.
  *
  * Note that a line written while a turn is running is *queued* into a following turn, not
- * steered into the running one, so the provider never advertises steering.
+ * steered into the running one, so the provider never advertises steering. That holds even with
+ * `"queuedMessages": "send-immediately"` in settings.json: 1.2.14 honours it in the TUI only, and a
+ * stream-json CLI still queues, mid-stream and mid-tool (fixtures/19-queued-send-immediately.txt).
  */
 export class AgyProcess {
   private child: ChildProcess | null = null;

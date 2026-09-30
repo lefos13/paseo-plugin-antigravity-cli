@@ -1,0 +1,51 @@
+agy 1.2.14 — `agents.json`, and which `trustedWorkspaces` entry trusts a workspace (Task 7)
+Probed 2026-09-30 on macOS with `agy agents` (no model calls), under a secondary plugin account
+(HOME = its shadow home) whose own settings.json was backed up, edited, and restored (checksum OK).
+Scratch git repo ~/agy-agentsjson-probe (deleted afterwards):
+
+  custom-agents/a-flat.md                 name: a-flat
+  custom-agents/a-dir/agent.md            name: a-dir
+  custom-agents/nested/deep.md            name: n-deep
+  custom-agents/nested/deepdir/agent.md   name: n-deepdir
+  custom-agents/sub-only.md               name: sub-only, mainAgent: false
+  other-agents/o-one.md, o-two.md         name: o-one, o-two
+  shared.json                             {"entries":[{"path":"other-agents"}]}
+
+`firestore-rules-author` is an agent listed from elsewhere on this machine in every run; ignore it.
+
+1. TRUST IS AN EXACT PATH ON 1.2.14
+   A workspace agent (`.agents/agents/ctl.md`) was listed only when trustedWorkspaces held the
+   workspace itself:
+     ["/Users/<me>"] (this machine's real entry)   → not listed
+     ["<parent>"], ["<parent>/"]                   → not listed for <parent>/child
+     ["<parent>/child"]                            → listed
+   Same with and without a real `git init`. The plugin used to treat an entry as covering every
+   path beneath it (read off the 1.2.11 binary, never probed), which offered agents agy would not
+   load. Launching from a subdirectory of a trusted workspace lists no workspace agents either,
+   but that is the launch-directory rule from fixture 13 (no walk-up), not trust.
+
+2. agents.json, workspace (all runs trusted exactly; launched from the repo root)
+   file .agents/agents.json                                          listed
+   {"entries":[{"path":"custom-agents"}]}                            a-dir a-flat
+   … "include_only":["a-flat"]   (or "a-flat.md")                   a-flat
+   … "include_only":["nested/deep"] (or "nested/deep.md")           n-deep
+   … "include_only":["nested/deepdir"]                              n-deepdir
+   … "exclude":["a-dir"]                                            a-flat
+   … "exclude":["a-flat"]        (or "a-flat.md")                   a-dir
+   {"inherits":[{"path":"shared.json"}]}                             o-one o-two
+   {"inherits":[{"path":"shared.json","exclude":["o-one"]}]}         o-two
+   {"entries":[{"path":"<abs>/other-agents"}]}                       o-one o-two
+   {"entries":[{"path":"custom-agents/a-flat.md"}]}                  a-flat   (a file entry)
+   no agents.json                                                    (none)
+   - One level: nested items only through include_only; `mainAgent: false` never listed.
+   - An item is named by its file/dir name with or without `.md`; a nested one by its relative path.
+   - Read from `.agents/`, `.agent/`, `_agents/` and `_agent/` alike (each alone listed o-one o-two).
+   - Only from the launch directory: a file at the repo root lists nothing when launched from
+     `sub/`. A file in `sub/.agents/` with a relative path resolves it from the REPOSITORY ROOT
+     (`custom-agents` → root's a-dir a-flat; `custom-agents/nested` → n-deep n-deepdir).
+   - `~/…` is not expanded: {"path":"~/agy-agentsjson-probe/other-agents"} listed nothing.
+   - Untrusted workspace (the earlier runs under ["/Users/<me>"]): nothing from agents.json.
+
+3. agents.json, global (~/.gemini/config/agents.json, workspace untrusted; removed afterwards)
+   {"entries":[{"path":"<abs>/custom-agents"}]}      a-dir a-flat   (not gated by trust)
+   {"entries":[{"path":"~/agy-agentsjson-probe/…"}]} (none)
