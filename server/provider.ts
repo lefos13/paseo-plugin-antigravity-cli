@@ -373,6 +373,11 @@ interface PendingTurn {
   readonly backfilled: Map<number, string>;
   backfill: TranscriptPoller | null;
   backfillTimer: NodeJS.Timeout | null;
+  /**
+   * The transcript showed a background command of this turn still running: agy holds the stream
+   * until every such command ends, and hands it back then (see `applyBackfill`).
+   */
+  heldByBackground: boolean;
   /** The exact text written to agy, so a turn queued behind a detached CLI can be sent again. */
   outgoing: string;
   /** Sent in plan mode, so its answer is offered as a plan to implement. */
@@ -1233,6 +1238,7 @@ async function startTurn(session: Session, emit: Emit, request: TurnRequest): Pr
     backfilled: new Map(),
     backfill: null,
     backfillTimer: null,
+    heldByBackground: false,
     outgoing: "",
     plan,
   };
@@ -1484,6 +1490,14 @@ function applyBackfill(
   }
   if (render.finalStep !== null && turn.backfilled.has(render.finalStep)) {
     settleFromTranscript(session, turn, render.finalStep, emit);
+  } else if (render.backgroundTasks > 0) {
+    turn.heldByBackground = true;
+  } else if (turn.heldByBackground) {
+    // Every background command of the turn has ended, so agy released the stream it held and is
+    // carrying the turn on there (see `backgroundState`). Following the transcript any longer
+    // would only race the stream to the answer and settle a turn agy is about to finish itself.
+    turn.heldByBackground = false;
+    stopBackfill(turn);
   }
 }
 

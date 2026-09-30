@@ -3626,6 +3626,40 @@ describe("background commands", () => {
     expect(readArgvLog()).toHaveLength(2);
     expect(readArgvLog()[1]).toContain("--conversation");
   });
+
+  it("keeps the turn running while the model waits for its background command", async () => {
+    heldTurn();
+    process.env.FAKE_SCENARIO = "background-wait";
+    const { connection, events } = await connect();
+    await openSession(connection);
+    await prompt(connection, "run them");
+    await waitFor(
+      () => [...paseoView(events).messages.values()].find((text) => text === "The tests are still running."),
+      "the waiting answer after the model looked in on its task",
+    );
+    // Settling would happen in the same transcript read that published the waiting answer.
+    expect(turns(events, "completed")).toEqual([]);
+
+    writeFileSync(process.env.FAKE_BACKGROUND_GATE ?? "", "");
+    await waitFor(() => turns(events, "completed")[0], "agy to finish the turn");
+
+    expect([...paseoView(events).messages.values()]).toEqual([
+      "Running the tests.",
+      "Waiting for the tests to finish.",
+      "The tests are still running.",
+      "All 12 tests passed (run them).",
+    ]);
+    const calls = timelineItems(events).filter((item) => item.type === "tool_call");
+    expect([...new Map(calls.map((item) => [item.id, [item.name, item.status]])).values()]).toEqual([
+      ["run_command", "completed"],
+      ["manage_task", "completed"],
+      ["view_file", "completed"],
+    ]);
+    expect(
+      events.filter((event) => event.type === "session.notice" && event.notice.id.startsWith("agy-background")),
+    ).toEqual([]);
+    expect(readArgvLog()).toHaveLength(1);
+  });
 });
 
 describe("plan mode", () => {

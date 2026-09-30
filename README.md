@@ -93,13 +93,20 @@ In Plan mode the question comes first and the plan card follows the answer turn.
 ### Background commands
 
 When the model starts a long-running command in the background, agy holds back every later step until
-it exits. After 5 s of that the plugin reads the conversation's own transcript, publishes the held
-steps, and completes the turn as soon as the transcript shows the final answer. The CLI holding the
-command is left running, so the server stays up (a notice says so), but it cannot take another turn:
-your next message stops it, and the command with it, and resumes the conversation in a fresh CLI.
+it exits. After 5 s of that the plugin reads the conversation's own transcript and publishes the held
+steps, so the turn keeps showing progress.
 
-That answer is not always the end: when a background command finishes, agy hands its result to the
-model, which carries on in the same turn. The plugin watches the transcript for that and stops the
+If the model's answer is only "waiting for it to finish" (agy's own instruction right after the
+launch, even when the model checks on the task or reads its log first), the turn stays running: agy
+waits for the command itself (up to 30 minutes), hands the model its result, and the model finishes
+the same turn. Once the command ends the plugin goes back to the stream. A message sent meanwhile is
+queued behind the turn, as with any running turn.
+
+If the model answers after doing other work, such as a dev server started and then checked, the turn
+completes as soon as the transcript shows that answer. The CLI holding the command is left running, so
+the server stays up (a notice says so), but it cannot take another turn: your next message stops it,
+and the command with it, and resumes the conversation in a fresh CLI. When that command finishes
+later, agy hands its result to the model, which carries on in the answered turn; the plugin stops the
 CLI at the first step past the answer, with a notice, so nothing runs that you cannot see. Send a
 message such as "continue" to pick up from there.
 

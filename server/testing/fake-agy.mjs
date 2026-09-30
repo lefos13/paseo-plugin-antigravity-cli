@@ -9,7 +9,7 @@
  *                        test tells an account's shadow home from the real one (or its absence)
  *   FAKE_SCENARIO        text (default) | tool | edit | edit-applied | queued | interrupt | error
  *                        | fail | tool-hang | stdin-closed | schema | schema-invalid | subagent
- *                        | ask-question | background
+ *                        | ask-question | background | background-wait
  *   FAKE_SUBAGENT_COUNT       children the `subagent` scenario spawns (default 1)
  *   FAKE_SUBAGENT_TRANSCRIPT  what the `subagent` scenario writes for each child: valid (default),
  *                             malformed (unreadable lines only), missing (no file at all), or
@@ -25,7 +25,8 @@
  *                        carries on at once, as agy does when nobody intervenes
  *   FAKE_QUESTION_EFFECT file the `ask-question` scenario writes "User Skipped" into when it carries
  *                        on, the way the captured model wrote its skip into color.txt
- *   FAKE_BACKGROUND_GATE file the `background` scenario's background task runs until
+ *   FAKE_BACKGROUND_GATE file the `background` and `background-wait` scenarios' background task
+ *                        runs until
  *   FAKE_BACKGROUND_RESUME file the `background` scenario writes its pid into once the task has
  *                        ended, when set: the transcript then carries on past the answer the way
  *                        agy does when a background task's result reaches the model, and the
@@ -901,6 +902,51 @@ readline.createInterface({ input }).on("line", async (line) => {
     send(stepEvent(first + 3, "DONE", "tool", { tool_name: "run_command", tool_info: { name: "run_command", parameters: { CommandLine: "curl -s localhost:4719/health" }, output: "ok" } }));
     send(stepEvent(first + 4, "DONE", "agent_response", { text_delta: `The server is running (${text}).` }));
     sendResult(turnResult(turns, `The server is running (${text}).`));
+    return;
+  }
+
+  if (scenario === "background-wait") {
+    // Probed with agy 1.2.14 on `sleep 25`: the model says it is waiting right after the launch,
+    // looks in on the task (`manage_task status`, then its log), says so again, and agy keeps the
+    // turn open; when the task ends it releases the held steps, injects the task's result, and
+    // the model finishes the same turn.
+    const first = step;
+    step += 9;
+    const command = { CommandLine: "npm test" };
+    const log = `/home/.gemini/antigravity-cli/brain/${conversationId}/.system_generated/tasks/task-1.log`;
+    send(stepEvent(first, "DONE", "agent_response", { text_delta: "Running the tests." }));
+    send(stepEvent(first + 1, "ACTIVE", "tool", { tool_name: "run_command", tool_info: { name: "run_command", parameters: command } }));
+
+    const encode = (value) => JSON.stringify(value);
+    const path = join(homedir(), ".gemini", "antigravity-cli", "brain", conversationId, ".system_generated", "logs", "transcript.jsonl");
+    await writeChildLines(path, [
+      { step_index: first - 1, source: "USER_EXPLICIT", type: "USER_INPUT", status: "DONE", content: `<USER_REQUEST>\n${text}\n</USER_REQUEST>` },
+      { step_index: first, source: "MODEL", type: "PLANNER_RESPONSE", status: "DONE", content: "Running the tests.", tool_calls: [{ name: "run_command", args: { CommandLine: encode("npm test") } }] },
+      { step_index: first + 1, source: "MODEL", type: "GENERIC", status: "RUNNING", content: "Tool is running as a background task with task id: conv/task-1" },
+      { step_index: first + 2, source: "MODEL", type: "PLANNER_RESPONSE", status: "DONE", content: "Waiting for the tests to finish.", tool_calls: [{ name: "manage_task", args: { Action: encode("status"), TaskId: encode("conv/task-1") } }] },
+      { step_index: first + 3, source: "MODEL", type: "GENERIC", status: "DONE", content: "Task: conv/task-1\nStatus: RUNNING" },
+      { step_index: first + 4, source: "MODEL", type: "PLANNER_RESPONSE", status: "DONE", tool_calls: [{ name: "view_file", args: { AbsolutePath: encode(log) } }] },
+      { step_index: first + 5, source: "MODEL", type: "GENERIC", status: "DONE", content: "File Path: task-1.log\n" },
+      { step_index: first + 6, source: "MODEL", type: "PLANNER_RESPONSE", status: "DONE", content: "The tests are still running." },
+    ].map((line) => JSON.stringify(line)));
+
+    await waitForGate("FAKE_BACKGROUND_GATE");
+    send(stepEvent(first + 1, "DONE", "tool", { tool_name: "run_command", tool_info: { name: "run_command", parameters: command, output: "12 passed" } }));
+    send(stepEvent(first + 2, "DONE", "agent_response", { text_delta: "Waiting for the tests to finish." }));
+    send(stepEvent(first + 3, "DONE", "tool", { tool_name: "manage_task", tool_info: { name: "manage_task", parameters: { Action: "status" } } }));
+    send(stepEvent(first + 5, "DONE", "tool", { tool_name: "view_file", tool_info: { name: "view_file", parameters: { AbsolutePath: log } } }));
+    send(stepEvent(first + 6, "DONE", "agent_response", { text_delta: "The tests are still running." }));
+    await writeChildLines(path, [
+      { step_index: first + 7, source: "SYSTEM", type: "SYSTEM_MESSAGE", status: "DONE", content: 'Task id "conv/task-1" finished with result:\nThe command exited with code 0.\nOutput:\n12 passed' },
+    ].map((line) => JSON.stringify(line)));
+    // agy injects the result a while after releasing the stream; the transcript poll must see it.
+    await sleep(1_500);
+    send(stepEvent(first + 7, "DONE", "system_message", {}));
+    await writeChildLines(path, [
+      { step_index: first + 8, source: "MODEL", type: "PLANNER_RESPONSE", status: "DONE", content: `All 12 tests passed (${text}).` },
+    ].map((line) => JSON.stringify(line)));
+    send(stepEvent(first + 8, "DONE", "agent_response", { text_delta: `All 12 tests passed (${text}).` }));
+    sendResult(turnResult(turns, `Waiting for the tests to finish.\nThe tests are still running.\nAll 12 tests passed (${text}).`));
     return;
   }
 

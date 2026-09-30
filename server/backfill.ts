@@ -23,6 +23,17 @@ type JsonValue = string | number | boolean | null | JsonValue[] | { [key: string
 
 const PLANNER_RESPONSE = "PLANNER_RESPONSE";
 const GENERIC = "GENERIC";
+const USER_INPUT = "USER_INPUT";
+const SYSTEM_MESSAGE = "SYSTEM_MESSAGE";
+
+/** A `run_command` result saying agy moved the command to the background, naming its task. */
+const BACKGROUND_LAUNCH = /Tool is running as a background task with task id: (\S+)/;
+/** The SYSTEM_MESSAGE agy injects when a background task ends (agy 1.2.x). */
+const BACKGROUND_FINISH = /Task id "([^"]+)" finished/g;
+/** The SYSTEM_MESSAGE a fresh CLI injects about tasks its predecessor left behind. */
+const BACKGROUND_STOPPED = /background tasks have been stopped/;
+/** Where agy writes the log of a background task, inside the conversation's brain directory. */
+const TASK_LOGS = "/.system_generated/tasks/";
 
 /**
  * Where agy writes a conversation's transcript. The caller names the `.gemini` root: the real home
@@ -57,10 +68,13 @@ export interface Backfill {
   readonly rows: BackfillRow[];
   /**
    * The step holding the conversation's final answer — a PLANNER_RESPONSE with text and no tool
-   * calls as the highest step so far — or null while it is still working.
+   * calls as the highest step so far — or null while it is still working. An answer that is only
+   * the model waiting for a background command is not final (see `backgroundState`).
    */
   readonly finalStep: number | null;
   readonly finalText: string;
+  /** Background commands started since the latest user input that have not finished yet. */
+  readonly backgroundTasks: number;
 }
 
 /** Renders a conversation transcript into rows keyed the way the stream keys the same steps. */
@@ -110,16 +124,73 @@ export function renderBackfill(
   }
 
   const last = sorted.at(-1);
-  const done =
+  const answered =
     last !== undefined &&
     last.type === PLANNER_RESPONSE &&
     last.toolCalls.length === 0 &&
     (last.content ?? "").trim().length > 0;
+  const background = backgroundState(sorted);
+  const done = answered && !background.waiting;
   return {
     rows,
     finalStep: done ? last.stepIndex : null,
     finalText: done ? (last.content ?? "") : "",
+    backgroundTasks: background.running,
   };
+}
+
+/**
+ * The background commands of the current turn, and whether its latest answer only waits for one.
+ *
+ * agy tells the model a command went to the background with "either proceed to other relevant
+ * work, or simply update the user with a short message … and end the turn", then keeps the turn
+ * open itself ("root agent idle; waiting up to 30m0s for 1 background task(s)" on stderr) and hands
+ * the model the task's result when it ends, in the same turn (probed with agy 1.2.14 on
+ * `sleep 20`). An answer whose latest tool result is such a launch is that short message: the
+ * turn is not over. Checking on the task in between — `manage_task status`, reading its log, as
+ * gemini-3.8-flash did on the same probe — is still waiting. An answer after other work — a dev
+ * server started and then checked — is the end of the turn.
+ */
+function backgroundState(sorted: readonly TranscriptEntry[]): { running: number; waiting: boolean } {
+  let start = 0;
+  sorted.forEach((entry, index) => {
+    if (entry.type === USER_INPUT) start = index + 1;
+  });
+  const running = new Set<string>();
+  const calls = new Map<number, string>();
+  let latestResultTask: string | null = null;
+  for (const entry of sorted.slice(start)) {
+    const content = entry.content ?? "";
+    if (entry.type === PLANNER_RESPONSE) {
+      entry.toolCalls.forEach((call, index) => {
+        calls.set(entry.stepIndex + 1 + index, `${call.name} ${JSON.stringify(call.args)}`);
+      });
+    } else if (entry.type === GENERIC) {
+      const launch = BACKGROUND_LAUNCH.exec(content);
+      if (launch) {
+        latestResultTask = launch[1];
+        running.add(launch[1]);
+      } else if (!checksOnTask(calls.get(entry.stepIndex), running)) {
+        latestResultTask = null;
+      }
+    } else if (entry.type === SYSTEM_MESSAGE) {
+      for (const finish of content.matchAll(BACKGROUND_FINISH)) running.delete(finish[1]);
+      if (BACKGROUND_STOPPED.test(content)) running.clear();
+    }
+  }
+  return {
+    running: running.size,
+    waiting: latestResultTask !== null && running.has(latestResultTask),
+  };
+}
+
+/** Whether a tool call only looks in on a running background task: its status, or its log. */
+function checksOnTask(call: string | undefined, running: ReadonlySet<string>): boolean {
+  if (call === undefined) return false;
+  if (call.startsWith("manage_task ")) return true;
+  if (call.includes(TASK_LOGS)) return true;
+  for (const task of running) if (call.includes(task)) return true;
+  return false;
 }
 
 /** Poll period while a stream is stuck. */
