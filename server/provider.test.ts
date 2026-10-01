@@ -45,6 +45,7 @@ const OFFERED = [
   "session.configure",
   "session.list",
   "session.persistence",
+  "session.subsession",
   "permission",
   "permission.tool_policy",
 ];
@@ -87,8 +88,26 @@ function check(schema: z.ZodType, value: unknown, direction: "input" | "event"):
  */
 function watchConnection(connection: ProviderConnection): ProviderEvent[] {
   const events: ProviderEvent[] = [];
+  // The daemon's own `session.opened` checks: a session may only select what was negotiated, and a
+  // child may only hang off a session that selected `session.subsession`. Either failure takes the
+  // whole connection down in the daemon.
+  const selected = new Map<string, readonly string[]>();
   connection.onEvent((event) => {
     check(ProviderEventSchema, event, "event");
+    if (event.type === "session.opened") {
+      for (const capability of event.capabilities) {
+        if (!connection.capabilities.includes(capability)) {
+          schemaViolations.push(`event capabilities: unoffered ${capability}`);
+        }
+      }
+      if (
+        event.parentSessionId !== undefined &&
+        !selected.get(event.parentSessionId)?.includes("session.subsession")
+      ) {
+        schemaViolations.push("event parentSessionId: parent did not negotiate session.subsession");
+      }
+      selected.set(event.sessionId, event.capabilities);
+    }
     events.push(event);
   });
   const send = connection.send.bind(connection);
@@ -3125,7 +3144,7 @@ describe("subagents", () => {
     ]);
   });
 
-  it("opens the child's session linked to the row, with no capabilities of its own", async () => {
+  it("opens the child's session linked to the row, able to host its own subagents", async () => {
     const { connection, events } = await startedTurn();
     const childId = childIdOf(events);
     const opened = await waitFor(
@@ -3136,7 +3155,7 @@ describe("subagents", () => {
     expect(opened).toMatchObject({
       parentSessionId: "session-1",
       toolCallId: subagentRows(events)[0]?.id,
-      capabilities: [],
+      capabilities: ["session.subsession"],
       restoration: "parent",
       title: "Researcher A",
       description: `Please read the file ${childFile(0)} and report its exact contents.`,
@@ -3296,7 +3315,7 @@ describe("subagents", () => {
     expect(opened).toMatchObject({
       parentSessionId: childId,
       toolCallId: spawnRowId,
-      capabilities: [],
+      capabilities: ["session.subsession"],
       restoration: "parent",
       title: "Nested Worker",
       description: "Summarise what you find.",

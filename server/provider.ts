@@ -316,6 +316,12 @@ interface Session {
    * be offered.
    */
   readonly planApproval: boolean;
+  /**
+   * What a child session opens with: `session.subsession` when the host negotiated it. The host
+   * refuses a `session.opened` whose parent did not select it — and fails the whole connection —
+   * so a child that cannot host its own subagents would take the parent down with it.
+   */
+  readonly childCapabilities: readonly ProviderCapability[];
 }
 
 /**
@@ -750,6 +756,7 @@ async function openSession(
     pendingPlan: null,
     pendingQuestion: null,
     planApproval: state.capabilities.includes("permission"),
+    childCapabilities: state.capabilities.filter((capability) => capability === "session.subsession"),
   };
   state.sessions.set(input.sessionId, session);
   // Before `session.config`: the tier the effort becomes is what the composer has to show.
@@ -938,7 +945,7 @@ async function replaySubagentItem(
     sessionId: childId,
     parentSessionId: host.sessionId,
     toolCallId: row.id,
-    capabilities: [],
+    capabilities: session.childCapabilities,
     restoration: "parent",
     title: row.info.role ?? row.info.typeName ?? "Subagent",
     description: (row.info.prompt ?? "").slice(0, DESCRIPTION_LIMIT),
@@ -2520,7 +2527,7 @@ function handleChildRender(
       // A subagent started by another subagent hangs off that one, not off the conversation.
       parentSessionId: follow.hostSessionId,
       toolCallId: follow.rowId,
-      capabilities: [],
+      capabilities: session.childCapabilities,
       restoration: "parent",
       title,
       description: (row?.info.prompt ?? "").slice(0, DESCRIPTION_LIMIT),
