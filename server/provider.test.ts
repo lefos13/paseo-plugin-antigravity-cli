@@ -166,6 +166,7 @@ afterEach(async () => {
     "FAKE_SUBAGENT_GATE",
     "FAKE_SUBAGENT_NESTED",
     "FAKE_SUBAGENT_NESTED_GATE",
+    "FAKE_SUBAGENT_NESTED_RESUME",
     "FAKE_EDIT_FILE",
     "FAKE_EDIT_TOOL",
     "FAKE_EDIT_AFTER",
@@ -3297,7 +3298,7 @@ describe("subagents", () => {
 
   it("opens a subagent that a subagent started under that subagent, and holds it open until then", async () => {
     // The first child starts a subagent of its own, which only its own transcript reports. The
-    // gate holds that grandchild's last word back, so the child is done while it still runs.
+    // gate holds that grandchild's last word back, so the child speaks while it still runs.
     const GRANDCHILD = "bbbbbbbb-0000-4000-8000-000000000000";
     const nestedGate = join(tempDir, "nested-gate");
     process.env.FAKE_SUBAGENT_NESTED = "1";
@@ -3337,13 +3338,23 @@ describe("subagents", () => {
       ),
     ).toEqual(new Set([spawnRowId]));
 
-    // The child said its last word, but its subagent is still going: its session stays open.
+    // The child said its last word, but its subagent is still going: the child is waiting on it,
+    // so neither its turn nor its row is over and its session stays open.
     await waitFor(
-      () => (turnIndex(events, childId, "completed") >= 0 ? true : undefined),
-      "the child's turn to complete",
+      () =>
+        itemsFor(events, childId).some(
+          (item) => item.type === "assistant_message" && item.text.startsWith("I have read"),
+        )
+          ? true
+          : undefined,
+      "the child's last word",
     );
     await waitOutAPoll();
+    expect(turnIndex(events, childId, "completed")).toBe(-1);
     expect(closedSessions(events, childId)).toEqual([]);
+    expect(subagentRows(events).filter((row) => row.id === subagentRows(events)[0]?.id).at(-1)).toMatchObject({
+      status: "running",
+    });
 
     writeFileSync(nestedGate, "", "utf8");
     await waitFor(
@@ -3368,6 +3379,48 @@ describe("subagents", () => {
       "user_message",
       "assistant_message",
     ]);
+  });
+
+  it("keeps following a child that carries on after its subagent reports, into the next one it starts", async () => {
+    // A /boost coordinator: it says it is waiting, is handed its worker's report, starts a reviewer,
+    // waits again, and only then finishes. The reviewer must open under it like the first worker.
+    const REVIEWER = "cccccccc-0000-4000-8000-000000000000";
+    process.env.FAKE_SUBAGENT_NESTED = "1";
+    process.env.FAKE_SUBAGENT_NESTED_RESUME = "1";
+    const { events } = await startedTurn();
+    const childId = childIdOf(events);
+    const reviewerId = `session-1:subagent:${REVIEWER}`;
+
+    const opened = await waitFor(
+      () => childSessions(events).find((event) => event.sessionId === reviewerId),
+      "the reviewer's session to open",
+    );
+    expect(opened).toMatchObject({
+      parentSessionId: childId,
+      toolCallId: `agy-sub:${CHILD_A}:9:spawn:0:0`,
+      title: "Reviewer",
+    });
+    await waitFor(
+      () => (closedSessions(events, childId).length > 0 ? true : undefined),
+      "the child's session to close",
+    );
+
+    // Completed once, after it said its real last word, and closed after the reviewer.
+    expect(
+      events.filter(
+        (event) => event.type === "session.turn" && event.sessionId === childId && event.state === "completed",
+      ),
+    ).toHaveLength(1);
+    expect(itemsFor(events, childId).at(-1)).toMatchObject({
+      type: "assistant_message",
+      text: "Both workers reported; the task is done.",
+    });
+    expect(
+      events.findIndex((event) => event.type === "session.closed" && event.sessionId === reviewerId),
+    ).toBeLessThan(
+      events.findIndex((event) => event.type === "session.closed" && event.sessionId === childId),
+    );
+    expect(closedSessions(events, childId)).toEqual([{ sessionId: childId }]);
   });
 
   it("cancels a running subagent and stops following its transcript on interrupt", async () => {

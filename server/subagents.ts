@@ -627,13 +627,15 @@ export class SubagentTranscript {
     }
   }
 
-  /** One last look at the transcript, for the callers that stop following while a child runs. */
-  async readFinal(): Promise<void> {
+  /**
+   * Reads the transcript now, whether or not it changed: for a caller about to stop following a
+   * running child, and for a host whose last subagent just finished and may have finished with it.
+   */
+  async reread(): Promise<void> {
     if (this.stopped) return;
     // A read may already be under way — from the poll, the watch, or the read `start` issued — and
     // it was started before this call, so what it publishes goes first. Giving up here instead
-    // would turn the caller's "one last read" into no read at all whenever a tick happened to be
-    // running, which is the one moment it matters most.
+    // would turn the caller's read into no read at all whenever a tick happened to be running.
     await this.inFlight;
     // That read may have found the child's last word, which stops the tailer; there is nothing
     // more to look at then.

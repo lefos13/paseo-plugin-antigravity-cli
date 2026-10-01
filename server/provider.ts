@@ -485,7 +485,10 @@ interface ChildFollow {
   store: TranscriptStore | null;
   /** Whether the child's session events have been emitted; the session opens lazily. */
   opened: boolean;
-  /** Whether the child reached its own last word. */
+  /**
+   * Whether the child is over: it said its last word and no subagent it started is still running.
+   * A child that answers "waiting for my worker" carries on once the worker reports back.
+   */
   done: boolean;
   /** The follow of the child that started this one, or null when the conversation itself did. */
   readonly host: ChildFollow | null;
@@ -497,8 +500,6 @@ interface ChildFollow {
   readonly depth: number;
   /** Rows of the subagents this child started that are still to finish. */
   readonly nested: Set<string>;
-  /** The child said its last word while subagents of its own were still running. */
-  closePending: boolean;
 }
 
 /** The error a failed turn reports, and whether retrying is likely to help. */
@@ -2329,40 +2330,27 @@ function closeChildSession(
   // Several paths settle the same child — the child finishing, the turn ending, the transcript
   // being given up on — and only the first of them may close the session.
   if (!session.childSessions.delete(follow.childId)) return;
-  follow.closePending = false;
   emit({
     type: "session.closed",
     sessionId: follow.childId,
     ...(error !== undefined ? { error } : {}),
   });
-  releaseFromHost(session, emit, follow);
-}
-
-/**
- * Closes a child that said its last word, unless subagents it started are still running: their
- * rows are drawn in its session, so it stays open until the last of them is over.
- */
-function requestChildClose(session: Session, emit: Emit, follow: ChildFollow): void {
-  if (follow.nested.size > 0) {
-    follow.closePending = true;
-    return;
-  }
-  closeChildSession(session, emit, follow);
+  releaseFromHost(follow);
 }
 
 /** A child is over; the child that started it may now be closable. */
-function releaseFromHost(session: Session, emit: Emit, follow: ChildFollow): void {
-  releaseNested(session, emit, follow.host, follow.rowId);
+function releaseFromHost(follow: ChildFollow): void {
+  releaseNested(follow.host, follow.rowId);
 }
 
-function releaseNested(
-  session: Session,
-  emit: Emit,
-  host: ChildFollow | null,
-  rowId: string,
-): void {
+/**
+ * Takes a finished subagent off its host's running set. The host is read again once the last one
+ * is gone: a host whose last word still stands is finished there, and one that carried on — the
+ * worker's report usually reaches it before the worker's own last line — is followed further.
+ */
+function releaseNested(host: ChildFollow | null, rowId: string): void {
   if (host === null || !host.nested.delete(rowId)) return;
-  if (host.closePending && host.nested.size === 0) closeChildSession(session, emit, host);
+  if (host.nested.size === 0) void host.transcript.reread();
 }
 
 /**
@@ -2405,7 +2393,7 @@ async function startChildFollow(
     );
     // No follow was left behind, so nothing will ever report this child over: it must not hold
     // its host open.
-    if (!session.follows.has(row.id)) releaseNested(session, emit, row.host, row.id);
+    if (!session.follows.has(row.id)) releaseNested(row.host, row.id);
   }
 }
 
@@ -2473,7 +2461,6 @@ function createChildFollow(
     parentConversationId: host?.childConversationId ?? session.conversationId ?? "",
     depth: host === null ? 0 : host.depth + 1,
     nested: new Set(),
-    closePending: false,
     transcript: null as unknown as SubagentTranscript,
   };
   follow.transcript = new SubagentTranscript(
@@ -2489,7 +2476,7 @@ function createChildFollow(
       // which is why this degrades to that rather than removing or failing anything.
       onDegrade: (reason) => {
         console.error(`[antigravity] not following subagent ${childConversationId}: ${reason}`);
-        releaseFromHost(session, emit, follow);
+        releaseFromHost(follow);
       },
       onLost: (reason) => handleChildLost(session, emit, follow, reason),
       isBusy: () => follow.nested.size > 0,
@@ -2556,28 +2543,31 @@ function handleChildRender(
     emit({ type: "timeline.item", sessionId: follow.childId, item });
   }
 
-  follow.done = render.done;
+  // A child that spoke while subagents of its own still run is waiting for them, not finished:
+  // agy hands it their reports and it goes on, often to start more of them.
+  const finished = render.done && follow.nested.size === 0;
+  follow.done = finished;
   const row = session.subagents.get(follow.rowId);
   if (row) {
     row.childSessionId = follow.childId;
     if (render.report.length > 0) row.log = render.report;
     if (render.actions.length > 0) row.actions = [...render.actions];
-    if (render.done) row.info.done = true;
+    if (finished) row.info.done = true;
     // The child finished, and the row does not need the turn to say so; a row something else has
     // already settled keeps that status, since a later report cannot unsay what happened.
-    if (render.done && row.status === "running") row.status = "completed";
+    if (finished && row.status === "running") row.status = "completed";
     refreshSubagentRow(row);
     publishSubagent(session, emit, row);
   }
 
-  if (render.done) {
+  if (finished) {
     emit({
       type: "session.turn",
       sessionId: follow.childId,
       turnId: childTurnId(follow.childConversationId),
       state: "completed",
     });
-    requestChildClose(session, emit, follow);
+    closeChildSession(session, emit, follow);
     follow.transcript.stop();
     // The child's rows are complete here, so they no longer have to wait out the write debounce:
     // a session closed right after this still replays everything the child said.
@@ -2631,7 +2621,7 @@ function handleChildLost(session: Session, emit: Emit, follow: ChildFollow, reas
     void follow.store?.flush();
     closeChildSession(session, emit, follow, error);
   }
-  releaseFromHost(session, emit, follow);
+  releaseFromHost(follow);
 }
 
 /**
@@ -2658,7 +2648,7 @@ async function settleChildFollows(
     if (follow === undefined) return;
     session.follows.delete(follow.rowId);
     try {
-      await follow.transcript.readFinal();
+      await follow.transcript.reread();
     } catch (error) {
       console.error(
         `[antigravity] could not read the last of subagent ${follow.childConversationId}: ${describe(error)}`,
@@ -2690,7 +2680,7 @@ async function settleChildFollows(
       });
       closeChildSession(session, emit, follow, outcome.error);
     }
-    releaseFromHost(session, emit, follow);
+    releaseFromHost(follow);
   }
 }
 

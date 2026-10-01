@@ -486,7 +486,7 @@ describe("SubagentTranscript", () => {
     // The read is under way — it is waiting on the file — when following stops beneath it, which is
     // what a session close, an interrupted turn, or a finished child does. Nothing that read was
     // going to say may reach the consumer afterwards, not even a render that carries nothing.
-    const last = transcript.readFinal();
+    const last = transcript.reread();
     await Promise.resolve();
     transcript.stop();
     await last;
@@ -508,7 +508,7 @@ describe("SubagentTranscript", () => {
     // way, and not on how many reads it took to publish it.
     transcript.start();
     writeFileSync(file, `${line(0, "USER_INPUT", { content: "read the file" })}\n`, "utf8");
-    await transcript.readFinal();
+    await transcript.reread();
 
     expect(published).toEqual([[`agy-sub:${CHILD}:0:user`]]);
     await firstRender;
@@ -528,7 +528,7 @@ describe("SubagentTranscript", () => {
 
     const { transcript, published, degraded, lost, firstRender } = harness(file);
     transcript.start();
-    await transcript.readFinal();
+    await transcript.reread();
     await firstRender;
     transcript.stop();
 

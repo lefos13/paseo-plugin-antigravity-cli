@@ -349,11 +349,13 @@ function subagentChildren(count) {
  * calling `invoke_subagent`, which only its own transcript reports (probed 2026-09-29, the parent's
  * stream names its direct children and nothing below them).
  */
-function subagentGrandchild() {
-  const conversationId = "bbbbbbbb-0000-4000-8000-000000000000";
+function subagentGrandchild(
+  conversationId = "bbbbbbbb-0000-4000-8000-000000000000",
+  role = "Nested Worker",
+) {
   return {
     conversationId,
-    role: "Nested Worker",
+    role,
     typeName: "worker",
     prompt: "Summarise what you find.",
     path: join(
@@ -388,6 +390,60 @@ function grandchildTranscriptLines(grandchild, parentConversationId) {
       }),
     ],
     tail: [step(1, "PLANNER_RESPONSE", { content: "The nested worker is done." })],
+  };
+}
+
+/**
+ * What the first child writes after its last word when `FAKE_SUBAGENT_NESTED_RESUME=1`, mirroring
+ * a captured /boost run (2026-10-01): a coordinator says "waiting for the worker", is handed the
+ * worker's report, starts a second worker, waits again, and only then finishes. The report reaches
+ * the child before the worker's own last line, as it did there.
+ */
+function resumedChildLines(first, second) {
+  const step = (stepIndex, type, extra) =>
+    JSON.stringify({
+      step_index: stepIndex,
+      source: "MODEL",
+      type,
+      status: "DONE",
+      created_at: "2026-10-01T08:11:29Z",
+      ...extra,
+    });
+  const reportFrom = (stepIndex, worker) =>
+    step(stepIndex, "SYSTEM_MESSAGE", {
+      source: "SYSTEM",
+      content: `The following is a <SYSTEM_MESSAGE> not actually sent by the user.\n\n<SYSTEM_MESSAGE>\n[Message] timestamp=2026-10-01T08:11:29Z sender=${worker.conversationId} priority=MESSAGE_PRIORITY_HIGH content=Done.\n</SYSTEM_MESSAGE>`,
+    });
+  return {
+    firstReport: [reportFrom(8, first)],
+    respawn: [
+      step(9, "PLANNER_RESPONSE", {
+        tool_calls: [
+          {
+            name: "invoke_subagent",
+            args: {
+              Subagents: JSON.stringify([
+                {
+                  Model: "inherit",
+                  Prompt: second.prompt,
+                  Role: second.role,
+                  TypeName: second.typeName,
+                  Workspace: "inherit",
+                },
+              ]),
+              toolAction: '"Spawning a reviewer"',
+              toolSummary: '"Reviewer invocation"',
+            },
+          },
+        ],
+      }),
+      step(10, "GENERIC", {
+        content: `Created the following subagents:\n{\n  "conversationId":  "${second.conversationId}",\n  "logAbsoluteUri":  "${pathToFileURL(second.path).href}",\n  "workspaceUris":  [\n    "${pathToFileURL(process.cwd()).href}"\n  ]\n}`,
+      }),
+      step(11, "PLANNER_RESPONSE", { content: "Waiting for the reviewer to report back." }),
+    ],
+    secondReport: [reportFrom(12, second)],
+    last: [step(13, "PLANNER_RESPONSE", { content: "Both workers reported; the task is done." })],
   };
 }
 
@@ -816,14 +872,32 @@ readline.createInterface({ input }).on("line", async (line) => {
     // watch a child report while the parent's own turn is still running.
     await waitForGate("FAKE_SUBAGENT_GATE");
 
-    // The first child's last word goes out before its subagent's, so the child is done while the
+    // The first child's last word goes out before its subagent's, so the child speaks while the
     // subagent it started still runs.
     for (const { child, lines } of transcripts) {
       await writeChildLines(child.path, lines.tail);
     }
     if (grandchild !== null && nestedLines !== null) {
       await waitForGate("FAKE_SUBAGENT_NESTED_GATE");
-      await writeChildLines(grandchild.path, nestedLines.tail);
+      if (process.env.FAKE_SUBAGENT_NESTED_RESUME === "1") {
+        const reviewer = subagentGrandchild("cccccccc-0000-4000-8000-000000000000", "Reviewer");
+        const reviewerLines = grandchildTranscriptLines(reviewer, children[0].conversationId);
+        const resumed = resumedChildLines(grandchild, reviewer);
+        const host = children[0].path;
+        await writeChildLines(host, resumed.firstReport);
+        await writeChildLines(grandchild.path, nestedLines.tail);
+        // The host carries on only after the plugin has had time to see the worker finish.
+        await new Promise((resolve) => setTimeout(resolve, 300));
+        await writeChildLines(host, resumed.respawn);
+        await writeChildLines(reviewer.path, reviewerLines.head);
+        await new Promise((resolve) => setTimeout(resolve, 300));
+        await writeChildLines(host, resumed.secondReport);
+        await writeChildLines(reviewer.path, reviewerLines.tail);
+        await new Promise((resolve) => setTimeout(resolve, 300));
+        await writeChildLines(host, resumed.last);
+      } else {
+        await writeChildLines(grandchild.path, nestedLines.tail);
+      }
     }
     // One system message per child, which is how agy tells the parent a child reported; it carries
     // nothing that says which child, and it arrives long after the child's own transcript has.
