@@ -136,6 +136,13 @@ const IMPLEMENT_PLAN_TEXT = "The plan is approved. Implement it now.";
  * permanent failure such as `model does-not-exist is not recognized` as worth retrying.
  */
 const UNAVAILABLE_PATTERN = /\bUNAVAILABLE\b|\b503\b/;
+/**
+ * agy 1.2.15+ stops at once when the plan quota is used up and the AI credits balance cannot cover
+ * the request. Both strings are read off the 1.2.16 binary; no capture of ours holds either yet.
+ */
+const CREDITS_EXHAUSTED_PATTERN =
+  /\bINSUFFICIENT_G1_CREDITS_BALANCE\b|AI credits balance is too low to continue/;
+const CREDITS_EXHAUSTED_CODE = "credits_exhausted";
 
 /**
  * `prompt.steer` is deliberately absent: a line written to agy stdin while a turn is running is
@@ -2779,7 +2786,7 @@ function handleResult(session: Session, result: AgyResult, emit: Emit): void {
     error,
   });
   void settleChildFollows(session, emit, turn, { state: "failed", error });
-  if (retryable) emitUnavailableNotice(session, emit);
+  emitFailureNotice(session, emit, { error, retryable });
 }
 
 function handleAgyExit(
@@ -2834,7 +2841,7 @@ function handleAgyExit(
       canceled ? { state: "canceled", error: failure.error } : { state: "failed", error: failure.error },
     );
   }
-  if (failure.retryable) emitUnavailableNotice(session, emit);
+  emitFailureNotice(session, emit, failure);
 }
 
 /**
@@ -2843,6 +2850,15 @@ function handleAgyExit(
  * other failure keeps the status agy reported or the exit-path code.
  */
 function turnFailure(session: Session, fallback: { message: string; code: string }): TurnFailure {
+  const failure = reportedFailure(session, fallback);
+  // Retrying cannot help a spent balance, whatever the report says about retryability.
+  if (CREDITS_EXHAUSTED_PATTERN.test(`${failure.error.code ?? ""} ${failure.error.message}`)) {
+    return { error: { ...failure.error, code: CREDITS_EXHAUSTED_CODE }, retryable: false };
+  }
+  return failure;
+}
+
+function reportedFailure(session: Session, fallback: { message: string; code: string }): TurnFailure {
   const report = session.agyError;
   if (report) {
     const error: ProviderError = {
@@ -2868,6 +2884,23 @@ function emitUnavailableNotice(session: Session, emit: Emit): void {
     "warning",
     "Antigravity is temporarily unavailable",
     "The Antigravity service reported that it is temporarily unavailable. Retry the prompt in a moment; this usually clears on its own.",
+  );
+}
+
+function emitFailureNotice(session: Session, emit: Emit, failure: TurnFailure): void {
+  if (failure.retryable) {
+    emitUnavailableNotice(session, emit);
+    return;
+  }
+  if (failure.error.code !== CREDITS_EXHAUSTED_CODE) return;
+  // An account is fixed for the life of a session, so the way out is a session on another one.
+  emitNotice(
+    session,
+    emit,
+    "agy-credits-exhausted",
+    "warning",
+    "This account is out of AI credits",
+    "The account's plan quota is used up and its AI credits balance cannot cover more requests, so retrying here fails the same way. Add credits to the account, or start a new session under another Antigravity account.",
   );
 }
 

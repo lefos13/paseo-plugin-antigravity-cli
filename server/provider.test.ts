@@ -2145,6 +2145,56 @@ describe("failures", () => {
     });
   });
 
+  it("names an exhausted AI credits balance and points at another account", async () => {
+    // agy 1.2.15 fails at once with this text instead of retrying for minutes. The string is the
+    // one in the 1.2.16 binary and changelog; no capture of ours has it, so the result is synthetic.
+    process.env.FAKE_SCENARIO = "error";
+    process.env.FAKE_RESULT_ERROR = "Your AI credits balance is too low to continue.";
+
+    const { connection, events } = await connect();
+    await openSession(connection);
+    await prompt(connection, "hello");
+    const turn = await waitFor(() => turns(events, "failed")[0], "the turn to fail");
+
+    expect(turn).toMatchObject({
+      error: { code: "credits_exhausted", message: "Your AI credits balance is too low to continue." },
+    });
+    const notices = events.filter(
+      (event) => event.type === "session.notice" && event.notice.id === "agy-credits-exhausted",
+    );
+    expect(notices).toHaveLength(1);
+    expect(notices[0]).toMatchObject({
+      notice: { severity: "warning", description: expect.stringContaining("another Antigravity account") },
+    });
+    expect(
+      events.some((event) => event.type === "session.notice" && event.notice.id === "agy-unavailable"),
+    ).toBe(false);
+  });
+
+  it("names an exhausted AI credits balance reported as a structured AGY_ERROR status", async () => {
+    // INSUFFICIENT_G1_CREDITS_BALANCE is the status string in the 1.2.16 binary; the payload shape
+    // is the documented one, as in the UNAVAILABLE case above.
+    process.env.FAKE_SCENARIO = "fail";
+    const report = JSON.stringify({
+      short_error: "inference failed",
+      status: "INSUFFICIENT_G1_CREDITS_BALANCE",
+      retryable: false,
+    });
+    process.env.FAKE_STDERR_LINE = `AGY_ERROR: ${report}`;
+
+    const { connection, events } = await connect();
+    await openSession(connection);
+    await prompt(connection, "hello");
+    const turn = await waitFor(() => turns(events, "failed")[0], "the turn to fail");
+
+    expect(turn).toMatchObject({
+      error: { code: "credits_exhausted", message: "inference failed", diagnostic: report },
+    });
+    expect(
+      events.some((event) => event.type === "session.notice" && event.notice.id === "agy-credits-exhausted"),
+    ).toBe(true);
+  });
+
   it("cancels the running turn on interrupt and lets the session continue", async () => {
     process.env.FAKE_SCENARIO = "interrupt";
     const { connection, events } = await connect();
