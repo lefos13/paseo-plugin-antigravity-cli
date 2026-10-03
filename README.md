@@ -7,7 +7,7 @@ already installed and signed in on your machine.
 
 - Provider id: `antigravity-cli`
 - Requires: Paseo ≥ 0.9.1 (provider protocol version 1), Node 24 for the plugin process, and
-  Antigravity CLI 1.2.9–1.2.14 for the behaviour described below. The plugin also ships a client
+  Antigravity CLI 1.2.9–1.2.16 for the behaviour described below. The plugin also ships a client
   entry (the [accounts screen](#multiple-accounts)), so the connected Paseo **app** must satisfy the
   same minimum — a compatible daemon does not make an older app compatible.
 
@@ -148,7 +148,10 @@ turn relaunches with it.
 - **`skills.json`** (`.agents/skills.json`, the same file under the other workspace roots, and
   `~/.gemini/config/skills.json`) loads the items directly inside its `path`, one level deep;
   `include_only` and `exclude` name those items exactly, a nested one is named by its relative path in
-  `include_only` (`nested/deep`), and a relative `path` resolves from the repository root.
+  `include_only` (`nested/deep`), and a relative `path` resolves from the repository root. As in
+  agy 1.2.16, a workspace `skills.json` is read from every directory between the session's
+  directory and the repository root, so a session in a monorepo package also lists the root's;
+  `skills/` directories are read from the session's own directory only.
 - **Some built-ins are per account**: `/compact`, `/review` and `/owl` are gated server-side, and
   commands the CLI answers itself (`/skills`, `/model`, …) end a `stream-json` turn, so both stay out.
 
@@ -181,6 +184,8 @@ global agent roots, `<name>.md` or `<name>/agent.md`, with a frontmatter `name` 
 those an `agents.json` names — in any workspace root (`.agents/agents.json`, …) and
 `~/.gemini/config/agents.json` — in the `skills.json` shape, where a filter names an agent with or
 without its `.md`, an entry may name a single agent file, and `~/` paths are not expanded.
+As in agy 1.2.16, the workspace roots of every directory between the session's directory and the
+repository root are read, nearest first; outside a repository, only the session's directory.
 `mainAgent: false` agents are skipped, hidden ones are offered, and workspace agents (from either
 source) need that exact workspace trusted in `antigravity-cli/settings.json` (`trustedWorkspaces`) —
 on 1.2.14 a parent directory, the home directory included, trusts nothing below it — using the real
@@ -345,6 +350,9 @@ running subagent's transcript.
   a file the plugin cannot read, or one that did not change, leaves the row without a diff.
 - **Transient 503s** fail the turn with `code: "unavailable"`, and an error result ends the CLI
   process, which the next turn relaunches on the same conversation.
+- **An exhausted AI credits balance** (agy 1.2.15+) fails the turn with `code: "credits_exhausted"`,
+  never as retryable, and a notice suggests adding credits or starting a session under another
+  account: an account is fixed for the life of a session.
 - **Imported conversations** resume from `session.list`, but their earlier turns are not replayed.
 - **The command list is read from disk, not from the CLI**, so a skill the CLI would refuse to load can
   appear in the picker, and a command it no longer expands is sent as ordinary text.
