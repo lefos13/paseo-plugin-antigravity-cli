@@ -532,6 +532,37 @@ describe("discoverCommands", () => {
     expect(discovered).not.toContain("local-skill");
   });
 
+  it("reads a skills.json from every .agents/ between the launch directory and the repository root", async () => {
+    // agy 1.2.16 changelog: manifests in a parent `.agents/` load for a session started in a
+    // subdirectory. The walk stops at the git root (fixtures/26, probed with agents).
+    const repo = join(workspace, "repo");
+    const web = join(repo, "packages", "web");
+    mkdirSync(join(repo, ".git"), { recursive: true });
+    mkdirSync(web, { recursive: true });
+    writeItemSkill(join(repo, "shared", "root-skill"));
+    writeItemSkill(join(repo, "packages", "pkg-skills", "pkg-skill"));
+    writeItemSkill(join(repo, "outside", "above-skill"));
+    writeSkillsConfig({ entries: [{ path: "shared" }] }, join(repo, ".agents"));
+    writeSkillsConfig({ entries: [{ path: "packages/pkg-skills" }] }, join(repo, "packages", "_agents"));
+    writeSkillsConfig({ entries: [{ path: join(repo, "outside") }] }, join(workspace, ".agents"));
+
+    const discovered = (await discoverCommands(web)).commands.map((command) => command.name);
+    expect(discovered).toContain("root-skill");
+    expect(discovered).toContain("pkg-skill");
+    expect(discovered).not.toContain("above-skill");
+  });
+
+  it("reads no parent skills.json outside a repository", async () => {
+    // fixtures/26 §2: without a `.git` above it, agy reads the launch directory only.
+    const sub = join(workspace, "a", "b");
+    mkdirSync(sub, { recursive: true });
+    writeItemSkill(join(workspace, "shared", "parent-skill"));
+    writeSkillsConfig({ entries: [{ path: join(workspace, "shared") }] }, join(workspace, "a", ".agents"));
+
+    const discovered = (await discoverCommands(sub)).commands.map((command) => command.name);
+    expect(discovered).not.toContain("parent-skill");
+  });
+
   it("discovers skills named by the global config file", async () => {
     writeItemSkill(join(workspace, "repo-skills", "repo-skill"));
     writeItemSkill(join(home, "installed", "home-skill"));
@@ -677,6 +708,42 @@ describe("discoverCommands", () => {
     writeAgent(join(home, "home-agents", "h.md"), "home-agent", "Home");
     writeFileSync(configPath, JSON.stringify({ entries: [{ path: "~/home-agents" }] }), "utf8");
     expect(await listed()).toEqual([]);
+  });
+
+  it("lists the agents of every .agents/ up to the repository root, when the launch directory is trusted", async () => {
+    // Probed 2026-10-03 on 1.2.16 (fixtures/26): `agents/` and `agents.json` in a parent
+    // `.agents/` are listed from a subdirectory, trust is still the launch directory exactly, and
+    // nothing above the git root is read.
+    const repo = join(workspace, "repo");
+    const web = join(repo, "packages", "web");
+    mkdirSync(join(repo, ".git"), { recursive: true });
+    writeAgent(join(repo, ".agents", "agents", "root-dir-agent.md"), "root-dir-agent", "Root dir");
+    writeAgent(join(repo, "custom-agents", "root-json-agent.md"), "root-json-agent", "Root json");
+    mkdirSync(join(repo, ".agents"), { recursive: true });
+    writeFileSync(
+      join(repo, ".agents", "agents.json"),
+      JSON.stringify({ entries: [{ path: "custom-agents" }] }),
+      "utf8",
+    );
+    writeAgent(join(web, ".agents", "agents", "sub-dir-agent.md"), "sub-dir-agent", "Sub dir");
+    writeAgent(join(workspace, ".agents", "agents", "above-root.md"), "above-root", "Above the repo");
+    const listed = async () => (await discoverAgents(web, join(home, ".gemini"))).map((agent) => agent.name);
+
+    trustWorkspaces(repo);
+    expect(await listed()).toEqual([]);
+
+    trustWorkspaces(web);
+    expect(await listed()).toEqual(["root-dir-agent", "root-json-agent", "sub-dir-agent"]);
+  });
+
+  it("lists no parent agents outside a repository", async () => {
+    // fixtures/26 §2: without a `.git` above it, agy reads the launch directory only.
+    const sub = join(workspace, "a", "b");
+    writeAgent(join(workspace, "a", ".agents", "agents", "parent.md"), "parent", "Parent");
+    mkdirSync(sub, { recursive: true });
+    trustWorkspaces(sub);
+
+    expect((await discoverAgents(sub, join(home, ".gemini"))).map((agent) => agent.name)).toEqual([]);
   });
 
   it("reads the global agents.json whether or not the workspace is trusted", async () => {

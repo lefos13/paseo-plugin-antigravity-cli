@@ -1,0 +1,45 @@
+agy 1.2.16 — do workspace agents load from parent `.agents/` directories? (Task 1)
+Probed 2026-10-03 on macOS with `agy agents` (no model calls), under a secondary plugin account
+(HOME = its shadow home) whose own settings.json was backed up, its `trustedWorkspaces` edited,
+and restored (sha1 2458aa58… before and after). `firestore-rules-author`, listed from elsewhere on
+this machine in every run, is left out below.
+
+Scratch git repo ~/agy-parent-probe:
+  .agents/agents/root-dir-agent.md              name: root-dir-agent
+  .agents/agents.json                           {"entries":[{"path":"custom-agents"}]}
+  custom-agents/root-json-agent.md              name: root-json-agent
+  packages/web/.agents/agents/sub-dir-agent.md  name: sub-dir-agent
+
+1. THE WALK (launched from packages/web)
+   trustedWorkspaces                           listed
+   ["<repo>/packages/web"]                     root-dir-agent root-json-agent sub-dir-agent
+   ["<repo>"]                                  (none)
+   ["<repo>", "<repo>/packages/web"]           root-dir-agent root-json-agent sub-dir-agent
+   launched from <repo>, trusted ["<repo>"]    root-dir-agent root-json-agent
+   - 1.2.16 reads both `agents/` directories and `agents.json` from every `.agents/` between the
+     launch directory and the repository root. On 1.2.14 a root file listed nothing from `sub/`
+     (fixtures/23-agents-json.txt §2).
+   - Trust is still the exact launch directory: trusting the repo root does not cover a session
+     started in a subdirectory, and trusting the launch directory covers the parents it walks.
+
+2. WHERE IT STOPS
+   ~/agy-outer-probe/.agents/agents/above-root.md     (no .git here)
+   ~/agy-outer-probe/repo/.git
+   ~/agy-outer-probe/repo/.agents/agents/in-repo.md
+   launched from repo/sub, trusted exactly              in-repo
+   - The walk stops at the git root; a `.agents/` above it is not read.
+
+   ~/agy-nogit-probe/.agents/agents/nogit-top.md        (no .git anywhere)
+   ~/agy-nogit-probe/a/.agents/agents/nogit-a.md
+   launched from a/b, trusted exactly                   (none)
+   - Outside a repository only the launch directory is read: no walk at all.
+
+3. NAME CLASH
+   <repo>/.agents/agents/clash.md and <repo>/packages/web/.agents/agents/clash.md, both
+   `name: clash`, launched from packages/web: one `clash` is listed. `agy agents` prints names
+   only, so which copy wins is NOT established here. Settling it needs a model turn with
+   `--agent clash`, which was not run.
+
+NOT PROBED (need model turns, not run on 2026-10-03): whether skills (`skills.json` and
+`skills/` directories) follow the same walk, the image-generator child transcript, and queued
+stream-json lines on 1.2.16.

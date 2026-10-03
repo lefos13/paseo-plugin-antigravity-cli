@@ -160,10 +160,15 @@ export async function discoverCommands(cwd: string): Promise<DiscoveredCommands>
   // entries inherit it, which is what the shared visited set tracks.
   const repoRoot = await repositoryRoot(cwd);
   const readConfigs = new Set<string>();
-  for (const root of WORKSPACE_ROOTS) {
-    await collectSkills(join(cwd, root, "skills"), commands);
-    const configs = await collectJsonConfig(join(cwd, root, "skills.json"), repoRoot, readConfigs, SKILL_CONFIG);
-    for (const { value } of configs) remember(commands, value);
+  // agy 1.2.16 reads a `skills.json` from every `.agents/` up to the repository root, per its
+  // changelog. Whether `skills/` directories above the launch directory load too is unprobed, so
+  // only the manifests are walked.
+  for (const dir of workspaceDirs(cwd, repoRoot)) {
+    for (const root of WORKSPACE_ROOTS) {
+      if (dir === resolve(cwd)) await collectSkills(join(dir, root, "skills"), commands);
+      const configs = await collectJsonConfig(join(dir, root, "skills.json"), repoRoot, readConfigs, SKILL_CONFIG);
+      for (const { value } of configs) remember(commands, value);
+    }
   }
   // A global skill is addressed by its own name and outranks the CLI's own skills, which is why
   // these are read before the plugins and the built-in set. The global `skills.json` scores in the
@@ -464,6 +469,22 @@ async function repositoryRoot(cwd: string): Promise<string> {
   }
 }
 
+/**
+ * The directories whose workspace roots a session reads, nearest first: agy 1.2.16 loads them from
+ * every directory between the launch directory and the repository root, and outside a repository
+ * from the launch directory alone (`fixtures/26-parent-agents.txt`). Which of two same-named
+ * entries at different levels agy keeps is unprobed; the nearest is listed.
+ */
+function workspaceDirs(cwd: string, repoRoot: string): string[] {
+  const dirs = [resolve(cwd)];
+  while (dirs[dirs.length - 1] !== repoRoot) {
+    const parent = dirname(dirs[dirs.length - 1]);
+    if (parent === dirs[dirs.length - 1]) break;
+    dirs.push(parent);
+  }
+  return dirs;
+}
+
 function resolveConfigPath(repoRoot: string, targetPath: string, expandHome: boolean): string {
   if (targetPath.startsWith("/")) return targetPath;
   if (expandHome && targetPath.startsWith("~/")) return join(homedir(), targetPath.slice(2));
@@ -619,10 +640,14 @@ export async function discoverAgents(
   const repoRoot = await repositoryRoot(cwd);
   const readConfigs = new Set<string>();
 
+  // agy 1.2.16 reads both shapes from every `.agents/` up to the repository root, all of them
+  // trusted by the launch directory's entry alone (fixtures/26).
   if (isWorkspaceTrusted(geminiRoot, cwd)) {
-    for (const root of WORKSPACE_ROOTS) {
-      keep(await scanAgents(join(cwd, root, "agents")));
-      keep(await collectJsonConfig(join(cwd, root, "agents.json"), repoRoot, readConfigs, AGENT_CONFIG));
+    for (const dir of workspaceDirs(cwd, repoRoot)) {
+      for (const root of WORKSPACE_ROOTS) {
+        keep(await scanAgents(join(dir, root, "agents")));
+        keep(await collectJsonConfig(join(dir, root, "agents.json"), repoRoot, readConfigs, AGENT_CONFIG));
+      }
     }
   }
 
