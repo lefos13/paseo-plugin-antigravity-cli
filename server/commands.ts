@@ -338,7 +338,9 @@ function describeSkill(description: string): string {
 async function readConfigPlugins(): Promise<Record<string, { enabled?: boolean }> | null> {
   const path = join(homedir(), ".gemini", "config", "config.json");
   try {
-    const raw = await readFile(path, "utf8");
+    // agy 1.2.16 loads a `config.json` saved with a UTF-8 byte order mark (Notepad, PowerShell
+    // `Set-Content`), so its plugin switches must not be lost to a parse error here.
+    const raw = (await readFile(path, "utf8")).replace(/^﻿/, "");
     const parsed: unknown = JSON.parse(raw);
     if (typeof parsed === "object" && parsed !== null && "plugins" in parsed) {
       const plugins = (parsed as { plugins: unknown }).plugins;

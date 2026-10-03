@@ -361,6 +361,22 @@ describe("discoverCommands", () => {
     expect(commands.some((c) => c.name.includes("active-skill"))).toBe(true);
   });
 
+  it("reads a config.json that starts with a UTF-8 byte order mark", async () => {
+    // agy 1.2.16 loads such a file (Notepad, PowerShell `Set-Content`), so its plugin switches
+    // apply; parsed as-is it would throw and every plugin would look enabled.
+    const path = join(home, ".gemini", "config", "plugins", "bom-plugin", "skills", "sub");
+    mkdirSync(path, { recursive: true });
+    writeFileSync(join(path, "SKILL.md"), skill("name: bom-skill\ndescription: BOM"), "utf8");
+    writeFileSync(
+      join(home, ".gemini", "config", "config.json"),
+      `﻿${JSON.stringify({ plugins: { "bom-plugin": { enabled: false } } })}`,
+      "utf8",
+    );
+
+    const commands = (await discoverCommands(workspace)).commands;
+    expect(commands.some((c) => c.name.includes("bom-skill"))).toBe(false);
+  });
+
   it("lets config.json override plugin.json, and ignores enabled: false in it", async () => {
     // Probed 2026-09-25 (`fixtures/13-agents.txt` §5) against the CLI's own doc: `disabled: true`
     // in `plugin.json` turns a plugin off, `enabled: false` there does nothing, and config.json
