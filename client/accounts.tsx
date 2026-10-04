@@ -223,36 +223,43 @@ export function AccountsSurface({ theme, layout }: PluginSurfaceProps) {
 
       {failure === null ? null : <Text style={styles.error}>{errorMessage(failure)}</Text>}
 
-      <View style={styles.card}>
-        <Text style={styles.cardTitle}>Add account</Text>
+      {accountsQuery.data?.multiAccount === false ? (
         <Text style={styles.hint}>
-          Creates the account's own folder, then opens the CLI's sign-in there.
+          Extra accounts are not available on Windows: agy keeps a single sign-in per Windows user,
+          so only Default can be used.
         </Text>
-        <View style={styles.inputRow}>
-          <TextInput
-            style={styles.input}
-            value={draftName}
-            onChangeText={(text) => {
-              setDraftName(text);
-              setFormError(null);
-            }}
-            placeholder="Account name, e.g. Work"
-            placeholderTextColor={theme.colors.foregroundMuted}
-            autoCapitalize="none"
-            autoCorrect={false}
-            onSubmitEditing={submitName}
-          />
-          <Pressable
-            accessibilityRole="button"
-            accessibilityLabel="Add the account and sign in"
-            disabled={create.isPending}
-            onPress={submitName}
-            style={styles.primary}
-          >
-            <Text style={styles.primaryText}>{create.isPending ? "Adding…" : "Add"}</Text>
-          </Pressable>
+      ) : (
+        <View style={styles.card}>
+          <Text style={styles.cardTitle}>Add account</Text>
+          <Text style={styles.hint}>
+            Creates the account's own folder, then opens the CLI's sign-in there.
+          </Text>
+          <View style={styles.inputRow}>
+            <TextInput
+              style={styles.input}
+              value={draftName}
+              onChangeText={(text) => {
+                setDraftName(text);
+                setFormError(null);
+              }}
+              placeholder="Account name, e.g. Work"
+              placeholderTextColor={theme.colors.foregroundMuted}
+              autoCapitalize="none"
+              autoCorrect={false}
+              onSubmitEditing={submitName}
+            />
+            <Pressable
+              accessibilityRole="button"
+              accessibilityLabel="Add the account and sign in"
+              disabled={create.isPending}
+              onPress={submitName}
+              style={styles.primary}
+            >
+              <Text style={styles.primaryText}>{create.isPending ? "Adding…" : "Add"}</Text>
+            </Pressable>
+          </View>
         </View>
-      </View>
+      )}
 
       {notice === null ? null : (
         <View style={styles.card}>

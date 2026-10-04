@@ -50,6 +50,17 @@ import { pluginDataDir } from "./plugindata";
 export const DEFAULT_ACCOUNT_ID = "default";
 export const DEFAULT_ACCOUNT_NAME = "Default";
 
+/**
+ * Shadow homes cannot separate accounts on Windows, so only Default exists there. Probed with agy
+ * 1.2.16: it ignores `HOME` and resolves `.gemini` from `USERPROFILE`, and it keeps the sign-in in
+ * Windows Credential Manager under the single target `gemini:antigravity`, whatever the home — two
+ * accounts would share one token, and signing one in would sign the other out. Creating the
+ * shadow home's links also needs Developer Mode or an elevated daemon.
+ */
+export function multiAccountSupported(platform: NodeJS.Platform = process.platform): boolean {
+  return platform !== "win32";
+}
+
 export interface Account {
   id: string;
   name: string;
@@ -128,6 +139,8 @@ const SETTINGS_RELATIVE = join("antigravity-cli", "settings.json");
  * recover from.
  */
 export function readAccounts(): AccountsState {
+  // A store copied from another machine must not route a spawn into a shadow home that cannot work.
+  if (!multiAccountSupported()) return { active: DEFAULT_ACCOUNT_ID, accounts: [] };
   const stored = readStateFile();
   const accounts: Account[] = [];
   const seen = new Set<string>([DEFAULT_ACCOUNT_ID]);
@@ -163,6 +176,9 @@ export function setActive(id: string): void {
  * create it must not leave an account in the store whose home is missing.
  */
 export function addAccount(name: string): Account {
+  if (!multiAccountSupported()) {
+    throw new Error("Multiple accounts are not supported on Windows: agy keeps one sign-in per Windows user");
+  }
   const trimmed = name.trim();
   if (trimmed.length === 0) throw new Error("An account needs a name");
   const id = slugify(trimmed);

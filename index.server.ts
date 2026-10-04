@@ -13,6 +13,7 @@ import {
   DEFAULT_ACCOUNT_ID,
   addAccount,
   listAccounts,
+  multiAccountSupported,
   readAccountSettings,
   readAccounts,
   removeAccount,
@@ -35,6 +36,7 @@ export default function contribute(server: PluginServerContext) {
   server.handle(accountsList, () => ({
     active: readAccounts().active,
     accounts: listAccounts(),
+    multiAccount: multiAccountSupported(),
   }));
 
   server.handle(accountsSetActive, ({ id }) => {

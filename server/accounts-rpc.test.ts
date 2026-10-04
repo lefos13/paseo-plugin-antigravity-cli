@@ -153,6 +153,7 @@ describe("accounts.list", () => {
   it("lists Default first and reports it active until something else is chosen", async () => {
     expect(validated(accountsList, await invoke("accounts.list"))).toEqual({
       active: "default",
+      multiAccount: true,
       accounts: [{ id: "default", name: "Default" }],
     });
 
@@ -160,6 +161,7 @@ describe("accounts.list", () => {
 
     expect(validated(accountsList, await invoke("accounts.list"))).toEqual({
       active: "default",
+      multiAccount: true,
       accounts: [
         { id: "default", name: "Default" },
         { id: "work", name: "Work" },
@@ -212,6 +214,7 @@ describe("accounts.remove", () => {
     });
     expect(validated(accountsList, await invoke("accounts.list"))).toEqual({
       active: "default",
+      multiAccount: true,
       accounts: [{ id: "default", name: "Default" }],
     });
   });

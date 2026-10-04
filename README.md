@@ -36,8 +36,9 @@ Check it with `paseo plugin ls`; `antigravity-cli` should be `running`. `agy --v
 Unlike [`agy-provider`](https://paseo.cafe/plugins/agy-provider), which adapts Antigravity's ACP
 server through Paseo's ACP shim, this plugin drives the `agy` CLI directly over its documented
 `stream-json` mode. The `agy` it launches is the first of `providerOptions.agyPath`,
-`PASEO_ANTIGRAVITY_BIN`, `~/.local/bin/agy` (checked explicitly, because a daemon started by a GUI app
-often has no such directory on `PATH`), then `agy` from `PATH`.
+`PASEO_ANTIGRAVITY_BIN`, the installer's location — `~/.local/bin/agy`, or on Windows
+`%LOCALAPPDATA%\agy\bin\agy.exe` — (checked explicitly, because a daemon started by a GUI app often
+has no such directory on `PATH`), then `agy` from `PATH`.
 
 ## What the plugin supports
 
@@ -212,6 +213,9 @@ its settings in the pane below, and that account's **Use** button makes it the a
 active row shows the `active` badge in place of the button. It also adds, signs in and removes
 accounts, and edits the two per-account settings below.
 
+- **Windows has Default only.** There `agy` ignores `HOME` (it reads `USERPROFILE`) and keeps its
+  sign-in in Windows Credential Manager under one fixed entry, so a second account would share — and
+  overwrite — Default's sign-in. The screen hides **Add account** on a Windows daemon.
 - **Default** is the real home and its `~/.gemini` — the account `agy` already uses in a normal
   terminal. It is always listed first, has no directory of its own, and cannot be removed; the plugin
   reads and writes about it exactly as it did before multiple accounts existed.

@@ -26,6 +26,8 @@ export const accountsList = defineRpc({
   output: z.object({
     active: z.string(),
     accounts: z.array(accountSchema),
+    /** Whether the daemon's platform can keep accounts apart; false on Windows (Default only). */
+    multiAccount: z.boolean(),
   }),
 });
 

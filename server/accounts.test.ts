@@ -20,6 +20,7 @@ import {
   accountHome,
   addAccount,
   listAccounts,
+  multiAccountSupported,
   readAccountSettings,
   readAccounts,
   removeAccount,
@@ -189,6 +190,14 @@ describe("account state", () => {
     // Rewritten through a temp file in the same directory, which must not be left behind.
     const dir = join(paseoHome, "plugin-data", "antigravity-cli");
     expect(readdirSync(dir).filter((name) => name.endsWith(".tmp"))).toEqual([]);
+  });
+});
+
+describe("multiAccountSupported", () => {
+  it("is off on Windows only, where agy keeps one sign-in per Windows user", () => {
+    expect(multiAccountSupported("win32")).toBe(false);
+    expect(multiAccountSupported("darwin")).toBe(true);
+    expect(multiAccountSupported("linux")).toBe(true);
   });
 });
 
