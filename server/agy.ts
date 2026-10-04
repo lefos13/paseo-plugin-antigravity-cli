@@ -54,9 +54,21 @@ export function resolveAgyBinary(explicit?: string): string {
   if (explicit && explicit.trim().length > 0) return explicit;
   const fromEnv = process.env.PASEO_ANTIGRAVITY_BIN;
   if (fromEnv && fromEnv.trim().length > 0) return fromEnv;
-  const local = join(homedir(), ".local", "bin", "agy");
-  if (existsSync(local)) return local;
+  for (const candidate of installedAgyPaths()) {
+    if (existsSync(candidate)) return candidate;
+  }
   return "agy";
+}
+
+/**
+ * Where the installer puts `agy`: `~/.local/bin` on unix, `%LOCALAPPDATA%\agy\bin` on Windows. The
+ * Windows installer only adds its directory to the user PATH, which a daemon started before the
+ * install (or by a GUI app) never sees.
+ */
+function installedAgyPaths(): string[] {
+  if (process.platform !== "win32") return [join(homedir(), ".local", "bin", "agy")];
+  const localAppData = process.env.LOCALAPPDATA ?? join(homedir(), "AppData", "Local");
+  return [join(localAppData, "agy", "bin", "agy.exe"), join(homedir(), ".local", "bin", "agy.exe")];
 }
 
 export function buildAgyArgs(config: AgyLaunchConfig): string[] {
