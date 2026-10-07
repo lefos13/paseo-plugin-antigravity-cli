@@ -208,6 +208,12 @@ export interface ChildRender {
    * as the highest step so far.
    */
   readonly done: boolean;
+  /**
+   * The error the child stopped on: set while its highest step is an `ERROR_MESSAGE`. agy 1.3.1
+   * shows such a child (out of quota, out of model capacity) as `Error: <reason>` until it makes
+   * progress again, rather than as done.
+   */
+  readonly failure?: string;
   /** The child's report to its parent, else whatever it said last. */
   readonly report: string;
   readonly actions: readonly ChildAction[];
@@ -361,10 +367,15 @@ export function renderChild(
     last.type === TRANSCRIPT_PLANNER_RESPONSE &&
     last.toolCalls.length === 0 &&
     (last.content ?? "").trim().length > 0;
+  const failure =
+    last?.type === TRANSCRIPT_ERROR_MESSAGE
+      ? (last.error ?? last.content ?? "").trim() || "Antigravity reported an error"
+      : undefined;
 
   return {
     items,
     done,
+    ...(failure !== undefined ? { failure } : {}),
     report: report.length > 0 ? report : lastText,
     actions,
     spawns,

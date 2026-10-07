@@ -455,6 +455,13 @@ interface SubagentRow {
    */
   status: "running" | "completed" | "canceled" | "failed";
   error: JsonValue;
+  /**
+   * The error the child last stopped on, while it has not moved past it. It overrides the
+   * `completed` a SUCCESS turn would give the row, and only for as long as it lasts: `failedByChild`
+   * marks a `failed` that came from it, so the child's next progress can take it back.
+   */
+  childFailure?: string;
+  failedByChild?: boolean;
   /** Set once the child session was opened, which is also what links the row to it. */
   childSessionId: string | null;
   /**
@@ -2560,9 +2567,19 @@ function handleChildRender(
     if (render.report.length > 0) row.log = render.report;
     if (render.actions.length > 0) row.actions = [...render.actions];
     if (finished) row.info.done = true;
+    row.childFailure = render.failure;
     // The child finished, and the row does not need the turn to say so; a row something else has
     // already settled keeps that status, since a later report cannot unsay what happened.
     if (finished && row.status === "running") row.status = "completed";
+    // A SUCCESS turn only says the parent was satisfied, not that the child was: a child it left
+    // stopped on an error is failed, and moving past that error makes it the turn's success again.
+    if (render.failure !== undefined && row.status === "completed" && row.info.done !== true) {
+      failRowByChild(row, render.failure);
+    } else if (render.failure === undefined && row.failedByChild) {
+      row.status = "completed";
+      row.error = null;
+      row.failedByChild = false;
+    }
     refreshSubagentRow(row);
     publishSubagent(session, emit, row);
   }
@@ -2926,6 +2943,8 @@ function finalizeToolCalls(
         if (terminal.status === "failed") {
           subagent.status = "failed";
           subagent.error = toErrorJson(terminal.error);
+        } else if (terminal.status === "completed" && subagent.childFailure !== undefined) {
+          failRowByChild(subagent, subagent.childFailure);
         } else {
           subagent.status = terminal.status;
         }
@@ -2943,6 +2962,12 @@ function finalizeToolCalls(
     }
   }
   turn.tools.clear();
+}
+
+function failRowByChild(row: SubagentRow, failure: string): void {
+  row.status = "failed";
+  row.error = toErrorJson({ message: failure });
+  row.failedByChild = true;
 }
 
 /**

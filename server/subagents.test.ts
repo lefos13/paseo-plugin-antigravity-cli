@@ -277,6 +277,24 @@ describe("renderChild on the captured transcripts", () => {
     );
     // Neither step ends the child: it carried on after both.
     expect(render.done).toBe(false);
+    // An error it moved past is not what it stopped on.
+    expect(render.failure).toBeUndefined();
+  });
+
+  it("reports the error a child stopped on, until a later step moves past it", () => {
+    const context = { childConversationId: "c", parentConversationId: "p", cwd: "/w" };
+    const error: TranscriptEntry = {
+      stepIndex: 2,
+      type: "ERROR_MESSAGE",
+      error: "RESOURCE_EXHAUSTED: quota exceeded",
+      content: "Error: RESOURCE_EXHAUSTED: quota exceeded",
+      toolCalls: [],
+    };
+    const prompt: TranscriptEntry = { stepIndex: 0, type: "USER_INPUT", content: "go", toolCalls: [] };
+    // agy 1.3.1 shows such a child as `Error: <reason>` rather than done.
+    expect(renderChild([prompt, error], context).failure).toBe("RESOURCE_EXHAUSTED: quota exceeded");
+    const answer: TranscriptEntry = { stepIndex: 3, type: "PLANNER_RESPONSE", content: "Done.", toolCalls: [] };
+    expect(renderChild([prompt, error, answer], context).failure).toBeUndefined();
   });
 
   it("names the subagents of a call whose result has not arrived from what the model asked for", () => {

@@ -3318,6 +3318,36 @@ describe("subagents", () => {
     expect(childSessions(events)).toEqual([]);
   });
 
+  it("fails the row of a child that stopped on an error, though the parent's turn succeeded", async () => {
+    // agy 1.3.1 reports such a child (out of quota, out of model capacity) as `Error: <reason>`
+    // rather than done; the parent summing the failure up gracefully must not make it a success.
+    process.env.FAKE_SUBAGENT_TRANSCRIPT = "error";
+    const { events } = await startedTurn();
+    await waitFor(() => turns(events, "completed")[0], "the turn to complete");
+
+    const failed = await waitFor(() => {
+      const row = subagentRows(events).at(-1);
+      return row?.status === "failed" ? row : undefined;
+    }, "the subagent row to fail");
+    expect(failed.error).toEqual({ message: "RESOURCE_EXHAUSTED: quota exceeded" });
+    expect(reported(failed).done).toBeUndefined();
+  });
+
+  it("settles a child that moves past the error it stopped on as completed", async () => {
+    process.env.FAKE_SUBAGENT_TRANSCRIPT = "error";
+    const { events } = await startedTurn();
+    await waitFor(() => (subagentRows(events).at(-1)?.status === "failed" ? true : undefined), "the row to fail");
+
+    // The error lasts only until the child makes progress, as in agy's own `/agents`.
+    appendFileSync(childTranscriptFile(events), finalChildLine(6), "utf8");
+    const childId = childIdOf(events);
+    await waitFor(
+      () => (turnIndex(events, childId, "completed") >= 0 ? true : undefined),
+      "the child's turn to complete",
+    );
+    expect(subagentRows(events).at(-1)).toMatchObject({ status: "completed", error: null });
+  });
+
   it("ignores a step type it does not know and still finishes the child", async () => {
     process.env.FAKE_SUBAGENT_TRANSCRIPT = "unknown-type";
     const { events } = await startedTurn();

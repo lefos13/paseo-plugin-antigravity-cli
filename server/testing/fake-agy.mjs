@@ -12,8 +12,10 @@
  *                        | ask-question | background | background-wait
  *   FAKE_SUBAGENT_COUNT       children the `subagent` scenario spawns (default 1)
  *   FAKE_SUBAGENT_TRANSCRIPT  what the `subagent` scenario writes for each child: valid (default),
- *                             malformed (unreadable lines only), missing (no file at all), or
- *                             unknown-type (valid, plus one step of a type nothing knows)
+ *                             malformed (unreadable lines only), missing (no file at all),
+ *                             unknown-type (valid, plus one step of a type nothing knows), or
+ *                             error (valid, but the child stops on an ERROR_MESSAGE instead of
+ *                             answering, as a child out of quota does)
  *   FAKE_SUBAGENT_GATE        file the `subagent` scenario waits for before the parent's final
  *                             answer, so a test can watch a child stream while its turn runs
  *   FAKE_QUESTIONS       JSON array the `ask-question` scenario asks, in agy's own shape
@@ -539,6 +541,13 @@ function childTranscriptLines(child, parentConversationId, grandchild = null) {
   // The child's own last word, written after the head so a gate can hold it back.
   const lastWord = `I have read ${child.file} and reported its contents back to the parent agent.`;
   const lastStep = grandchild !== null ? 7 : 5;
+  if (process.env.FAKE_SUBAGENT_TRANSCRIPT === "error") {
+    const reason = "RESOURCE_EXHAUSTED: quota exceeded";
+    return {
+      head,
+      tail: [step(lastStep, "ERROR_MESSAGE", { source: "SYSTEM", error: reason, content: `Error: ${reason}` })],
+    };
+  }
   const tail =
     process.env.FAKE_SUBAGENT_TRANSCRIPT === "unknown-type"
       ? // A step type nothing knows, written *before* the last word: the renderer reads "done" from
