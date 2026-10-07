@@ -22,14 +22,22 @@ const DEFAULT_TIER = "high";
 /**
  * The reasoning tiers Antigravity encodes in the model id itself (`gemini-3.8-flash-high`). The
  * CLI rejects `--model X --effort Y` for those ids, so a tier is chosen as a thinking option and
- * resolved back into the slug the CLI accepts. `max` is here for a model that lists one — no model
- * on `agy models` 1.2.11 does, which the composer shows by offering the tiers the ids carry.
+ * resolved back into the slug the CLI accepts. `max` and `xhigh` (which `--effort` accepts since
+ * 1.3.0) are here for a model that lists one — no model on `agy models` 1.3.1 does, which the
+ * composer shows by offering the tiers the ids carry.
  */
-const TIERS = ["max", "high", "medium", "low"] as const;
+const TIERS = ["max", "xhigh", "high", "medium", "low"] as const;
 type Tier = (typeof TIERS)[number];
 
-const TIER_ID = /^(?<base>.+)-(?<tier>max|high|medium|low)$/;
-const TIER_LABEL = /\s*\((?:max|high|medium|low)\)$/i;
+const TIER_ID = /^(?<base>.+)-(?<tier>max|xhigh|high|medium|low)$/;
+const TIER_LABEL = /\s*\((?:max|x-?high|high|medium|low)\)$/i;
+const TIER_LABELS: Record<Tier, string> = {
+  max: "Max",
+  xhigh: "XHigh",
+  high: "High",
+  medium: "Medium",
+  low: "Low",
+};
 
 /** `default` is implicit: omitting --mode gives review-before-write behaviour. */
 export const MODES: readonly ProviderMode[] = [
@@ -220,7 +228,7 @@ export function groupModels(rows: readonly ProviderModel[]): readonly ProviderMo
       isDefault: split.base === DEFAULT_MODEL_ID,
       thinkingOptions: ordered.map((tier) => ({
         id: tier,
-        label: `${tier[0].toUpperCase()}${tier.slice(1)}`,
+        label: TIER_LABELS[tier],
         isDefault: tier === chosen,
       })),
       defaultThinkingOptionId: chosen,

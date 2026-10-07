@@ -10,7 +10,7 @@ export interface AgyLaunchConfig {
   env?: Readonly<Record<string, string>>;
   model?: string;
   mode?: string;
-  /** Passes --effort (low|medium|high|max). */
+  /** Passes --effort (low|medium|high|xhigh|max). */
   effort?: string;
   /** Passes --agent to select an agent profile. */
   agent?: string;

@@ -344,4 +344,23 @@ describe("resolveThinking", () => {
       },
     ]);
   });
+
+  it("handles the xhigh reasoning effort tier, between max and high", async () => {
+    const { groupModels, parseModels } = await import("./catalog");
+    const grouped = groupModels(
+      parseModels("custom-model-high\tCustom Model (High)\ncustom-model-xhigh\tCustom Model (XHigh)\n"),
+    );
+    expect(grouped).toEqual([
+      {
+        id: "custom-model",
+        label: "Custom Model",
+        isDefault: false,
+        defaultThinkingOptionId: "high",
+        thinkingOptions: [
+          { id: "xhigh", label: "XHigh", isDefault: false },
+          { id: "high", label: "High", isDefault: true },
+        ],
+      },
+    ]);
+  });
 });
