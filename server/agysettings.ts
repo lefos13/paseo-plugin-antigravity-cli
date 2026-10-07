@@ -2,6 +2,15 @@ import { readFileSync } from "node:fs";
 import { join } from "node:path";
 
 /**
+ * `JSON.parse` for a file Antigravity reads. agy loads JSON saved with a UTF-8 byte order mark
+ * (Notepad, PowerShell `Set-Content`): `config.json` since 1.2.16, plugin manifests and
+ * `mcp_config.json` since 1.3.1. Such a file must not read as malformed here when agy accepts it.
+ */
+export function parseAgyJson(raw: string): unknown {
+  return JSON.parse(raw.replace(/^\uFEFF/, ""));
+}
+
+/**
  * The CLI's `settings.json`, parsed. The caller names the `.gemini` root it belongs to: the real
  * home for Default, an account's shadow home otherwise (`accountGeminiRoot`). A missing, unreadable
  * or malformed file is not an error: `null` means the caller has no settings to read, and
@@ -10,7 +19,7 @@ import { join } from "node:path";
 export function readSettingsFile(geminiRoot: string): Record<string, unknown> | null {
   const path = join(geminiRoot, "antigravity-cli", "settings.json");
   try {
-    const parsed: unknown = JSON.parse(readFileSync(path, "utf8"));
+    const parsed: unknown = parseAgyJson(readFileSync(path, "utf8"));
     if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) return null;
     return parsed as Record<string, unknown>;
   } catch {

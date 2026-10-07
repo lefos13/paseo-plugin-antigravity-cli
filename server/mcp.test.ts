@@ -87,6 +87,18 @@ describe("workspace MCP config", () => {
     expect(JSON.parse(readFileSync(ledgerPath, "utf8")).workspaces).toEqual({});
   });
 
+  it("merges into a config that starts with a UTF-8 byte order mark", async () => {
+    // agy 1.3.1 loads such a file (Notepad, PowerShell `Set-Content`), so the plugin must not
+    // refuse it as invalid and launch without Paseo's servers.
+    mkdirSync(join(cwd, ".agents"), { recursive: true });
+    writeFileSync(configPath, `\uFEFF${JSON.stringify({ mcpServers: { mine: { serverUrl: "https://x" } } })}`, "utf8");
+
+    expect(await injectMcpServers({ cwd, sessionId: "s1", servers: SERVERS })).toMatchObject({
+      status: "written",
+    });
+    expect(Object.keys(readConfig().mcpServers).sort()).toEqual(["mine", "paseo-api", "paseo-fs"]);
+  });
+
   it("refuses to touch a config that is not valid JSON", async () => {
     mkdirSync(join(cwd, ".agents"), { recursive: true });
     writeFileSync(configPath, "{ this is not json", "utf8");

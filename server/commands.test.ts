@@ -377,6 +377,17 @@ describe("discoverCommands", () => {
     expect(commands.some((c) => c.name.includes("bom-skill"))).toBe(false);
   });
 
+  it("reads a plugin.json that starts with a UTF-8 byte order mark", async () => {
+    // agy 1.3.1 loads plugin manifests saved with a BOM, so their `disabled` flag still applies.
+    const plugin = join(home, ".gemini", "config", "plugins", "bom-manifest");
+    mkdirSync(join(plugin, "skills", "sub"), { recursive: true });
+    writeFileSync(join(plugin, "plugin.json"), `\uFEFF${JSON.stringify({ disabled: true })}`, "utf8");
+    writeFileSync(join(plugin, "skills", "sub", "SKILL.md"), skill("name: bom-manifest-skill\ndescription: BOM"), "utf8");
+
+    const commands = (await discoverCommands(workspace)).commands;
+    expect(commands.some((c) => c.name.includes("bom-manifest-skill"))).toBe(false);
+  });
+
   it("lets config.json override plugin.json, and ignores enabled: false in it", async () => {
     // Probed 2026-09-25 (`fixtures/13-agents.txt` §5) against the CLI's own doc: `disabled: true`
     // in `plugin.json` turns a plugin off, `enabled: false` there does nothing, and config.json

@@ -1,7 +1,7 @@
 import { readdir, readFile, stat } from "node:fs/promises";
 import { homedir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
-import { readSettingsFile } from "./agysettings";
+import { parseAgyJson, readSettingsFile } from "./agysettings";
 
 /**
  * The slash commands the composer offers. Paseo sends one as `/<name> <arguments>`, which the CLI
@@ -343,10 +343,7 @@ function describeSkill(description: string): string {
 async function readConfigPlugins(): Promise<Record<string, { enabled?: boolean }> | null> {
   const path = join(homedir(), ".gemini", "config", "config.json");
   try {
-    // agy 1.2.16 loads a `config.json` saved with a UTF-8 byte order mark (Notepad, PowerShell
-    // `Set-Content`), so its plugin switches must not be lost to a parse error here.
-    const raw = (await readFile(path, "utf8")).replace(/^﻿/, "");
-    const parsed: unknown = JSON.parse(raw);
+    const parsed = parseAgyJson(await readFile(path, "utf8"));
     if (typeof parsed === "object" && parsed !== null && "plugins" in parsed) {
       const plugins = (parsed as { plugins: unknown }).plugins;
       if (typeof plugins === "object" && plugins !== null) {
@@ -375,8 +372,7 @@ async function isPluginDisabled(
   const fromConfig = configPlugins?.[dirName]?.enabled;
   if (typeof fromConfig === "boolean") return !fromConfig;
   try {
-    const raw = await readFile(join(pluginDir, "plugin.json"), "utf8");
-    const parsed: unknown = JSON.parse(raw);
+    const parsed = parseAgyJson(await readFile(join(pluginDir, "plugin.json"), "utf8"));
     if (typeof parsed === "object" && parsed !== null && "disabled" in parsed) {
       return parsed.disabled === true;
     }
@@ -538,8 +534,7 @@ async function collectJsonConfig<T>(
 
   let parsed: ConfigFile;
   try {
-    const raw = await readFile(configPath, "utf8");
-    parsed = JSON.parse(raw);
+    parsed = parseAgyJson(await readFile(configPath, "utf8")) as ConfigFile;
   } catch {
     return [];
   }

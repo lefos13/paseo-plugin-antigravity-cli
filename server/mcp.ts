@@ -2,6 +2,7 @@ import { execFile } from "node:child_process";
 import { mkdir, readFile, realpath, rm, rmdir, stat, writeFile } from "node:fs/promises";
 import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { z } from "zod";
+import { parseAgyJson } from "./agysettings";
 import { pluginDataDir } from "./plugindata";
 
 /**
@@ -419,7 +420,7 @@ async function readText(path: string): Promise<string | null> {
 
 function safeJson(raw: string): unknown {
   try {
-    return JSON.parse(raw);
+    return parseAgyJson(raw);
   } catch {
     return null;
   }
