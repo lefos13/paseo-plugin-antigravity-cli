@@ -1,8 +1,9 @@
 {
   "name": "paseo-plugin-antigravity-cli",
-  "version": "0.9.2",
+  "version": "0.9.3",
   "files": [
     "README.md",
+    "OVERVIEW.md",
     "paseo-plugin.json",
     "icon.svg",
     "index.server.ts",

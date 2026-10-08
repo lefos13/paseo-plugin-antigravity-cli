@@ -7,7 +7,7 @@ already installed and signed in on your machine.
 
 - Provider id: `antigravity-cli`
 - Requires: Paseo ≥ 0.9.1 (provider protocol version 1), Node 24 for the plugin process, and
-  Antigravity CLI 1.2.9–1.2.16 for the behaviour described below. The plugin also ships a client
+  Antigravity CLI 1.2.9–1.3.1 for the behaviour described below. The plugin also ships a client
   entry (the [accounts screen](#multiple-accounts)), so the connected Paseo **app** must satisfy the
   same minimum — a compatible daemon does not make an older app compatible.
 
