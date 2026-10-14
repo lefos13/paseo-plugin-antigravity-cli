@@ -7,7 +7,7 @@ already installed and signed in on your machine.
 
 - Provider id: `antigravity-cli`
 - Requires: Paseo ≥ 0.9.1 (provider protocol version 1), Node 24 for the plugin process, and
-  Antigravity CLI 1.2.9–1.3.1 for the behaviour described below. The plugin also ships a client
+  Antigravity CLI 1.2.9–1.3.5 for the behaviour described below (`/compact` and *Auto* mode need 1.3.5). The plugin also ships a client
   entry (the [accounts screen](#multiple-accounts)), so the connected Paseo **app** must satisfy the
   same minimum — a compatible daemon does not make an older app compatible.
 
@@ -54,8 +54,13 @@ Models come from `agy models` (cached ten minutes; `force` rediscovers), so the 
 model per family with the tiers that family has — High, Medium and Low today. `providerOptions.effort`
 is described in the table below.
 
-Modes are *Default* (review file writes before they run), *Accept edits*, and *Plan*; tool rows cover
+Modes are *Default* (review file writes before they run), *Accept edits*, *Auto*, and *Plan*; tool rows cover
 shell commands, file edits with a diff, searches, web fetches, and MCP tool calls.
+
+*Auto* (agy 1.3.5) approves edits and safe commands and asks before irreversible actions. agy offers
+it only to some accounts and runs any other in its default mode with a warning; the plugin then moves
+the selector back to *Default* and says so. How Auto's question before an irreversible action behaves
+in `stream-json` mode is untested.
 
 ### Plan mode
 
@@ -139,7 +144,7 @@ turn relaunches with it.
 | Command | Source |
 |---|---|
 | `/plan` | Paseo's plan turn, run by the plugin rather than the CLI ([Plan mode](#plan-mode)). |
-| `/goal`, `/grill-me`, `/teamwork-preview`, `/learn`, `/schedule`, `/boost`, `/browser` | The CLI's own workflows. `/learn` records a behaviour in the workspace's `GEMINI.md`, `/schedule` sets up a recurring run, and `/boost` and `/browser` are the deep-thinking and browser-agent flows. |
+| `/goal`, `/grill-me`, `/teamwork-preview`, `/learn`, `/schedule`, `/boost`, `/browser`, `/compact` | The CLI's own workflows. `/learn` records a behaviour in the workspace's `GEMINI.md`, `/schedule` sets up a recurring run, and `/boost` and `/browser` are the deep-thinking and browser-agent flows. `/compact` (agy 1.3.5) summarizes the conversation to free context, shown as a compaction row; alone it ends the turn without an answer, and text after it is answered once compacted. |
 | `/<name>` | A skill, either in the workspace's customization roots (`.agents/skills/<name>/SKILL.md`, and the same under `.agent/`, `_agents/`, `_agent/`) or installed for every workspace under `~/.gemini/antigravity-cli/skills/`, `~/.gemini/config/skills/`, `~/.gemini/skills/`, in that precedence. The name is the skill's frontmatter `name`, and the CLI's own built-ins are listed too. |
 | `<plugin>:<name>` | A plugin's skill, under `~/.gemini/config/plugins/<plugin>/skills/`. A plugin holding one skill directly in `skills/` is addressed with a `..` placeholder: `/android-cli-plugin:..:android-cli`. A frontmatter `name` that already starts with `<plugin>:` is addressed with the prefix once, as agy does: `name: firebase:basics` is `/firebase:basics`. |
 

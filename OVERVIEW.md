@@ -1,4 +1,4 @@
-Antigravity CLI adds **Antigravity** as a Paseo agent provider. Each Paseo session runs Google's `agy` command in its `stream-json` mode, so the work happens in the `agy` already installed and signed in on the daemon machine, and Paseo shows its turns, tool calls, and edits. Described for `agy` 1.2.9 to 1.3.1, Paseo 0.9.1 or later on daemon and app, and Node 24 for the plugin process.
+Antigravity CLI adds **Antigravity** as a Paseo agent provider. Each Paseo session runs Google's `agy` command in its `stream-json` mode, so the work happens in the `agy` already installed and signed in on the daemon machine, and Paseo shows its turns, tool calls, and edits. Described for `agy` 1.2.9 to 1.3.5 (`/compact` and Auto mode need 1.3.5), Paseo 0.9.1 or later on daemon and app, and Node 24 for the plugin process.
 
 ## Setup
 
@@ -8,6 +8,7 @@ Antigravity CLI adds **Antigravity** as a Paseo agent provider. Each Paseo sessi
 
 - **Tool approval** is decided by `agy` from its own `toolPermission` setting. Paseo cannot show approval prompts. A session setting can skip all permissions with `--dangerously-skip-permissions`.
 - **Plan mode** is an instruction the plugin adds to the model's prompt (investigate read-only, end with a plan). It is not a sandbox, and a model that ignores it can still write files. The **Sandbox** setting passes `--sandbox`, which the plugin's notes say did not stop a write outside the workspace in testing.
+- **Auto mode** (`agy` 1.3.5) approves edits and safe commands and asks before irreversible actions. Accounts without it run in the default mode, and the plugin switches the selector back to Default with a notice.
 - **Steering is not supported.** A slash command, a skill, or a structured-output prompt sent while a turn is running is refused until the turn finishes. A plain message is also refused if the running turn used one of those.
 
 ## Shared MCP servers (off by default)
