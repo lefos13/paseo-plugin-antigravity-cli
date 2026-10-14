@@ -234,7 +234,7 @@ describe("buildCatalog", () => {
       "fake-model-x",
     ]);
     expect(catalog.defaultModel).toBe("gemini-3.8-flash");
-    expect(catalog.modes.map((mode) => mode.id)).toEqual(["default", "accept-edits", "plan"]);
+    expect(catalog.modes.map((mode) => mode.id)).toEqual(["default", "accept-edits", "auto", "plan"]);
     // The axis is per model, so the catalog carries no list of its own.
     expect(catalog.thinkingOptions).toEqual([]);
     expect(catalog.defaultMode).toBe("default");

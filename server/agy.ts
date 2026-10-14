@@ -100,9 +100,9 @@ export function buildAgyArgs(config: AgyLaunchConfig): string[] {
   if (config.model) args.push("--model", config.model);
   if (config.effort) args.push("--effort", config.effort);
   if (config.agent) args.push("--agent", config.agent);
-  // `default` is the implicit mode; agy only accepts accept-edits/plan. `plan` never arrives here:
-  // the provider keeps Paseo's Plan mode to itself (see `ensureProcess`), because agy ignores
-  // `--mode plan` while slash-command expansion is disabled.
+  // `default` is the implicit mode; agy accepts accept-edits, auto (1.3.5) and plan. `plan` never
+  // arrives here: the provider keeps Paseo's Plan mode to itself (see `ensureProcess`), because agy
+  // ignores `--mode plan` while slash-command expansion is disabled.
   if (config.mode && config.mode !== "default") args.push("--mode", config.mode);
   if (config.conversationId) args.push("--conversation", config.conversationId);
   if (config.sandbox) args.push("--sandbox");

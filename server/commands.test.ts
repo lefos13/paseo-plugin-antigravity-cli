@@ -81,8 +81,9 @@ async function names(): Promise<string[]> {
 
 /**
  * The CLI's own workflows, which `discoverCommands` publishes ahead of every skill. `/boost` and
- * `/browser` were probed 2026-09-24 (see Task 19 in tasks/todo.md) and are listed here so the
- * index-based assertions below cannot drift when one is added.
+ * `/browser` were probed 2026-09-24 (see Task 19 in tasks/todo.md) and `/compact` on 2026-10-14
+ * (fixtures/27-compact.ndjson); they are listed here so the index-based assertions below cannot
+ * drift when one is added.
  */
 const CLI_WORKFLOWS = [
   "plan",
@@ -93,6 +94,7 @@ const CLI_WORKFLOWS = [
   "schedule",
   "boost",
   "browser",
+  "compact",
 ] as const;
 
 describe("discoverCommands", () => {

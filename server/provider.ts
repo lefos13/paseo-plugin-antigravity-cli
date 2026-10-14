@@ -58,6 +58,7 @@ import {
 } from "./commands";
 import {
   STEP_AGENT_RESPONSE,
+  STEP_CHECKPOINT,
   STEP_STATE_DONE,
   STEP_SUBAGENT,
   STEP_TOOL,
@@ -396,6 +397,8 @@ interface PendingTurn {
   outgoing: string;
   /** Sent in plan mode, so its answer is offered as a plan to implement. */
   plan: boolean;
+  /** Sent as agy's own `/compact` (see `TurnRequest`). */
+  readonly compact: boolean;
 }
 
 /** The fields of a tool row, kept so a call left open can be republished with a terminal status. */
@@ -1240,6 +1243,7 @@ async function promptSession(
     clientMessageId: prompt.clientMessageId,
     verbatim,
     plan: planCommand || (session.selection.mode === PLAN_MODE_ID && !verbatim),
+    compact: verbatim && command?.name === COMPACT_COMMAND,
   });
 }
 
@@ -1254,6 +1258,8 @@ interface TurnRequest {
   verbatim: boolean;
   /** A plan-mode turn: the preamble goes in front of the text and its answer is offered as a plan. */
   plan: boolean;
+  /** Sent as agy's own `/compact`, so a compaction in it was asked for rather than automatic. */
+  compact?: boolean;
 }
 
 async function startTurn(session: Session, emit: Emit, request: TurnRequest): Promise<void> {
@@ -1275,6 +1281,7 @@ async function startTurn(session: Session, emit: Emit, request: TurnRequest): Pr
     heldByBackground: false,
     outgoing: "",
     plan,
+    compact: request.compact === true,
   };
 
   publish(session, emit, {
@@ -1937,10 +1944,12 @@ function ensureProcess(session: Session, emit: Emit): AgyProcess {
       },
       onStderr: (line) => {
         if (session.process !== process) return;
+        console.error(`[antigravity] ${line}`);
+        // A handled warning is not why the process might die later, so it is never quoted as such.
+        if (handleModeUnavailable(session, line, emit)) return;
         session.stderrTail.push(line);
         if (session.stderrTail.length > STDERR_TAIL) session.stderrTail.shift();
         session.agyError = parseAgyErrorLine(line) ?? session.agyError;
-        console.error(`[antigravity] ${line}`);
       },
       onExit: (info) => {
         if (session.process !== process) return;
@@ -1959,6 +1968,33 @@ function ensureProcess(session: Session, emit: Emit): AgyProcess {
   process.start();
   return process;
 }
+
+/**
+ * agy 1.3.5 refuses a mode the account does not have with a stderr warning and runs in its default
+ * mode instead of failing (probed with `--mode auto` on 2026-10-14). The selector is moved back to
+ * what the CLI is doing; the running process already is in that mode, so nothing is relaunched.
+ * Returns whether the line was that warning.
+ */
+function handleModeUnavailable(session: Session, line: string, emit: Emit): boolean {
+  const match = AGY_MODE_UNAVAILABLE.exec(line);
+  if (!match) return false;
+  if (match[1] !== session.selection.mode) return true;
+  const label = MODES.find((mode) => mode.id === match[1])?.label ?? match[1];
+  session.selection.mode = DEFAULT_MODE_ID;
+  emitNotice(
+    session,
+    emit,
+    "agy-mode-unavailable",
+    "warning",
+    `${label} mode is not available`,
+    `Antigravity does not offer ${label} mode to this account, so it is running in the default mode, which reviews file writes before they run.`,
+  );
+  emit({ type: "session.config", sessionId: session.sessionId, config: configState(session) });
+  return true;
+}
+
+/** The warning agy prints for a `--mode` the account does not have. */
+const AGY_MODE_UNAVAILABLE = /^warning: --mode (\S+) is not available for this account/;
 
 function handleAgyEvent(session: Session, event: AgyEvent, emit: Emit): void {
   switch (event.kind) {
@@ -2120,6 +2156,25 @@ function handleStepUpdate(session: Session, step: AgyStepUpdate, emit: Emit): vo
     return;
   }
 
+  if (step.step_type === STEP_CHECKPOINT) {
+    if (!turn) {
+      console.error(
+        `[antigravity] dropping a checkpoint step that belongs to no pending turn (idx=${step.step_index})`,
+      );
+      return;
+    }
+    // Only a finished step becomes a row: a `loading` one would outlive a turn that is canceled or
+    // fails before agy reports it DONE, since nothing else settles it.
+    if (step.state !== STEP_STATE_DONE) return;
+    publish(session, emit, {
+      type: "compaction",
+      id: itemId(turn, step.step_index, "compaction"),
+      status: "completed",
+      trigger: turn.compact ? "manual" : "auto",
+    });
+    return;
+  }
+
   // `ask_question` arrives as a bare `unknown` step; whether it was one is in the transcript.
   if (step.step_type === STEP_UNKNOWN && step.state === STEP_STATE_DONE && turn) {
     void relaySkippedQuestion(session, turn, step.step_index, emit);
@@ -2130,6 +2185,8 @@ function handleStepUpdate(session: Session, step: AgyStepUpdate, emit: Emit): vo
   // carries no user-facing content, so neither becomes a timeline row.
 }
 
+/** agy's own command for compacting the conversation on request. */
+const COMPACT_COMMAND = "compact";
 /** The tool whose children this plugin follows. */
 const INVOKE_SUBAGENT = "invoke_subagent";
 /** How a turn settles the tool rows it left open. */

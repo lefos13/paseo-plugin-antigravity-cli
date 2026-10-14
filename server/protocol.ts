@@ -118,6 +118,11 @@ export const STEP_SUBAGENT = "subagent";
  * which arrives with no tool name or parameters at all (fixtures/17-ask-question.ndjson).
  */
 export const STEP_UNKNOWN = "unknown";
+/**
+ * Where agy compacted the conversation's context: on `/compact`, or on its own as the context
+ * fills. It carries no detail of what was summarized (fixtures/27-compact.ndjson, agy 1.3.5).
+ */
+export const STEP_CHECKPOINT = "checkpoint";
 
 export const STEP_STATE_ACTIVE = "ACTIVE";
 export const STEP_STATE_DONE = "DONE";

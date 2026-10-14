@@ -22,12 +22,13 @@ export interface AgyCommand {
  * deliberately absent: in print mode they fail the whole turn with `ERROR` and exit 2 instead of
  * being ignored, so sending one would kill the turn it was meant to start.
  *
- * Antigravity also ships built-ins it only enables for some accounts — `/compact`, `/review` and
- * `/owl` are gated behind server-side flags (`enable-compact-slash-command`,
- * `enable-owl-slash-command`, `enable-review`, and the `boost_command_disabled` /
- * `teamwork_preview_command_disabled` admin controls). A disabled one never expands: agy treats
- * the text as an ordinary message. Nothing can be probed into existence, so only the
- * unconditional ones are listed here; see the Task 19 table for every name that was tried.
+ * Antigravity also ships built-ins it only enables for some accounts — `/review` and `/owl` are
+ * gated behind server-side flags (`enable-owl-slash-command`, `enable-review`, and the
+ * `boost_command_disabled` / `teamwork_preview_command_disabled` admin controls). A disabled one
+ * never expands: agy treats the text as an ordinary message. Nothing can be probed into existence,
+ * so only the unconditional ones are listed here; see the Task 19 table for every name that was
+ * tried. `/compact` left that list in 1.3.5, which made it a built-in: it expanded as `(system)`
+ * on 2026-10-14 and reported its work as a `checkpoint` step (fixtures/27-compact.ndjson).
  */
 const SYSTEM_COMMANDS: readonly AgyCommand[] = [
   {
@@ -65,6 +66,12 @@ const SYSTEM_COMMANDS: readonly AgyCommand[] = [
     name: "browser",
     description:
       "Browse the web, search, and work with web applications, through Antigravity's browser agent.",
+  },
+  {
+    // Alone, agy summarizes the conversation and ends the turn with an empty answer; any text after
+    // the name is answered once the conversation is compacted.
+    name: "compact",
+    description: "Compact the conversation to free context, then answer any message that follows.",
   },
 ];
 

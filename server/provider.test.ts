@@ -157,6 +157,7 @@ afterEach(async () => {
     "FAKE_TOOL_END",
     "FAKE_RESULT_INPUT_TOKENS",
     "FAKE_STEP_INPUT_TOKENS",
+    "FAKE_AUTO_MODE",
     "FAKE_SCHEMA_OUTPUT",
     "FAKE_SCHEMA_ERROR",
     "FAKE_SCHEMA_GATE",
@@ -425,6 +426,41 @@ describe("session lifecycle", () => {
     const argv = readArgv();
     expect(argv[argv.indexOf("--mode") + 1]).toBe("accept-edits");
     expect(argv).toContain("--disable-slash-commands");
+  });
+
+  it("passes Auto mode through to the CLI", async () => {
+    const { connection, events } = await connect();
+    await openSession(connection, { mode: "auto" });
+    await prompt(connection, "fix the tests");
+    await waitFor(() => turns(events, "completed")[0], "the turn to complete");
+
+    const argv = readArgv();
+    expect(argv[argv.indexOf("--mode") + 1]).toBe("auto");
+    expect(events.some((event) => event.type === "session.notice" && event.notice.id === "agy-mode-unavailable")).toBe(false);
+  });
+
+  it("falls back to Default, and says so, when the account has no Auto mode", async () => {
+    process.env.FAKE_AUTO_MODE = "unavailable";
+    const { connection, events } = await connect();
+    await openSession(connection, { mode: "auto" });
+    await prompt(connection, "fix the tests");
+    await waitFor(() => turns(events, "completed")[0], "the turn to complete");
+
+    // agy does not fail: it warns on stderr and runs the turn in its default mode, so the selector
+    // has to follow what the CLI actually does rather than keep showing Auto.
+    const notice = await waitFor(
+      () => events.find((event) => event.type === "session.notice" && event.notice.id === "agy-mode-unavailable"),
+      "the fallback notice",
+    );
+    expect(notice).toMatchObject({ notice: { severity: "warning" } });
+    expect(events.filter((event) => event.type === "session.config").at(-1)).toMatchObject({
+      config: { mode: "default" },
+    });
+
+    // The CLI already runs in the default mode, so the next turn keeps it instead of relaunching.
+    await prompt(connection, "again", "m2");
+    await waitFor(() => turns(events, "completed")[1], "the second turn to complete");
+    expect(readArgvLog()).toHaveLength(1);
   });
 
   it("reports the model and mode selectors in the committed config", async () => {
@@ -2500,6 +2536,43 @@ describe("session import", () => {
   });
 });
 
+/**
+ * An `agy` that replays a captured run instead of inventing one: every line of the fixture goes
+ * to stdout once the turn arrives, with the recorded paths rewritten to this test's temp
+ * directory. It stands in where `testing/fake-agy.mjs` would have to guess at the stream — a
+ * `Workspace: branch` child's workspace, or the steps `/compact` reports.
+ */
+function replayAgy(fixture: string, replacements: ReadonlyArray<readonly [string, string]>): string {
+  const path = join(tempDir, "replay-agy.mjs");
+  writeFileSync(
+    path,
+    [
+      "#!/usr/bin/env node",
+      'import { readFileSync } from "node:fs";',
+      `const lines = readFileSync(${JSON.stringify(fixture)}, "utf8").split("\\n");`,
+      `const from = ${JSON.stringify(replacements.map(([recorded]) => recorded))};`,
+      `const to = ${JSON.stringify(replacements.map(([, rewritten]) => rewritten))};`,
+      'process.stdin.setEncoding("utf8");',
+      'process.stdin.once("data", () => {',
+      "  for (const line of lines) {",
+      '    if (line.trim().length === 0) continue;',
+      "    let out = line;",
+      "    from.forEach((needle, index) => {",
+      "      out = out.split(needle).join(to[index]);",
+      "    });",
+      "    process.stdout.write(`${out}\\n`);",
+      "  }",
+      "});",
+      // The plugin keeps writing turns to stdin; the process stays up to take them, as agy does.
+      "process.stdin.resume();",
+      "",
+    ].join("\n"),
+    "utf8",
+  );
+  chmodSync(path, 0o755);
+  return path;
+}
+
 describe("slash commands", () => {
   /** A command prompt, as Paseo sends one for a name in the published command list. */
   async function commandPrompt(
@@ -2568,11 +2641,48 @@ describe("slash commands", () => {
       { name: "schedule", description: expect.any(String) },
       { name: "boost", description: expect.any(String) },
       { name: "browser", description: expect.any(String) },
+      { name: "compact", description: expect.any(String) },
       { name: "release-notes", description: "Draft the release notes" },
     ]);
     // Paseo fills the draft composer's picker only from what arrived before `session.ready`.
     const ready = events.findIndex((event) => event.type === "session.ready");
     expect(events.findIndex((event) => event.type === "session.commands")).toBeLessThan(ready);
+  });
+
+  /** agy 1.3.5 running `/compact` alone, captured 2026-10-14. */
+  const COMPACT_FIXTURE = fileURLToPath(new URL("../fixtures/27-compact.ndjson", import.meta.url));
+
+  function compactionRows(events: ProviderEvent[]) {
+    return timelineItems(events).filter((item) => item.type === "compaction");
+  }
+
+  it("shows the compaction `/compact` runs and ends its turn without an answer", async () => {
+    const { connection, events } = await connect();
+    await openSession(connection, { providerOptions: { agyPath: replayAgy(COMPACT_FIXTURE, []) } });
+
+    await commandPrompt(connection, "compact", "");
+    await waitFor(() => turns(events, "completed")[0], "the command turn to complete");
+
+    // The capture's `checkpoint` step is the compaction; asked for by name, it is a manual one.
+    expect(compactionRows(events)).toEqual([
+      expect.objectContaining({ type: "compaction", status: "completed", trigger: "manual" }),
+    ]);
+    // agy answers `/compact` with an empty response, which is a finished turn, not a failure, and
+    // leaves nothing to show as an answer.
+    expect(turns(events, "failed")).toHaveLength(0);
+    expect(timelineItems(events).filter((item) => item.type === "assistant_message")).toEqual([]);
+  });
+
+  it("calls a compaction agy chose on its own an automatic one", async () => {
+    const { connection, events } = await connect();
+    await openSession(connection, { providerOptions: { agyPath: replayAgy(COMPACT_FIXTURE, []) } });
+
+    await prompt(connection, "keep going");
+    await waitFor(() => turns(events, "completed")[0], "the turn to complete");
+
+    expect(compactionRows(events)).toEqual([
+      expect.objectContaining({ type: "compaction", status: "completed", trigger: "auto" }),
+    ]);
   });
 
   it("serves a command on a process launched for it, then relaunches for plain turns", async () => {
@@ -2890,43 +3000,6 @@ describe("subagents", () => {
     process.env.HOME = home;
   }
 
-  /**
-   * An `agy` that replays a captured run instead of inventing one: every line of the fixture goes
-   * to stdout once the turn arrives, with the recorded paths rewritten to this test's temp
-   * directory. The `subagent` scenario of `testing/fake-agy.mjs` cannot stand in here — it reports
-   * the parent's own directory as the child's workspace, which is exactly what a `Workspace:
-   * branch` child does not do — so the capture itself has to be the stream.
-   */
-  function replayAgy(fixture: string, replacements: ReadonlyArray<readonly [string, string]>): string {
-    const path = join(tempDir, "replay-agy.mjs");
-    writeFileSync(
-      path,
-      [
-        "#!/usr/bin/env node",
-        'import { readFileSync } from "node:fs";',
-        `const lines = readFileSync(${JSON.stringify(fixture)}, "utf8").split("\\n");`,
-        `const from = ${JSON.stringify(replacements.map(([recorded]) => recorded))};`,
-        `const to = ${JSON.stringify(replacements.map(([, rewritten]) => rewritten))};`,
-        'process.stdin.setEncoding("utf8");',
-        'process.stdin.once("data", () => {',
-        "  for (const line of lines) {",
-        '    if (line.trim().length === 0) continue;',
-        "    let out = line;",
-        "    from.forEach((needle, index) => {",
-        "      out = out.split(needle).join(to[index]);",
-        "    });",
-        "    process.stdout.write(`${out}\\n`);",
-        "  }",
-        "});",
-        // The plugin keeps writing turns to stdin; the process stays up to take them, as agy does.
-        "process.stdin.resume();",
-        "",
-      ].join("\n"),
-      "utf8",
-    );
-    chmodSync(path, 0o755);
-    return path;
-  }
 
   /** A child transcript that says one thing and ends: enough for its own session to open. */
   function childTranscript(cwd: string): string {

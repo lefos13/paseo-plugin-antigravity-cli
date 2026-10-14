@@ -56,6 +56,8 @@
  *   FAKE_QUOTA_LOG       when set, every `/usage` run appends its argv, HOME and cwd here
  *   FAKE_RESULT_INPUT_TOKENS  input_tokens of the terminal result (default 15466)
  *   FAKE_STEP_INPUT_TOKENS    input_tokens of an agent_response step (default: the result's)
+ *   FAKE_AUTO_MODE       "unavailable" makes `--mode auto` fall back to the default mode with the
+ *                        warning agy 1.3.5 prints for an account without Auto mode
  */
 import { appendFileSync, closeSync, existsSync, mkdirSync, readFileSync, writeFileSync, writeSync } from "node:fs";
 import { createServer } from "node:net";
@@ -262,6 +264,11 @@ function quotaPayload() {
 
 const conversationId = process.env.FAKE_CONVERSATION_ID ?? "11111111-2222-3333-4444-555555555555";
 const scenario = process.env.FAKE_SCENARIO ?? "text";
+
+// Captured from agy 1.3.5 on 2026-10-14: an account without Auto mode is warned and carries on.
+if (process.env.FAKE_AUTO_MODE === "unavailable" && argv[argv.indexOf("--mode") + 1] === "auto") {
+  process.stderr.write("warning: --mode auto is not available for this account; continuing in the default mode.\n");
+}
 
 /** Mirrors a captured 503: agy fails the turn and quotes the service error to the user. */
 const defaultResultError = "Eligibility check failed: the service is currently unavailable.";

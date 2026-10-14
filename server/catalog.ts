@@ -43,6 +43,14 @@ const TIER_LABELS: Record<Tier, string> = {
 export const MODES: readonly ProviderMode[] = [
   { id: "default", label: "Default", description: "Review file writes before they run" },
   { id: "accept-edits", label: "Accept edits", description: "Accept file edits automatically" },
+  // Added in agy 1.3.5 and only for some accounts: the rest get a stderr warning and the default
+  // mode, which the provider reports back to the selector (`AGY_MODE_UNAVAILABLE`). How it asks
+  // before an irreversible action without a terminal is unprobed: no account here has it.
+  {
+    id: "auto",
+    label: "Auto",
+    description: "Approve edits and safe commands automatically; ask before irreversible actions",
+  },
   { id: "plan", label: "Plan", description: "Plan without applying edits" },
 ];
 
