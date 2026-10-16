@@ -302,6 +302,36 @@ describe("discoverCommands", () => {
     });
   });
 
+  it("still offers the shared skills read last on a machine with many plugins", async () => {
+    // The shape of a real machine on 2026-10-16: 22 plugin skills, 9 built-ins and 45 shared
+    // skills overflowed a 64-command cap, so every shared skill after `paseo` went missing.
+    for (let index = 0; index < 22; index += 1) {
+      writeGlobalSkill(".gemini/config/plugins/kit/skills", `skill_${index}`, skill(`name: kit-${index}\ndescription: Kit`));
+    }
+    for (let index = 0; index < 9; index += 1) {
+      writeGlobalSkill(".gemini/antigravity-cli/builtin/skills", `builtin-${index}`, skill(`name: builtin-${index}\ndescription: Built in`));
+    }
+    for (let index = 0; index < 44; index += 1) {
+      const name = `shared-${String(index).padStart(2, "0")}`;
+      writeGlobalSkill(".agents/skills", name, skill(`name: ${name}\ndescription: Shared`));
+    }
+    writeGlobalSkill(".agents/skills", "zz-paseo-handoff", skill("name: zz-paseo-handoff\ndescription: Hand off"));
+
+    const discovered = await discoverCommands(workspace);
+    expect(discovered.commands.at(-1)?.name).toBe("zz-paseo-handoff");
+    expect(discovered.expanded.has("zz-paseo-handoff")).toBe(true);
+  });
+
+  it("caps how many commands it publishes", async () => {
+    for (const plugin of ["one", "two", "three"]) {
+      for (let index = 0; index < 60; index += 1) {
+        writeGlobalSkill(`.gemini/config/plugins/${plugin}/skills`, `skill_${index}`, skill(`name: s-${index}\ndescription: Many`));
+      }
+    }
+
+    expect((await discoverCommands(workspace)).commands).toHaveLength(128);
+  });
+
   it("leaves a shared skill to the command the CLI expands itself", async () => {
     // A name the CLI resolves on its own is the one the user gets, so the copy in the shared
     // directory is not offered and not expanded by the plugin.

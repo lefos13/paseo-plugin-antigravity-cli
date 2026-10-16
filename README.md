@@ -154,6 +154,8 @@ turn relaunches with it.
   `skills.json` exclusions all count. If the CLI cannot list its plugins, disabled ones are still
   left out: `"enabled": false` in `~/.gemini/config/config.json`, or `"disabled": true` in a root
   `plugin.json` with no `config.json` entry (an entry there always wins).
+- **The picker holds up to 128 commands**, read in the order of this table and then the
+  shared-installer skills, so a machine with many plugins can still push the last ones out.
 - **`skills.json`** (`.agents/skills.json`, the same file under the other workspace roots, and
   `~/.gemini/config/skills.json`) loads the items directly inside its `path`, one level deep;
   `include_only` and `exclude` name those items exactly, a nested one is named by its relative path in

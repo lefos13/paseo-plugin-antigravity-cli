@@ -133,10 +133,12 @@ export interface ExpandedSkill {
 /**
  * Bounds for a read that the draft composer repeats on every model, mode, and tier change: a
  * bounded directory listing per root, the frontmatter head of each SKILL.md, and a cap on how many
- * commands the session publishes.
+ * commands the session publishes. The shared installer's skills are read last, so the cap is what
+ * cuts them off: 64 was already full on 2026-10-16 with 9 workflows, 22 plugin skills, 9 built-ins
+ * and 45 shared skills, which dropped every shared skill after `paseo`.
  */
 const MAX_DIRS_PER_ROOT = 64;
-const MAX_COMMANDS = 64;
+const MAX_COMMANDS = 128;
 const SKILL_HEAD_BYTES = 4 * 1024;
 const DESCRIPTION_LIMIT = 240;
 
