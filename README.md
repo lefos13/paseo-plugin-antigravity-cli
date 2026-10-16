@@ -354,7 +354,9 @@ running subagent's transcript.
 - **Edit diffs are reconstructed** from file snapshots, because the stream names only the edited file;
   a file the plugin cannot read, or one that did not change, leaves the row without a diff.
 - **Transient 503s** fail the turn with `code: "unavailable"`, and an error result ends the CLI
-  process, which the next turn relaunches on the same conversation.
+  process, which the next turn relaunches on the same conversation. A 503 that agy retried mid-turn
+  does not fail the turn: agy still reports such a turn as an error, but when its last step is a
+  finished answer after the 503, the turn completes, with an info notice.
 - **An exhausted AI credits balance** (agy 1.2.15+) fails the turn with `code: "credits_exhausted"`,
   never as retryable, and a notice suggests adding credits or starting a session under another
   account: an account is fixed for the life of a session.

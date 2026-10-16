@@ -123,6 +123,11 @@ export const STEP_UNKNOWN = "unknown";
  * fills. It carries no detail of what was summarized (fixtures/27-compact.ndjson, agy 1.3.5).
  */
 export const STEP_CHECKPOINT = "checkpoint";
+/**
+ * An error agy hit inside the turn, such as a model call failing with a 503. agy may retry and
+ * carry on past it, so it does not end the turn by itself.
+ */
+export const STEP_ERROR_MESSAGE = "error_message";
 
 export const STEP_STATE_ACTIVE = "ACTIVE";
 export const STEP_STATE_DONE = "DONE";

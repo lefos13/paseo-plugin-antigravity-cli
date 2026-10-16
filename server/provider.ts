@@ -59,6 +59,7 @@ import {
 import {
   STEP_AGENT_RESPONSE,
   STEP_CHECKPOINT,
+  STEP_ERROR_MESSAGE,
   STEP_STATE_DONE,
   STEP_SUBAGENT,
   STEP_TOOL,
@@ -380,6 +381,10 @@ interface PendingTurn {
   contextInputTokens?: number;
   /** Highest step index the stream has delivered for this turn. */
   lastStreamStep: number;
+  /** Highest `error_message` step the stream reported, or -1 (see `recoveredFromOutage`). */
+  lastErrorStep: number;
+  /** Highest agent_response step that reached DONE, or -1. */
+  lastAnswerStep: number;
   /**
    * Steps published from the conversation transcript while the stream was held, with the JSON
    * last published for each. The stream no longer owns these steps: when it catches up, its copy
@@ -1275,6 +1280,8 @@ async function startTurn(session: Session, emit: Emit, request: TurnRequest): Pr
     // queued behind another is answered by that process, not by the one its own prompt implies.
     schema: false,
     lastStreamStep: -1,
+    lastErrorStep: -1,
+    lastAnswerStep: -1,
     backfilled: new Map(),
     backfill: null,
     backfillTimer: null,
@@ -2038,6 +2045,18 @@ function handleStepUpdate(session: Session, step: AgyStepUpdate, emit: Emit): vo
 
   const turn = session.pendingTurns[0];
   if (turn) {
+    // Recorded before the backfill check: a step the transcript already published still counts
+    // towards how the turn ended.
+    if (step.step_type === STEP_ERROR_MESSAGE && step.step_index > turn.lastErrorStep) {
+      turn.lastErrorStep = step.step_index;
+    }
+    if (
+      step.step_type === STEP_AGENT_RESPONSE &&
+      step.state === STEP_STATE_DONE &&
+      step.step_index > turn.lastAnswerStep
+    ) {
+      turn.lastAnswerStep = step.step_index;
+    }
     // The transcript already supplied this step while the stream was held; publishing the
     // stream's own copy now would only repeat it, and an assistant row would repeat its text.
     if (turn.backfilled.has(step.step_index)) return;
@@ -2794,7 +2813,14 @@ function handleResult(session: Session, result: AgyResult, emit: Emit): void {
     return;
   }
 
-  if (result.status === "SUCCESS") {
+  const recovered = recoveredFromOutage(turn, result);
+  if (recovered) {
+    console.log(
+      `[antigravity] treating the result as SUCCESS: error_message at step ${turn.lastErrorStep}, answer done at step ${turn.lastAnswerStep}`,
+    );
+  }
+
+  if (result.status === "SUCCESS" || recovered) {
     const response = result.response ?? "";
     if (turn.schema) {
       if (result.structured_output !== undefined) {
@@ -2825,6 +2851,16 @@ function handleResult(session: Session, result: AgyResult, emit: Emit): void {
     // as this turn is concerned, and a child still followed keeps following until it finishes.
     finalizeToolCalls(session, emit, turn, { status: "completed" });
     emit({ type: "session.turn", sessionId: session.sessionId, turnId: turn.turnId, state: "completed" });
+    if (recovered) {
+      emitNotice(
+        session,
+        emit,
+        "agy-recovered-outage",
+        "info",
+        "Antigravity recovered from a temporary outage",
+        "The Antigravity service was briefly unavailable during this turn. Antigravity retried and the turn finished, so it is shown as completed even though Antigravity reported the outage as an error.",
+      );
+    }
     if (!turn.schema) offerPlan(session, emit, turn, lastAssistantText(turn) || response);
     return;
   }
@@ -2861,6 +2897,24 @@ function handleResult(session: Session, result: AgyResult, emit: Emit): void {
   });
   void settleChildFollows(session, emit, turn, { state: "failed", error });
   emitFailureNotice(session, emit, { error, retryable });
+}
+
+/**
+ * agy 1.4.0 keeps a turn's first API error in its result even after it retried that call and the
+ * turn went on to finish: two runs on 2026-10-16 hit a 503 at steps 307 and 340, went on for up to
+ * 90 minutes, and still ended `ERROR` with `API error (attempt 1): UNAVAILABLE (code 503)`. Such a
+ * turn is finished when the stream's last word was a completed answer that came after the error.
+ * A turn that really stops on the outage ends on the `error_message` step or reports no steps at
+ * all (fixtures/05-unavailable.ndjson), so it still fails.
+ */
+function recoveredFromOutage(turn: PendingTurn, result: AgyResult): boolean {
+  return (
+    result.status === "ERROR" &&
+    UNAVAILABLE_PATTERN.test(result.error ?? "") &&
+    turn.lastErrorStep >= 0 &&
+    turn.lastAnswerStep > turn.lastErrorStep &&
+    turn.lastAnswerStep >= turn.lastStreamStep
+  );
 }
 
 function handleAgyExit(

@@ -2181,6 +2181,44 @@ describe("failures", () => {
     });
   });
 
+  it("completes a turn that agy reports as failed after it retried a 503 and answered", async () => {
+    // agy 1.4.0 keeps a retried mid-turn 503 in the result of a turn that went on to finish.
+    process.env.FAKE_SCENARIO = "recovered-error";
+
+    const { connection, events } = await connect();
+    await openSession(connection);
+    await prompt(connection, "hello");
+    await waitFor(() => turns(events, "completed")[0], "the turn to complete");
+
+    expect(turns(events, "failed")).toHaveLength(0);
+    const assistant = timelineItems(events).filter((item) => item.type === "assistant_message");
+    expect(assistant.at(-1)).toMatchObject({ text: "All done." });
+    expect(
+      events.some((event) => event.type === "session.notice" && event.notice.id === "agy-unavailable"),
+    ).toBe(false);
+    const notice = events.find(
+      (event) => event.type === "session.notice" && event.notice.id === "agy-recovered-outage",
+    );
+    expect(notice).toMatchObject({ notice: { severity: "info" } });
+  });
+
+  it("still fails a turn that stops on a 503 after an earlier answer", async () => {
+    process.env.FAKE_SCENARIO = "error-after-answer";
+
+    const { connection, events } = await connect();
+    await openSession(connection);
+    await prompt(connection, "hello");
+    const turn = await waitFor(() => turns(events, "failed")[0], "the turn to fail");
+
+    expect(turn).toMatchObject({ error: { code: "unavailable" } });
+    expect(
+      events.some((event) => event.type === "session.notice" && event.notice.id === "agy-unavailable"),
+    ).toBe(true);
+    expect(
+      events.some((event) => event.type === "session.notice" && event.notice.id === "agy-recovered-outage"),
+    ).toBe(false);
+  });
+
   it("names an exhausted AI credits balance and points at another account", async () => {
     // agy 1.2.15 fails at once with this text instead of retrying for minutes. The string is the
     // one in the 1.2.16 binary and changelog; no capture of ours has it, so the result is synthetic.

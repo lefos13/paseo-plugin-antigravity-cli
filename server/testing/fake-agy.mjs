@@ -9,7 +9,8 @@
  *                        test tells an account's shadow home from the real one (or its absence)
  *   FAKE_SCENARIO        text (default) | tool | edit | edit-applied | queued | interrupt | error
  *                        | fail | tool-hang | stdin-closed | schema | schema-invalid | subagent
- *                        | ask-question | background | background-wait
+ *                        | ask-question | background | background-wait | recovered-error
+ *                        | error-after-answer
  *   FAKE_SUBAGENT_COUNT       children the `subagent` scenario spawns (default 1)
  *   FAKE_SUBAGENT_TRANSCRIPT  what the `subagent` scenario writes for each child: valid (default),
  *                             malformed (unreadable lines only), missing (no file at all),
@@ -1037,6 +1038,30 @@ readline.createInterface({ input }).on("line", async (line) => {
     ].map((line) => JSON.stringify(line)));
     send(stepEvent(first + 8, "DONE", "agent_response", { text_delta: `All 12 tests passed (${text}).` }));
     sendResult(turnResult(turns, `Waiting for the tests to finish.\nThe tests are still running.\nAll 12 tests passed (${text}).`));
+    return;
+  }
+
+  if (scenario === "recovered-error" || scenario === "error-after-answer") {
+    // Captured on agy 1.4.0 (2026-10-16): a model call fails with a 503 mid-turn, the stream
+    // reports an `error_message` step, and agy retries. In `recovered-error` the turn goes on to a
+    // finished answer, yet the result still says ERROR with that first error. In
+    // `error-after-answer` the turn stops on the 503 instead, so the answer before it is not final.
+    const error = "API error (attempt 1): UNAVAILABLE (code 503): The service is currently unavailable.";
+    const thinking = "Let me look.";
+    const answer = "All done.";
+    send(stepEvent(step, "ACTIVE", "agent_response", { text_delta: thinking }));
+    send(stepEvent(step, "DONE", "agent_response", { text_delta: "", usage: stepUsage }));
+    step += 1;
+    send(stepEvent(step, "DONE", "error_message", {}));
+    step += 1;
+    if (scenario === "error-after-answer") {
+      sendResult(turnResult(turns, thinking, "ERROR", error));
+      return;
+    }
+    send(stepEvent(step, "ACTIVE", "agent_response", { text_delta: answer }));
+    send(stepEvent(step, "DONE", "agent_response", { text_delta: "", usage: stepUsage }));
+    step += 1;
+    sendResult(turnResult(turns, `${thinking}\n${answer}`, "ERROR", error));
     return;
   }
 
