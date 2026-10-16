@@ -1,7 +1,12 @@
+import { execFile } from "node:child_process";
 import { readdir, readFile, stat } from "node:fs/promises";
 import { homedir } from "node:os";
-import { basename, dirname, join, resolve } from "node:path";
+import { basename, dirname, join, resolve, sep } from "node:path";
+import { promisify } from "node:util";
+import { resolveAgyBinary } from "./agy";
 import { parseAgyJson, readSettingsFile } from "./agysettings";
+
+const execFileAsync = promisify(execFile);
 
 /**
  * The slash commands the composer offers. Paseo sends one as `/<name> <arguments>`, which the CLI
@@ -156,10 +161,18 @@ export interface DiscoveredCommands {
   readonly expanded: ReadonlyMap<string, ExpandedSkill>;
 }
 
+export interface DiscoverOptions {
+  /** The session's `agy`, which is asked which plugins load and with which skills. */
+  readonly binary?: string;
+}
+
 /**
  * Every command the composer can offer, with the ones the CLI does not expand marked as ours.
  */
-export async function discoverCommands(cwd: string): Promise<DiscoveredCommands> {
+export async function discoverCommands(
+  cwd: string,
+  options: DiscoverOptions = {},
+): Promise<DiscoveredCommands> {
   const commands = new Map<string, AgyCommand>();
   for (const command of SYSTEM_COMMANDS) commands.set(command.name, command);
   // A `skills.json` resolves its relative paths against the repository root, so one workspace reads
@@ -193,17 +206,33 @@ export async function discoverCommands(cwd: string): Promise<DiscoveredCommands>
   // `/android-cli-plugin:..:android-cli` expanded, while `/android-cli-plugin:android-cli` did not.
   // A frontmatter name that already starts with `<plugin>:` has it stripped first, in both shapes
   // (fixtures/21-plugin-skill-prefix.txt, 1.2.14).
-  const configPlugins = await readConfigPlugins();
+  // The CLI's own list decides which plugins load and which of their skills do; the scan below it
+  // only finds each listed skill's file and its shape. Without that list the plugin's own reading
+  // of the switches stands in.
+  const listed = await listPlugins(options.binary);
+  const configPlugins = listed === null ? await readConfigPlugins() : null;
   const plugins = join(homedir(), ".gemini", "config", "plugins");
   for (const plugin of await subdirectories(plugins)) {
-    if (await isPluginDisabled(plugin, configPlugins)) continue;
+    let loads: ReadonlySet<string> | null = null;
+    if (listed !== null) {
+      // agy may report the path with its symlinks resolved, so the directory under the plugins
+      // root is matched by its tail rather than by the full path.
+      const tail = sep + join(".gemini", "config", "plugins", basename(plugin));
+      const entry = listed.find((item) => item.path === plugin || item.path.endsWith(tail));
+      // A directory agy does not list has no manifest it accepts, so none of its skills load.
+      if (entry?.enabled !== true) continue;
+      loads = entry.skills;
+    } else if (await isPluginDisabled(plugin, configPlugins)) continue;
     const prefix = `${basename(plugin)}:`;
+    // Whether agy lists a name with the prefix it strips is unprobed, so either form counts.
+    const keep = (name: string): boolean =>
+      loads === null || loads.has(name) || loads.has(`${prefix}${name}`);
     const root = join(plugin, "skills");
     const flat = await readSkill(join(root, "SKILL.md"), prefix);
-    if (flat !== null) {
+    if (flat !== null && keep(flat.name)) {
       remember(commands, { name: `${prefix}..:${flat.name}`, description: flat.description });
     }
-    await collectSkills(root, commands, prefix);
+    await collectSkills(root, commands, prefix, keep);
   }
   // Where the CLI unpacks the skills it ships with, one directory per skill.
   const builtin = join(homedir(), ".gemini", "antigravity-cli", "builtin", "skills");
@@ -259,10 +288,11 @@ async function collectSkills(
   root: string,
   commands: Map<string, AgyCommand>,
   prefix = "",
+  keep: (name: string) => boolean = () => true,
 ): Promise<void> {
   for (const dir of await subdirectories(root)) {
     const skill = await readSkill(join(dir, "SKILL.md"), prefix);
-    if (skill === null) continue;
+    if (skill === null || !keep(skill.name)) continue;
     remember(commands, { name: `${prefix}${skill.name}`, description: skill.description });
   }
 }
@@ -347,6 +377,55 @@ function describeSkill(description: string): string {
   return `${(space > 0 ? cut.slice(0, space) : cut).trimEnd()}…`;
 }
 
+/** A plugin as `agy plugin list --json` reports it. */
+interface ListedPlugin {
+  readonly path: string;
+  readonly enabled: boolean;
+  /** The frontmatter names of the skills that load. */
+  readonly skills: ReadonlySet<string>;
+}
+
+/** Measured at about 50 ms on 1.4.0; the composer waits on this read, so a stuck CLI is cut off. */
+const PLUGIN_LIST_TIMEOUT_MS = 3_000;
+
+/**
+ * The installed plugins as the CLI loads them, or null when it cannot say. Since 1.3.4 the list
+ * covers every installed plugin and whether it is on, and since 1.3.3 its skills are the ones that
+ * actually load, `skills.json` exclusions and the manifest's `skills` field included. A scan of
+ * `<plugin>/plugin.json` misses manifests in `.antigravity-plugin/` or `.gemini-plugin/` (1.3.2)
+ * and, on a case-sensitive disk, one named `Plugin.json` (1.3.6).
+ */
+async function listPlugins(binary?: string): Promise<ListedPlugin[] | null> {
+  let stdout: string;
+  try {
+    const listing = execFileAsync(resolveAgyBinary(binary), ["plugin", "list", "--json"], {
+      timeout: PLUGIN_LIST_TIMEOUT_MS,
+      maxBuffer: 1024 * 1024,
+    });
+    // A CLI without the subcommand reads its prompt from stdin; with stdin closed it exits at once
+    // (1.4.0 answers an unknown one with exit 2) instead of holding the composer to the timeout.
+    listing.child.stdin?.end();
+    ({ stdout } = await listing);
+  } catch {
+    return null;
+  }
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(stdout);
+  } catch {
+    return null;
+  }
+  if (!Array.isArray(parsed)) return null;
+  const plugins: ListedPlugin[] = [];
+  for (const entry of parsed) {
+    if (typeof entry !== "object" || entry === null) continue;
+    const { path, enabled, skills } = entry as Record<string, unknown>;
+    if (typeof path !== "string" || typeof enabled !== "boolean") continue;
+    plugins.push({ path, enabled, skills: new Set(stringNames(skills)) });
+  }
+  return plugins;
+}
+
 async function readConfigPlugins(): Promise<Record<string, { enabled?: boolean }> | null> {
   const path = join(homedir(), ".gemini", "config", "config.json");
   try {
@@ -364,7 +443,8 @@ async function readConfigPlugins(): Promise<Record<string, { enabled?: boolean }
 }
 
 /**
- * Whether the CLI loads a plugin's customizations. Its own doc
+ * Whether the CLI loads a plugin's customizations, for a CLI older than 1.3.4 or one that cannot
+ * list its plugins. Its own doc
  * (`~/.gemini/antigravity-cli/builtin/skills/agy-customizations/docs/plugins.md`) states that
  * `config.json` wins wherever it has an entry — `{ "plugins": { "<dirname>": { "enabled": false } } }`
  * — and that a plugin ships switched off with `"disabled": true` in its `plugin.json`, so only that

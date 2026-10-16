@@ -800,7 +800,7 @@ async function openSession(
   // `session.ready` reaches it — including for the throwaway probe a draft opens. Which of these
   // names this plugin expands itself is kept: a later prompt re-reads the roots, and this is what
   // separates a skill that has since disappeared from a name the CLI expands on its own.
-  const discovered = await discoverCommands(config.cwd);
+  const discovered = await discoverCommands(config.cwd, { binary: session.agyPath });
   session.publishedSkills = new Set(discovered.expanded.keys());
   emit({
     type: "session.commands",
@@ -1113,7 +1113,7 @@ async function promptSession(
   // Which command the user picked decides the launch, so the list is read again here rather than
   // trusted from `session.open`: a skill may have been installed, removed, or renamed since.
   const command = prompt.input.type === "command" ? prompt.input : null;
-  const discovered = command === null ? null : await discoverCommands(session.config.cwd);
+  const discovered = command === null ? null : await discoverCommands(session.config.cwd, { binary: session.agyPath });
   const skill = command === null ? null : (discovered?.expanded.get(command.name) ?? null);
   const unlisted =
     command !== null &&

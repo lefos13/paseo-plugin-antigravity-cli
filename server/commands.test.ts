@@ -1,10 +1,13 @@
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { basename, dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { discoverAgents, discoverCommands, renderSkillPrompt } from "./commands";
 
 const originalHome = process.env.HOME;
+const originalBinary = process.env.PASEO_ANTIGRAVITY_BIN;
+const fakeAgy = fileURLToPath(new URL("./testing/fake-agy.mjs", import.meta.url));
 
 let home: string;
 let workspace: string;
@@ -13,11 +16,18 @@ beforeEach(() => {
   home = mkdtempSync(join(tmpdir(), "antigravity-commands-home-"));
   workspace = mkdtempSync(join(tmpdir(), "antigravity-commands-work-"));
   process.env.HOME = home;
+  // Without FAKE_PLUGIN_LIST the fake cannot list its plugins, so discovery reads the switches
+  // itself: the path a CLI older than 1.3.4 takes.
+  process.env.PASEO_ANTIGRAVITY_BIN = fakeAgy;
+  delete process.env.FAKE_PLUGIN_LIST;
 });
 
 afterEach(() => {
   if (originalHome === undefined) delete process.env.HOME;
   else process.env.HOME = originalHome;
+  if (originalBinary === undefined) delete process.env.PASEO_ANTIGRAVITY_BIN;
+  else process.env.PASEO_ANTIGRAVITY_BIN = originalBinary;
+  delete process.env.FAKE_PLUGIN_LIST;
   rmSync(home, { recursive: true, force: true });
   rmSync(workspace, { recursive: true, force: true });
 });
@@ -361,6 +371,94 @@ describe("discoverCommands", () => {
     expect(commands.some((c) => c.name.includes("disabled-skill"))).toBe(false);
     expect(commands.some((c) => c.name.includes("self-disabled-skill"))).toBe(false);
     expect(commands.some((c) => c.name.includes("active-skill"))).toBe(true);
+  });
+
+  describe("when agy lists its plugins", () => {
+    const plugins = (): string => join(home, ".gemini", "config", "plugins");
+
+    function writePluginSkill(plugin: string, dir: string, name: string): void {
+      const path = dir === "" ? join(plugins(), plugin, "skills") : join(plugins(), plugin, "skills", dir);
+      mkdirSync(path, { recursive: true });
+      writeFileSync(join(path, "SKILL.md"), skill(`name: ${name}\ndescription: ${name}`), "utf8");
+    }
+
+    /** The shape `agy plugin list --json` printed on 1.4.0, 2026-10-16. */
+    function listPlugins(...entries: { name: string; enabled: boolean; skills?: string[] }[]): void {
+      process.env.FAKE_PLUGIN_LIST = JSON.stringify(
+        entries.map((entry) => ({
+          name: entry.name,
+          enabled: entry.enabled,
+          version: "1.0.0",
+          source: "antigravity-plugins-official",
+          path: join(plugins(), entry.name),
+          ...(entry.skills === undefined ? {} : { skills: entry.skills }),
+        })),
+      );
+    }
+
+    it("offers only the skills agy reports as loading", async () => {
+      // agy 1.3.3 applies `skills.json` exclusions and the manifest's `skills` field, which a scan
+      // of `skills/` cannot see.
+      writePluginSkill("firebase", "firebase_basics", "firebase-basics");
+      writePluginSkill("firebase", "firebase_excluded", "firebase-excluded");
+      writePluginSkill("android-cli-plugin", "", "android-cli");
+      listPlugins(
+        { name: "firebase", enabled: true, skills: ["firebase-basics"] },
+        { name: "android-cli-plugin", enabled: true, skills: ["android-cli"] },
+      );
+
+      const discovered = await names();
+      expect(discovered).toContain("firebase:firebase-basics");
+      expect(discovered).toContain("android-cli-plugin:..:android-cli");
+      expect(discovered).not.toContain("firebase:firebase-excluded");
+    });
+
+    it("takes the switch from agy rather than the manifest at the plugin root", async () => {
+      // A manifest in `.antigravity-plugin/` (1.3.2) or named `Plugin.json` (1.3.6) is invisible
+      // to the root `plugin.json` read, so only agy knows this plugin ships switched off.
+      writePluginSkill("hidden-manifest", "sub", "hidden-skill");
+      mkdirSync(join(plugins(), "hidden-manifest", ".antigravity-plugin"), { recursive: true });
+      writeFileSync(
+        join(plugins(), "hidden-manifest", ".antigravity-plugin", "plugin.json"),
+        JSON.stringify({ disabled: true }),
+        "utf8",
+      );
+      // And the other way round: a root `disabled` flag config.json has since overridden.
+      writePluginSkill("turned-on", "sub", "turned-on-skill");
+      writeFileSync(join(plugins(), "turned-on", "plugin.json"), JSON.stringify({ disabled: true }), "utf8");
+      listPlugins(
+        { name: "hidden-manifest", enabled: false, skills: ["hidden-skill"] },
+        { name: "turned-on", enabled: true, skills: ["turned-on-skill"] },
+      );
+
+      const discovered = await names();
+      expect(discovered).not.toContain("hidden-manifest:hidden-skill");
+      expect(discovered).toContain("turned-on:turned-on-skill");
+    });
+
+    it("skips a directory agy does not list as a plugin", async () => {
+      writePluginSkill("not-a-plugin", "sub", "stray-skill");
+      listPlugins();
+
+      expect(await names()).not.toContain("not-a-plugin:stray-skill");
+    });
+
+    it("matches a plugin agy reports under its resolved path", async () => {
+      // macOS keeps temp directories behind the `/var` -> `/private/var` link, which agy may resolve.
+      writePluginSkill("linked", "sub", "linked-skill");
+      process.env.FAKE_PLUGIN_LIST = JSON.stringify([
+        { name: "linked", enabled: true, path: join("/private", plugins(), "linked"), skills: ["linked-skill"] },
+      ]);
+
+      expect(await names()).toContain("linked:linked-skill");
+    });
+
+    it("falls back to its own reading when the list is not JSON", async () => {
+      writePluginSkill("firebase", "firebase_basics", "firebase-basics");
+      process.env.FAKE_PLUGIN_LIST = "Error: not signed in";
+
+      expect(await names()).toContain("firebase:firebase-basics");
+    });
   });
 
   it("reads a config.json that starts with a UTF-8 byte order mark", async () => {

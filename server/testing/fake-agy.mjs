@@ -52,6 +52,7 @@
  *   FAKE_TOOL_END        how `tool-hang` ends the turn: interrupt (default) | error | die
  *   FAKE_MODELS_OK       "1" makes `agy models` succeed, anything else makes it fail
  *   FAKE_MODELS_LOG      when set, every `agy models` run appends a line here
+ *   FAKE_PLUGIN_LIST     what `agy plugin list --json` prints; unset makes the command fail
  *   FAKE_QUOTA           the answer to `-p /usage --output-format json` (server/quota.ts):
  *                        ok (default) | signed-out | error | agent-turn | garbage
  *   FAKE_QUOTA_LOG       when set, every `/usage` run appends its argv, HOME and cwd here
@@ -70,6 +71,16 @@ import { PassThrough } from "node:stream";
 import { pathToFileURL } from "node:url";
 
 const argv = process.argv.slice(2);
+
+// Command discovery's read of the plugins, not a session launch, so it stays out of the argv logs.
+if (argv[0] === "plugin" && argv[1] === "list") {
+  if (process.env.FAKE_PLUGIN_LIST === undefined) {
+    process.stderr.write("error: could not list plugins\n");
+    process.exit(1);
+  }
+  await new Promise((resolve) => process.stdout.write(`${process.env.FAKE_PLUGIN_LIST}\n`, resolve));
+  process.exit(0);
+}
 
 if (process.env.FAKE_ARGV_FILE) {
   writeFileSync(process.env.FAKE_ARGV_FILE, JSON.stringify(argv), "utf8");

@@ -148,8 +148,12 @@ turn relaunches with it.
 | `/<name>` | A skill, either in the workspace's customization roots (`.agents/skills/<name>/SKILL.md`, and the same under `.agent/`, `_agents/`, `_agent/`) or installed for every workspace under `~/.gemini/antigravity-cli/skills/`, `~/.gemini/config/skills/`, `~/.gemini/skills/`, in that precedence. The name is the skill's frontmatter `name`, and the CLI's own built-ins are listed too. |
 | `<plugin>:<name>` | A plugin's skill, under `~/.gemini/config/plugins/<plugin>/skills/`. A plugin holding one skill directly in `skills/` is addressed with a `..` placeholder: `/android-cli-plugin:..:android-cli`. A frontmatter `name` that already starts with `<plugin>:` is addressed with the prefix once, as agy does: `name: firebase:basics` is `/firebase:basics`. |
 
-- **Disabled plugins** are left out: `"enabled": false` in `~/.gemini/config/config.json`, or
-  `"disabled": true` in a `plugin.json` with no `config.json` entry (an entry there always wins).
+- **Which plugin skills load is agy's call**: the plugin asks `agy plugin list --json` (agy 1.3.4+)
+  and offers only the skills of enabled plugins that agy reports as loading, so manifests in
+  `.antigravity-plugin/` or `.gemini-plugin/`, `Plugin.json`, the manifest's `skills` field and
+  `skills.json` exclusions all count. If the CLI cannot list its plugins, disabled ones are still
+  left out: `"enabled": false` in `~/.gemini/config/config.json`, or `"disabled": true` in a root
+  `plugin.json` with no `config.json` entry (an entry there always wins).
 - **`skills.json`** (`.agents/skills.json`, the same file under the other workspace roots, and
   `~/.gemini/config/skills.json`) loads the items directly inside its `path`, one level deep;
   `include_only` and `exclude` name those items exactly, a nested one is named by its relative path in
