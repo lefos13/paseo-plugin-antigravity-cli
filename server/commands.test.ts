@@ -897,4 +897,75 @@ describe("discoverCommands", () => {
     );
     expect(await agentNames()).toEqual(["global-json"]);
   });
+
+  describe("from installed plugins", () => {
+    const pluginDir = (name: string): string => join(home, ".gemini", "config", "plugins", name);
+
+    /** The shape `agy plugin list --json` printed on 1.4.3, 2026-10-20 (fixtures/28). */
+    function listPlugins(...entries: { name: string; enabled: boolean; agents?: string[] }[]): void {
+      process.env.FAKE_PLUGIN_LIST = JSON.stringify(
+        entries.map((entry) => ({
+          name: entry.name,
+          enabled: entry.enabled,
+          version: "1.0.0",
+          source: "antigravity-plugins-official",
+          path: pluginDir(entry.name),
+          ...(entry.agents === undefined ? {} : { agents: entry.agents }),
+        })),
+      );
+    }
+
+    it("offers an enabled plugin's listed agents, outside a trusted workspace", async () => {
+      writeAgent(
+        join(pluginDir("firebase"), "agents", "firestore-rules-author.md"),
+        "firestore-rules-author",
+        "Writes Firestore rules",
+        "mainAgent: true\n",
+      );
+      writeAgent(join(pluginDir("firebase"), "agents", "nested", "agent.md"), "nested-author", "Nested shape");
+      listPlugins({ name: "firebase", enabled: true, agents: ["firestore-rules-author", "nested-author"] });
+
+      expect(await discoverAgents(workspace, join(home, ".gemini"))).toEqual([
+        { name: "firestore-rules-author", description: "Writes Firestore rules" },
+        { name: "nested-author", description: "Nested shape" },
+      ]);
+    });
+
+    it("skips a disabled plugin and an agent file agy does not list", async () => {
+      writeAgent(join(pluginDir("off"), "agents", "off-agent.md"), "off-agent", "Disabled plugin");
+      writeAgent(join(pluginDir("on"), "agents", "listed.md"), "listed", "Listed");
+      writeAgent(join(pluginDir("on"), "agents", "unlisted.md"), "unlisted", "Not listed");
+      listPlugins(
+        { name: "off", enabled: false, agents: ["off-agent"] },
+        { name: "on", enabled: true, agents: ["listed"] },
+      );
+
+      expect(await agentNames()).toEqual(["listed"]);
+    });
+
+    it("still offers a listed agent the scan cannot find", async () => {
+      // A plugin may declare agents in a root `agents.json` pointing elsewhere (1.3.6).
+      listPlugins({ name: "declared", enabled: true, agents: ["declared-agent"] });
+
+      expect(await discoverAgents(workspace, join(home, ".gemini"))).toEqual([
+        { name: "declared-agent", description: "" },
+      ]);
+    });
+
+    it("lets a global agent keep a name a plugin also uses", async () => {
+      writeAgent(join(home, ".gemini", "config", "agents", "shared.md"), "shared", "Global one");
+      writeAgent(join(pluginDir("p"), "agents", "shared.md"), "shared", "Plugin one");
+      listPlugins({ name: "p", enabled: true, agents: ["shared"] });
+
+      expect(await discoverAgents(workspace, join(home, ".gemini"))).toEqual([
+        { name: "shared", description: "Global one" },
+      ]);
+    });
+
+    it("offers no plugin agents when agy cannot list its plugins", async () => {
+      writeAgent(join(pluginDir("firebase"), "agents", "a.md"), "plugin-agent", "Plugin agent");
+
+      expect(await agentNames()).toEqual([]);
+    });
+  });
 });

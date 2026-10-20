@@ -1,0 +1,18 @@
+agy 1.4.3 — plugin custom agents via `agy plugin list --json` and `--agent` (Item 11)
+Probed 2026-10-20 on macOS from an untrusted scratch directory (/tmp/agyprobe-item11).
+
+1. `agy plugin list --json` (firebase entry, trimmed): each plugin carries an `agents` array of
+   frontmatter names next to `skills`.
+     {"name":"firebase","enabled":true,"path":"~/.gemini/config/plugins/firebase",
+      "agents":["firestore-rules-author"], ...}
+   The file is plugins/firebase/agents/firestore-rules-author.md, frontmatter `mainAgent: true`.
+
+2. `agy agents` printed the bare name, no plugin prefix:
+     firestore-rules-author
+
+3. `agy -p "Reply with exactly: OK" --agent firestore-rules-author --output-format stream-json`
+   exited 0; the init event named the agent:
+{"event":"init","conversation_id":"3dc49f0e-cdee-4bfa-8de7-f29f7932425c","init":{"cwd":"/tmp/agyprobe-item11","agent":"firestore-rules-author","tools":["ask_cus ...
+
+4. `agy -p x --agent no-such-agent-zz` exited 1:
+error: unknown agent "no-such-agent-zz" (available: firestore-rules-author)

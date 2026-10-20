@@ -385,6 +385,8 @@ interface ListedPlugin {
   readonly enabled: boolean;
   /** The frontmatter names of the skills that load. */
   readonly skills: ReadonlySet<string>;
+  /** The frontmatter names of the plugin's custom agents. */
+  readonly agents: ReadonlySet<string>;
 }
 
 /** Measured at about 50 ms on 1.4.0; the composer waits on this read, so a stuck CLI is cut off. */
@@ -421,9 +423,14 @@ async function listPlugins(binary?: string): Promise<ListedPlugin[] | null> {
   const plugins: ListedPlugin[] = [];
   for (const entry of parsed) {
     if (typeof entry !== "object" || entry === null) continue;
-    const { path, enabled, skills } = entry as Record<string, unknown>;
+    const { path, enabled, skills, agents } = entry as Record<string, unknown>;
     if (typeof path !== "string" || typeof enabled !== "boolean") continue;
-    plugins.push({ path, enabled, skills: new Set(stringNames(skills)) });
+    plugins.push({
+      path,
+      enabled,
+      skills: new Set(stringNames(skills)),
+      agents: new Set(stringNames(agents)),
+    });
   }
   return plugins;
 }
@@ -711,10 +718,12 @@ const AGENT_CONFIG: ConfigKind<DiscoveredAgent> = {
  * always read. An agent is `<name>.md` or `<name>/agent.md`, with the frontmatter `name` deciding
  * what `--agent` is called with. Each root's `agents.json`, and the global one, name more agents in
  * the `skills.json` shape (1.2.14, fixtures/23); the workspace files are gated by trust too.
+ * An enabled plugin's agents come from `agy plugin list --json`, run with `binary`.
  */
 export async function discoverAgents(
   cwd: string,
   geminiRoot: string,
+  binary?: string,
 ): Promise<readonly DiscoveredAgent[]> {
   const agents = new Map<string, DiscoveredAgent>();
   const keep = (found: readonly ConfiguredItem<DiscoveredAgent>[]) => {
@@ -739,6 +748,20 @@ export async function discoverAgents(
     keep(await scanAgents(join(homedir(), root)));
   }
   keep(await collectJsonConfig(join(homedir(), GLOBAL_AGENT_CONFIG_FILE), repoRoot, readConfigs, AGENT_CONFIG));
+
+  // Probed 2026-10-20 on 1.4.3 (fixtures/28): `--agent` takes a plugin agent by its bare
+  // frontmatter name, from an untrusted workspace too. Only the names agy lists load; the scan
+  // supplies their descriptions, and a listed agent kept somewhere the scan does not look is still
+  // offered. Which agent wins a name shared with a workspace or global one is unprobed. Without
+  // the list no plugin agent is offered.
+  for (const plugin of (await listPlugins(binary)) ?? []) {
+    if (!plugin.enabled || plugin.agents.size === 0) continue;
+    const scanned = await scanAgents(join(plugin.path, "agents"));
+    keep(scanned.filter(({ value }) => plugin.agents.has(value.name)));
+    for (const name of plugin.agents) {
+      if (!agents.has(name)) agents.set(name, { name, description: "" });
+    }
+  }
 
   return [...agents.values()].sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0));
 }

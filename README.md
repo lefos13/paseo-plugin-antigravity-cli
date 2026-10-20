@@ -201,7 +201,9 @@ repository root are read, nearest first; outside a repository, only the session'
 source) need that exact workspace trusted in `antigravity-cli/settings.json` (`trustedWorkspaces`) —
 on 1.2.14 a parent directory, the home directory included, trusts nothing below it — using the real
 `~/.gemini/antigravity-cli/settings.json` for the Default account, and each other account's own copy
-([Multiple accounts](#multiple-accounts)). An unknown `--agent` name
+([Multiple accounts](#multiple-accounts)). The agents of an enabled plugin are offered as
+`agy plugin list --json` names them, by their bare name and without workspace trust (agy 1.4.3).
+An unknown `--agent` name
 silently runs the default agent, and so does a profile picked after the conversation's first turn:
 agy 1.2.14 ignores `--agent` when it resumes a conversation that started without it. The two Off/On
 settings are selects rather than toggles, because a Paseo plugin toggle has no visible state; older

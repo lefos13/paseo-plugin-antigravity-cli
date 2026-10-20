@@ -719,7 +719,11 @@ async function openSession(
   const addDirs = await checkAddDirs(options.addDirs);
   // The workspace's own agents are hidden until the *session's* account trusts the workspace, and
   // that trust lives in the account's settings file, which the launch's `HOME` selects.
-  const availableAgents = await discoverAgents(config.cwd, accountGeminiRoot(accountId));
+  const availableAgents = await discoverAgents(
+    config.cwd,
+    accountGeminiRoot(accountId),
+    options.agyPath,
+  );
 
   // Computed before this session joins the map: a conversation with no timeline of this plugin's
   // own is one that already existed in Antigravity. Another open session's rows may still be
