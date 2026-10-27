@@ -100,6 +100,8 @@ import { hasEditContent, mapToolDetail, snapshotDiff } from "./tools";
 type JsonValue = string | number | boolean | null | JsonValue[] | { [key: string]: JsonValue };
 
 const PROVIDER_ID = "antigravity-cli";
+/** The name the daemon gives its own MCP server in a session's `mcpServers` (0.14). */
+const PASEO_MCP_SERVER = "paseo";
 const STDERR_TAIL = 20;
 /** Whole files remembered per session for diffing, newest last. */
 const OBSERVED_LIMIT = 32;
@@ -825,13 +827,19 @@ async function openSession(
   // record of them, and this is where the set of live sessions is known.
   await sweepMcpLedger(new Set(state.sessions.keys()));
   if (session.mcp !== "applied" && Object.keys(config.mcpServers).length > 0) {
+    // Tools other plugins attach to an agent are served only by the daemon's own server, which it
+    // always names `paseo`; without it there are no such tools to mention.
+    const attachedTools =
+      PASEO_MCP_SERVER in config.mcpServers
+        ? " Tools that other Paseo plugins attach to this agent are served by Paseo's own MCP server, so Antigravity cannot call them while sharing is off."
+        : "";
     emitNotice(
       session,
       emit,
       "mcp-unsupported",
       "warning",
       "MCP servers are not applied",
-      `Antigravity reads MCP servers from ~/.gemini/config/mcp_config.json, and from .agents/mcp_config.json in a workspace. Turn on "Share Paseo tools with Antigravity" in the session settings to have Paseo write its ${Object.keys(config.mcpServers).length} server(s) to ${mcpConfigPath(config.cwd)}, or add them yourself with \`agy mcp add\`.`,
+      `Antigravity reads MCP servers from ~/.gemini/config/mcp_config.json, and from .agents/mcp_config.json in a workspace. Turn on "Share Paseo tools with Antigravity" in the session settings to have Paseo write its ${Object.keys(config.mcpServers).length} server(s) to ${mcpConfigPath(config.cwd)}, or add them yourself with \`agy mcp add\`.${attachedTools}`,
     );
   }
   if (addDirs.dropped.length > 0) {

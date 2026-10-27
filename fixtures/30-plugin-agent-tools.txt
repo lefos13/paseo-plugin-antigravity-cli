@@ -1,0 +1,98 @@
+fixtures/30-plugin-agent-tools.txt — Paseo plugin agent tools vs. Antigravity MCP sharing (Task 6)
+Static probe 2026-10-27 of the installed daemon 0.14.0-beta.1
+(/Applications/Paseo.app/Contents/Resources/app.asar, @getpaseo/server 0.14.0-beta.1). Read-only
+source analysis: nothing from the bundle was executed, and no plugin/daemon was reloaded. A live
+check — agy actually calling a tool attached by another plugin with sharing on — is still pending;
+the orchestrator runs it.
+
+Files read (paths inside the asar; line numbers are this build's):
+  node_modules/@getpaseo/server/dist/server/server/agent/runtime-mcp-config.js
+  node_modules/@getpaseo/server/dist/server/server/agent/tools/plugin-tools.js
+  node_modules/@getpaseo/server/dist/server/server/agent/tools/paseo-tools.js
+  node_modules/@getpaseo/server/dist/server/server/agent/plugin-provider.js
+  node_modules/@getpaseo/server/dist/server/server/agent/agent-manager.js
+  node_modules/@getpaseo/server/dist/server/server/plugins/lifecycle/index.js
+  node_modules/@getpaseo/server/dist/server/server/plugins/runtime.js
+  node_modules/@getpaseo/server/dist/server/server/plugins/agent-tools.js
+  node_modules/@getpaseo/server/dist/server/server/bootstrap.js
+  node_modules/@getpaseo/plugin/dist/server/provider.d.ts (0.14.0-beta.1 SDK installed in the repo)
+
+How Paseo attaches another plugin's tool: a session-open `before` hook pushes
+`defineAgentTool(...)` into `request.tools`. The daemon keeps the metadata in memory per agent
+(`agent-manager.js:3966`, `getPluginTools` at `:426`) and serves those tools from its own agent MCP
+server: `registerPluginTools` runs only when `scope === "agent"` (`agent/tools/plugin-tools.js:4-8`),
+and the agent catalog is built from `callerAgentId` (`agent/tools/paseo-tools.js:346`, registration
+at `:2466`).
+
+(1) Which `mcpServers` entry a plugin provider's session config gets
+  One entry, named `paseo`, added at launch — not stored — by
+  `AgentManager.prepareSessionConfig` (`agent-manager.js:3914-3930`) through
+  `withRuntimePaseoMcpServer` (`agent/runtime-mcp-config.js:23-42`):
+      mcpServers.paseo = {
+        type: "http",
+        url: "http://<host>:<port>/mcp/agents?callerAgentId=<agentId>",
+        headers: { Authorization: "Bearer <agent-mcp-token>" }   // when the token is set
+      }
+  `PASEO_MCP_SERVER_NAME` is the literal `"paseo"` (`runtime-mcp-config.js:1`); the base URL is the
+  daemon's `/mcp/agents` route (`bootstrap.js:186`, `:1297`).
+  Agent scoping: per-agent by URL (`callerAgentId`), not by token. The route reads the query
+  parameter on every request and builds the catalog for that caller (`bootstrap.js:1166`,
+  `:1228-1241`); the bearer token is a single random UUID per daemon run (`bootstrap.js:418`,
+  checked at `:1203`), shared by all local agents.
+  Conditions: injection is skipped when MCP injection is off (`config.mcpInjectIntoAgents === false`
+  or `mcpEnabled` false; `bootstrap.js:1297-1305`), when the provider's Paseo-tool policy is
+  disabled (`isPaseoToolPolicyEnabled`, default enabled — `agent/paseo-tool-policy.js`), or when the
+  agent's stored config already defines a server named `paseo` (`runtime-mcp-config.js:25`). The
+  stored config never keeps the injected entry: `stripInternalPaseoMcpServer` removes it first
+  (`runtime-mcp-config.js:3-21`).
+  Plugin providers always advertise `supportsMcpServers: true` (`agent/plugin-provider.js:1310`),
+  so `requireExternalMcpSupport` (`agent-manager.js:2734`) never rejects the entry.
+  `mapSessionConfig` copies `config.mcpServers` into `ProviderSessionConfig.mcpServers`
+  (`agent/plugin-provider.js:1330-1335`).
+
+(2) Can the provider tell from its session-open input that tools were attached?
+  No. `ProviderSessionConfig` has no tools field: cwd, env, systemPrompt, mcpServers, toolPolicy,
+  model, mode, thinkingOption, settings, providerOptions, title, persist
+  (`@getpaseo/plugin/dist/server/provider.d.ts:83-104`). `session.open` sends only `config`,
+  `persistence`, `history` (`provider.d.ts:223-229`; `agent/plugin-provider.js:117-145`).
+  Attached-tool metadata stays in the daemon (`agent-manager.js:3966`) and is served only through
+  the agent MCP catalog. The daemon's `launchContext` (which carries `mcpServerOwners` and
+  `paseoTools`) is reduced to `env` for plugin providers (`plugin-provider.js:1330-1332`). Each
+  plugin's hook request is even handed fresh empties (`plugins/runtime.js:365`), and the merged
+  metadata is consumed in `buildLaunchContext` (`agent-manager.js:3943-3975`).
+  Server names do not identify tools either: `paseo` is injected even when no other plugin attached
+  anything (it also carries Paseo's built-in tools), and a `tools/list` against it cannot separate
+  plugin tools from built-ins — `registerPluginTools` publishes name/title/description/inputSchema
+  with no `pluginId` (`agent/tools/plugin-tools.js:11-25`; `plugins/agent-tools.js`
+  `serializeAgentTool`). Detection of attached tools by name would require inventing a signal, so
+  the off-path notice is general.
+
+(3) Do MCP servers added by the session-open hook arrive in `config.mcpServers` as-is?
+  Yes. An `agent.session_open` hook may change only `env`, `tools`, `mcpServers`
+  (`plugins/lifecycle/index.js:110-120`). The runtime collects every plugin's `mcpServers` with an
+  owner map (`plugins/runtime.js:363-390`); `resolveProviderLaunchConfig` merges them into the
+  launch config (`agent-manager.js:4002-4018`), rejecting a collision with `paseo` or a name already
+  saved in the agent's config (`:4005-4008`). `mapSessionConfig` then spreads the merged record
+  verbatim (`agent/plugin-provider.js:1335`). The entries keep their original
+  `{type: "stdio" | "http" | "sse", …}` shape. They are applied only to interactive opens
+  (`purpose === "interactive"`, `agent-manager.js:3965-3969`), not to history-only opens.
+  Consequence: the existing off-path notice's `Object.keys(config.mcpServers).length` already counts
+  hook-added servers, and the sharing path (`server/mcp.ts` `injectMcpServers`) writes them like any
+  other entry. No change is needed for (3).
+
+VERDICT (1) The provider's session config gets exactly one Paseo entry, `paseo`, transport `http`,
+  URL `…/mcp/agents?callerAgentId=<agentId>` plus a daemon-wide bearer token. It exists so that both
+  Paseo's built-in tools and plugin-attached tools are reachable from the agent. Only the URL is
+  per-agent.
+
+VERDICT (2) Attached tool names are invisible to the provider: no field, no label, no distinct
+  server, and no plugin marker in the MCP listing. The off-path notice cannot name the tools; it can
+  only state that plugin tools do not reach Antigravity while sharing is off.
+
+VERDICT (3) Hook-added `mcpServers` arrive unchanged in `config.mcpServers` and are already counted
+  by the notice and written by sharing. `server/mcp.ts` needs no change for this task.
+
+PENDING (live) With sharing on, ask agy to call a tool attached by another plugin. Expected: the
+plugin writes `paseo-paseo` with a `serverUrl` pointing at `/mcp/agents?callerAgentId=…`, agy lists
+the attached tool through `call_mcp_tool`/MCP, and the call executes in the owning plugin. With
+sharing off, the session shows the `mcp-unsupported` notice and the tool is not callable.

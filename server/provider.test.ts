@@ -1133,6 +1133,13 @@ describe("Paseo MCP sharing", () => {
     await openSession(connection, { mcpServers: SERVERS });
     expect(existsSync(configPath())).toBe(false);
     expect(notices(events, "mcp-unsupported")).toHaveLength(1);
+    expect(notices(events, "mcp-unsupported")[0]).toMatchObject({
+      notice: {
+        description: expect.stringContaining(
+          "Tools that other Paseo plugins attach to this agent are served by Paseo's own MCP server, so Antigravity cannot call them while sharing is off.",
+        ),
+      },
+    });
 
     await prompt(connection, "hello");
     await waitFor(() => turns(events, "completed")[0], "the first turn");
@@ -1389,6 +1396,9 @@ describe("prompt content", () => {
       (event) => event.type === "session.notice" && event.notice.id === "mcp-unsupported",
     );
     expect(notice).toMatchObject({ notice: { severity: "warning" } });
+    expect(notice).not.toMatchObject({
+      notice: { description: expect.stringContaining("other Paseo plugins") },
+    });
   });
 });
 
