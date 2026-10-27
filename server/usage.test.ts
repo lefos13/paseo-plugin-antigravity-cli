@@ -43,8 +43,9 @@ function session(env: Record<string, string>, provider = "antigravity-cli"): Usa
   return { kind: "session", provider, env };
 }
 
-const WEEKLY_USED = (1 - 0.4486817717552185) * 100;
-const THIRD_PARTY_USED = (1 - 0.8659847974777222) * 100;
+// Whole percents, as the plugin's own quota screen shows them (`client/quota-format.ts`).
+const WEEKLY_USED = 55;
+const THIRD_PARTY_USED = 13;
 
 const OK_QUOTA: QuotaResult = {
   state: "ok",

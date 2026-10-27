@@ -185,9 +185,11 @@ function windowName(bucket: QuotaBucket): { label: string; shortLabel?: string }
   return { label: bucket.name };
 }
 
+/**
+ * 0..100 in whole percents, like the plugin's own quota screen: `agy` reports a share with float
+ * noise (0.7616450190544128), which Paseo would otherwise print digit for digit.
+ */
 function usedPercent(remainingFraction: number): number {
-  // 100 - remaining * 100, not (1 - remaining) * 100: the latter loses precision near a full tank
-  // (0.95 becomes 5.000000000000004).
-  const used = 100 - remainingFraction * 100;
+  const used = Math.round(100 - remainingFraction * 100);
   return Math.min(100, Math.max(0, used));
 }
