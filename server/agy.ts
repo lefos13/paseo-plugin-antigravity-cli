@@ -1,7 +1,7 @@
 import { spawn, type ChildProcess } from "node:child_process";
-import { existsSync } from "node:fs";
+import { existsSync, statSync } from "node:fs";
 import { homedir } from "node:os";
-import { join } from "node:path";
+import { delimiter, join } from "node:path";
 import { createInterface } from "node:readline";
 import { encodeUserTurn, parseAgyLine, type AgyEvent } from "./protocol";
 
@@ -58,6 +58,70 @@ export function resolveAgyBinary(explicit?: string): string {
     if (existsSync(candidate)) return candidate;
   }
   return "agy";
+}
+
+export interface AgyBinaryLookup {
+  /** The executable a launch would use, or `null` when no candidate is a runnable file. */
+  path: string | null;
+  /** Every candidate checked, in launch order, so a status diagnostic can name them. */
+  checked: readonly string[];
+}
+
+/**
+ * The `status()` view of `resolveAgyBinary`: the same lookup order, but proving the result is a
+ * runnable file instead of leaving that to `spawn` on the first turn. No process is started.
+ *
+ * `resolveAgyBinary` returns an override verbatim even when it does not exist, because that is what
+ * the launch will try; this returns `null` there so Paseo can say which path is wrong.
+ */
+export function locateAgyBinary(explicit?: string): AgyBinaryLookup {
+  const requested = explicit?.trim();
+  if (requested) return { path: executableAgy(requested), checked: [requested] };
+  const fromEnv = process.env.PASEO_ANTIGRAVITY_BIN?.trim();
+  if (fromEnv) return { path: executableAgy(fromEnv), checked: [fromEnv] };
+  const checked: string[] = [];
+  for (const candidate of installedAgyPaths()) {
+    checked.push(candidate);
+    if (isExecutableFile(candidate)) return { path: candidate, checked };
+  }
+  checked.push("agy on PATH");
+  return { path: findOnPath("agy"), checked };
+}
+
+/** A bare name is looked up on PATH, as `spawn` would; anything with a separator is a path. */
+function executableAgy(command: string): string | null {
+  if (command.includes("/") || command.includes("\\")) {
+    return isExecutableFile(command) ? command : null;
+  }
+  return findOnPath(command);
+}
+
+function isExecutableFile(candidate: string): boolean {
+  try {
+    const info = statSync(candidate);
+    if (!info.isFile()) return false;
+    return process.platform === "win32" || (info.mode & 0o111) !== 0;
+  } catch {
+    return false;
+  }
+}
+
+function findOnPath(command: string): string | null {
+  const env = process.env;
+  const pathValue = env.PATH ?? env.Path ?? "";
+  // Windows resolves an extensionless name through PATHEXT, as `spawn` does.
+  const suffixes =
+    process.platform === "win32" && !/\.[^./\\]+$/.test(command)
+      ? (env.PATHEXT ?? ".EXE;.CMD;.BAT;.COM").split(";").filter((suffix) => suffix.length > 0)
+      : [""];
+  for (const dir of pathValue.split(delimiter)) {
+    if (!dir) continue;
+    for (const suffix of suffixes) {
+      const candidate = join(dir, `${command}${suffix}`);
+      if (isExecutableFile(candidate)) return candidate;
+    }
+  }
+  return null;
 }
 
 /**

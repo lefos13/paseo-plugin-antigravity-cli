@@ -29,7 +29,7 @@ import {
   readAccounts,
   syncShadowHome,
 } from "./accounts";
-import { AgyProcess } from "./agy";
+import { AgyProcess, locateAgyBinary } from "./agy";
 import { attachmentsDir, clearAttachments, linkUpload, writeAttachment } from "./attachments";
 import { readToolPermission } from "./agysettings";
 import {
@@ -197,6 +197,28 @@ export function createProvider(): ProviderRegistration {
     label: "Antigravity",
     description: "Run, monitor, and steer Antigravity sessions from Paseo",
     icon: "icon.svg",
+    async status() {
+      // `command` is deliberately unset: with it unset the daemon resolves no launch
+      // (ProviderRuntime.resolveLaunch returns undefined), so `request.launch` cannot be present.
+      // Sessions spawn through `resolveAgyBinary`; advertising a launch this provider would not
+      // spawn from would make `status()` disagree with the first turn. The lookup is filesystem
+      // only: no `agy` is started to answer a status check. `providerOptions.agyPath` is per
+      // session and cannot reach a provider-level status; `PASEO_ANTIGRAVITY_BIN` is the global
+      // override that can.
+      const lookup = locateAgyBinary();
+      if (lookup.path !== null) return { available: true };
+      const override = process.env.PASEO_ANTIGRAVITY_BIN?.trim();
+      const checked = override === undefined ? ` Checked ${lookup.checked.join(", ")}.` : "";
+      return {
+        available: false,
+        diagnostic:
+          (override === undefined
+            ? "agy was not found."
+            : `agy was not found at ${override} (PASEO_ANTIGRAVITY_BIN).`) +
+          checked +
+          " Install the Antigravity CLI, or set PASEO_ANTIGRAVITY_BIN to its executable path.",
+      };
+    },
     async getCatalogCacheKey(options) {
       // Catalog inputs carry no providerOptions, so a per-session `agyPath` cannot reach the
       // catalog; the key follows the resolved binary, its build, the environment override, and the

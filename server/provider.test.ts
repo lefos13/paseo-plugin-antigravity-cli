@@ -25,6 +25,7 @@ import {
   type ProviderPersistence,
   type ProviderSessionConfig,
   type ProviderSetting,
+  type ProviderStatus,
   type ProviderTimelineItem,
 } from "@getpaseo/plugin/server/provider";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -343,6 +344,30 @@ function readPrompts(): string[] {
     .filter((line) => line.trim().length > 0)
     .map((line) => JSON.parse(line) as string);
 }
+
+async function providerStatus(): Promise<ProviderStatus> {
+  const status = createProvider().status;
+  if (!status) throw new Error("provider registration has no status()");
+  return status({});
+}
+
+describe("provider status", () => {
+  it("is available when agy resolves to an executable file", async () => {
+    await expect(providerStatus()).resolves.toEqual({ available: true });
+  });
+
+  it("names the configured path and the override when agy is missing", async () => {
+    const missing = join(tempDir, "missing-agy");
+    process.env.PASEO_ANTIGRAVITY_BIN = missing;
+
+    const status = await providerStatus();
+
+    expect(status.available).toBe(false);
+    if (status.available) throw new Error("expected the provider to be unavailable");
+    expect(status.diagnostic).toContain(missing);
+    expect(status.diagnostic).toContain("PASEO_ANTIGRAVITY_BIN");
+  });
+});
 
 describe("session lifecycle", () => {
   it("opens, streams an assistant message, and completes the turn", async () => {
