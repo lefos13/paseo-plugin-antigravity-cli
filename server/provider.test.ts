@@ -1846,6 +1846,26 @@ describe("tool calls", () => {
     });
   });
 
+  it("fails a tool row agy reports as ERROR, and never settles it as completed", async () => {
+    process.env.FAKE_SCENARIO = "tool-error";
+    const { connection, events } = await connect();
+    await openSession(connection);
+    await prompt(connection, "read the missing file");
+    await waitFor(() => turns(events, "completed")[0], "the turn to complete");
+
+    // A failed call is the same step reported ACTIVE and then ERROR, and the model carries on, so
+    // the turn completing must not settle the row it already failed.
+    const calls = timelineItems(events).filter((item) => item.type === "tool_call");
+    expect(calls.map((item) => item.status)).toEqual(["running", "failed"]);
+    expect(calls[1]).toMatchObject({
+      id: calls[0]?.id,
+      callId: calls[0]?.callId,
+      name: "view_file",
+      detail: { type: "read", filePath: join(realpathSync(tempDir), "missing.md") },
+      error: { message: expect.stringContaining("no such file or directory") },
+    });
+  });
+
   it("republishes a tool call left running as canceled when the turn is interrupted", async () => {
     process.env.FAKE_SCENARIO = "tool-hang";
     const { connection, events } = await connect();
@@ -3426,6 +3446,26 @@ describe("subagents", () => {
     await waitFor(() => turns(events, "completed")[0], "the turn to complete");
 
     expect(subagentRows(events).at(-1)).toMatchObject({ status: "completed", error: null });
+    expect(childSessions(events)).toEqual([]);
+  });
+
+  it("fails a subagent's row when its call is reported as ERROR", async () => {
+    // The call never reaches a child, so nothing else would ever settle the row: the turn's own
+    // success must not turn it into a completed one.
+    process.env.FAKE_SCENARIO = "subagent-error";
+    const { connection, events } = await connect();
+    await openSession(connection);
+    await prompt(connection, "spawn a researcher");
+    await waitFor(() => turns(events, "completed")[0], "the turn to complete");
+
+    const rows = subagentRows(events);
+    expect(rows.map((row) => row.status)).toEqual(["running", "failed"]);
+    expect(rows[1]).toMatchObject({
+      id: rows[0]?.id,
+      callId: rows[0]?.callId,
+      name: "invoke_subagent",
+      error: { message: expect.stringContaining("failed to start subagent") },
+    });
     expect(childSessions(events)).toEqual([]);
   });
 

@@ -3,10 +3,12 @@ import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
 import {
+  STEP_STATE_ERROR,
   encodeUserTurn,
   isInterrupted,
   parseAgyErrorLine,
   parseAgyLine,
+  toolFailureError,
   type AgyEvent,
 } from "./protocol";
 
@@ -61,6 +63,40 @@ describe("parseAgyLine", () => {
     });
   });
 
+  it("keeps the reason agy reports for a failed tool step", () => {
+    // Since 1.4.8 a failed call arrives as the same step in ERROR, with the reason in
+    // `tool_info.error` (fixtures/17-ask-question.ndjson:7).
+    const step = loadFixture("17-ask-question.ndjson")
+      .flatMap((event) => (event.kind === "step_update" ? [event.step] : []))
+      .find((update) => update.state === STEP_STATE_ERROR);
+    expect(step).toMatchObject({
+      step_index: 4,
+      step_type: "tool",
+      tool_name: "view_file",
+      tool_info: {
+        error: {
+          type: "TOOL_ERROR",
+          message: expect.stringContaining("no such file or directory"),
+        },
+      },
+    });
+  });
+
+  it("still decodes a step whose tool error has a shape it does not know", () => {
+    // A step that says it failed must become a failed row whatever the reason looks like, so an
+    // error the decoder cannot read leaves only the reason missing.
+    const event = parseAgyLine(
+      '{"event":"step_update","step_update":{"step_index":4,"state":"ERROR","step_type":"tool","tool_name":"view_file","tool_info":{"name":"view_file","error":"boom"}}}',
+    );
+    expect(event).toMatchObject({
+      kind: "step_update",
+      step: { step_index: 4, state: "ERROR", tool_name: "view_file" },
+    });
+    expect(event?.kind).toBe("step_update");
+    if (event?.kind !== "step_update") return;
+    expect(event.step.tool_info?.error).toBeUndefined();
+  });
+
   it("rejects an init event without a usable conversation id", () => {
     // An eligibility failure reports an empty id, which would name a transcript file ".jsonl".
     expect(parseAgyLine('{"event":"init","conversation_id":"","init":{"cwd":"/tmp"}}')).toEqual({
@@ -89,6 +125,19 @@ describe("parseAgyLine", () => {
       event: "user",
       message: { role: "user", content: [{ type: "text", text: "hello" }] },
     });
+  });
+});
+
+describe("toolFailureError", () => {
+  it("keeps agy's own reason verbatim", () => {
+    expect(toolFailureError("stat /tmp/a.md: no such file or directory")).toEqual({
+      message: "stat /tmp/a.md: no such file or directory",
+    });
+  });
+
+  it("falls back to a generic line when agy names no reason", () => {
+    expect(toolFailureError(undefined)).toEqual({ message: "Tool call failed" });
+    expect(toolFailureError("   ")).toEqual({ message: "Tool call failed" });
   });
 });
 

@@ -61,11 +61,13 @@ import {
   STEP_CHECKPOINT,
   STEP_ERROR_MESSAGE,
   STEP_STATE_DONE,
+  STEP_STATE_ERROR,
   STEP_SUBAGENT,
   STEP_TOOL,
   STEP_UNKNOWN,
   isInterrupted,
   parseAgyErrorLine,
+  toolFailureError,
   type AgyErrorReport,
   type AgyEvent,
   type AgyResult,
@@ -2147,6 +2149,21 @@ function handleStepUpdate(session: Session, step: AgyStepUpdate, emit: Emit): vo
         ...(step.tool_info?.parameters ? { parameters: toJson(step.tool_info.parameters) } : {}),
       },
     };
+    // A failed call is terminal for the call but not for the turn: agy hands the error to the
+    // model, which carries on. Nothing else would settle the row, and the turn's own success would
+    // otherwise publish it as completed (`finalizeToolCalls`), so it is settled here and dropped
+    // from what the turn still holds — including the snapshot it would have diffed.
+    if (step.state === STEP_STATE_ERROR) {
+      turn.tools.delete(callId);
+      turn.snapshots.delete(callId);
+      publish(session, emit, {
+        type: "tool_call",
+        ...tool,
+        status: "failed",
+        error: toolFailureError(step.tool_info?.error?.message),
+      });
+      return;
+    }
     // The stream names the file but not the change, so the file itself is the only source for a
     // diff: snapshot it before the call runs and compare once the call reports DONE. Parameters
     // that already carry the content win, and a file that cannot be read leaves the row as is.
@@ -2276,6 +2293,10 @@ function handleSubagentStep(
   console.log(
     `[antigravity] subagent ${name} ${step.state} children=${entries.length} idx=${step.step_index}`,
   );
+  // A failed call never starts its children, and the turn's success would otherwise settle its row
+  // as completed: like any other tool row, the failure is terminal for the row here.
+  const failure =
+    step.state === STEP_STATE_ERROR ? toolFailureError(step.tool_info?.error?.message) : null;
 
   const count = Math.max(entries.length, 1);
   for (let index = 0; index < count; index += 1) {
@@ -2298,12 +2319,24 @@ function handleSubagentStep(
     if (entry.workspaceUris !== undefined) row.info.workspaceUris = entry.workspaceUris;
     if (entry.prompt !== undefined && row.log.length === 0) row.log = entry.prompt;
 
+    if (failure !== null) {
+      row.status = "failed";
+      row.error = failure;
+    }
+
     refreshSubagentRow(row);
     session.subagents.set(id, row);
-    turn.tools.set(id, row);
+    // A failed row is already settled, so it leaves the turn's open calls with nothing to do.
+    if (failure === null) turn.tools.set(id, row);
+    else turn.tools.delete(id);
     publishSubagent(session, emit, row);
 
-    if (row.status === "running" && entry.conversationId !== undefined && entry.logUri !== undefined) {
+    if (
+      failure === null &&
+      row.status === "running" &&
+      entry.conversationId !== undefined &&
+      entry.logUri !== undefined
+    ) {
       void startChildFollow(session, emit, row, entry.conversationId, entry.logUri, row.info.workspaceUris);
     }
   }

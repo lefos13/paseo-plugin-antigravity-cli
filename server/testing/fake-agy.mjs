@@ -7,10 +7,10 @@
  *   FAKE_ARGV_LOG        when set, every launch appends its argv here, one JSON array per line
  *   FAKE_ENV_FILE        when set, the launch's own `HOME` is written here as JSON, which is how a
  *                        test tells an account's shadow home from the real one (or its absence)
- *   FAKE_SCENARIO        text (default) | tool | edit | edit-applied | queued | interrupt | error
- *                        | fail | tool-hang | stdin-closed | schema | schema-invalid | subagent
- *                        | ask-question | background | background-wait | recovered-error
- *                        | error-after-answer
+ *   FAKE_SCENARIO        text (default) | tool | tool-error | edit | edit-applied | queued
+ *                        | interrupt | error | fail | tool-hang | stdin-closed | schema
+ *                        | schema-invalid | subagent | subagent-error | ask-question
+ *                        | background | background-wait | recovered-error | error-after-answer
  *   FAKE_SUBAGENT_COUNT       children the `subagent` scenario spawns (default 1)
  *   FAKE_SUBAGENT_TRANSCRIPT  what the `subagent` scenario writes for each child: valid (default),
  *                             malformed (unreadable lines only), missing (no file at all),
@@ -942,6 +942,46 @@ readline.createInterface({ input }).on("line", async (line) => {
     return;
   }
 
+  if (scenario === "subagent-error") {
+    // An `invoke_subagent` call agy reports as failed: the step is ACTIVE and then ERROR, and no
+    // child is ever started, so its row must not stay running for the turn's success to settle.
+    const child = subagentChildren(1)[0];
+    const callStep = step;
+    step += 1;
+    const toolInfo = {
+      name: "invoke_subagent",
+      parameters: {
+        Subagents: [
+          {
+            Model: "inherit",
+            Prompt: `Read the file ${child.file}`,
+            Role: child.role,
+            TypeName: child.typeName,
+          },
+        ],
+      },
+    };
+    send(
+      stepEvent(callStep, "ACTIVE", "tool", { tool_name: "invoke_subagent", tool_info: toolInfo }),
+    );
+    send(
+      stepEvent(callStep, "ERROR", "tool", {
+        tool_name: "invoke_subagent",
+        duration_seconds: 0.002,
+        tool_info: {
+          ...toolInfo,
+          error: {
+            type: "TOOL_ERROR",
+            message:
+              "declaring permissions: cortex tool invoke_subagent: convert tool call for " +
+              "permissions: model output error: invalid tool call error (invalid_args) " +
+              "failed to start subagent",
+          },
+        },
+      }),
+    );
+  }
+
   if (scenario === "tool-hang") {
     // The tool stays ACTIVE: the turn only ends when the test interrupts it, agy reports an
     // error, or the process dies.
@@ -1238,6 +1278,33 @@ readline.createInterface({ input }).on("line", async (line) => {
         duration_seconds: 0.05,
       },
     });
+  }
+
+  if (scenario === "tool-error") {
+    // Since agy 1.4.8 a failed call is the same step reported once ACTIVE and then ERROR, with the
+    // reason in `tool_info.error`; the model is told and carries on, so the turn still succeeds
+    // (fixtures/17-ask-question.ndjson).
+    const toolStep = step;
+    step += 1;
+    const path = `${process.cwd()}/missing.md`;
+    const toolInfo = { name: "view_file", parameters: { AbsolutePath: path } };
+    send(stepEvent(toolStep, "ACTIVE", "tool", { tool_name: "view_file", tool_info: toolInfo }));
+    send(
+      stepEvent(toolStep, "ERROR", "tool", {
+        tool_name: "view_file",
+        duration_seconds: 0.003918,
+        tool_info: {
+          ...toolInfo,
+          error: {
+            type: "TOOL_ERROR",
+            message:
+              "declaring permissions: cortex tool view_file: convert tool call for permissions: " +
+              "model output error: invalid tool call error (invalid_args) failed to read file: " +
+              `stat ${path}: no such file or directory`,
+          },
+        },
+      }),
+    );
   }
 
   send({

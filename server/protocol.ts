@@ -33,10 +33,22 @@ const initSchema = z.object({
     .optional(),
 });
 
+/**
+ * Why a tool call failed, as agy 1.4.8 reports it on an `ERROR` step: `{ type: "TOOL_ERROR",
+ * message }` (fixtures/17-ask-question.ndjson). The shape is kept loose and a payload the decoder
+ * cannot read becomes `undefined` rather than failing the step: a step that says it failed must
+ * still become a failed row, even when agy moves the reason around.
+ */
+const toolErrorSchema = z
+  .looseObject({ type: z.string().optional(), message: z.string().optional() })
+  .optional()
+  .catch(undefined);
+
 const toolInfoSchema = z.object({
   name: z.string().optional(),
   parameters: z.record(z.string(), z.unknown()).optional(),
   output: z.string().optional(),
+  error: toolErrorSchema,
 });
 
 /** One child an `invoke_subagent` step spawned, as the subagent line reports it. */
@@ -131,6 +143,11 @@ export const STEP_ERROR_MESSAGE = "error_message";
 
 export const STEP_STATE_ACTIVE = "ACTIVE";
 export const STEP_STATE_DONE = "DONE";
+/**
+ * A call agy reports as failed. Since 1.4.8 the failure is handed to the model, which carries on,
+ * so the step is terminal for the call but not for the turn: nothing else ever settles that call.
+ */
+export const STEP_STATE_ERROR = "ERROR";
 
 /** agy reports an interrupted turn as a failed result carrying this exact error string. */
 export const INTERRUPTED_ERROR = "interrupted";
@@ -240,4 +257,18 @@ export function encodeUserTurn(text: string): string {
 
 export function isInterrupted(result: AgyResult): boolean {
   return result.status !== "SUCCESS" && result.error === INTERRUPTED_ERROR;
+}
+
+/** What a failed tool row says when agy gave no reason of its own. */
+const TOOL_FAILURE_FALLBACK = "Tool call failed";
+
+/**
+ * The `error` payload of a failed tool row: agy's own text, as given, or a generic line when it
+ * reported none. The live stream and the transcript renderers all build the row through here, so
+ * the same failure reads the same whichever path drew it.
+ */
+export function toolFailureError(reason: string | undefined): { message: string } {
+  return {
+    message: reason !== undefined && reason.trim().length > 0 ? reason : TOOL_FAILURE_FALLBACK,
+  };
 }
