@@ -174,6 +174,9 @@ const CAPABILITIES = [
   // `--json-schema` makes agy decode the answer against a schema; the turn's last assistant row
   // then holds that JSON (see the SUCCESS branch of `handleResult`).
   "prompt.output_schema",
+  // Paseo stops an idle session's runtime after its idle hour and resumes the conversation on the
+  // next prompt; this session answers whether stopping it now would lose anything (`canStopRuntime`).
+  "session.can_stop_runtime",
   "session.configure",
   // Antigravity's own conversation index is readable, which is what makes import possible.
   "session.list",
@@ -643,6 +646,9 @@ async function dispatch(input: ProviderInput, state: ConnectionState, emit: Emit
       return;
     case "session.permission":
       await respondToPermission(input, state, emit);
+      return;
+    case "session.can_stop_runtime":
+      await answerCanStopRuntime(input, state, emit);
       return;
     case "session.configure":
       await configureSession(input, state, emit);
@@ -1851,6 +1857,103 @@ async function respondToPermission(
     verbatim: false,
     plan: false,
   });
+}
+
+/**
+ * Answers Paseo's question of whether this session's runtime can be released, after which the
+ * daemon resumes the saved conversation on the next prompt (`session.open` with this session's
+ * persistence, `--conversation` on the first launch). The reply is the event itself; there is no
+ * `request.completed` after it — the same shape as `catalog` and `sessions`.
+ *
+ * `validateAdmission` has already rejected an unknown session id, like every session-scoped input.
+ */
+async function answerCanStopRuntime(
+  input: Extract<ProviderInput, { type: "session.can_stop_runtime" }>,
+  state: ConnectionState,
+  emit: Emit,
+): Promise<void> {
+  const session = requireSession(state, input.sessionId);
+  emit({
+    type: "session.can_stop_runtime",
+    requestId: input.requestId,
+    sessionId: input.sessionId,
+    canStop: canStopRuntime(runtimeLifetime(session)),
+  });
+}
+
+/** The parts of a session that `canStopRuntime` decides on. */
+function runtimeLifetime(session: Session): RuntimeLifetime {
+  return {
+    pendingTurns: session.pendingTurns.length,
+    // A turn held by a background command is pending too; a CLI whose turn was settled from the
+    // transcript is kept only to own that command, so it is the detached CLI that survives here.
+    backgroundTask: session.detached !== null,
+    // A finished child stays in `follows` until the session closes, and a child whose transcript
+    // was given up on (degraded or lost) stays too with nothing left to read: neither is running.
+    followedChildren: [...session.follows.values()].filter(
+      (follow) => !follow.done && follow.transcript.live,
+    ).length,
+    runningSubagents: [...session.subagents.values()].filter((row) => row.status === "running").length,
+    openChildSessions: session.childSessions.size,
+    pendingPermission: session.pendingQuestion !== null || session.pendingPlan !== null,
+    interrupting: session.interrupting,
+  };
+}
+
+/**
+ * What a session would lose if Paseo released its runtime: every field is state that outlives the
+ * turn the daemon last saw. Kept apart from `Session` so the rule is tested one condition at a time.
+ */
+export interface RuntimeLifetime {
+  /** Turns written to agy that have no result yet, including lines queued behind them. */
+  pendingTurns: number;
+  /** A CLI kept alive for a background command of a turn that was already settled. */
+  backgroundTask: boolean;
+  /** Child transcripts still being followed for a running subagent. */
+  followedChildren: number;
+  /** Subagent rows the plugin has not settled yet. */
+  runningSubagents: number;
+  /** Child sessions the host still counts as live. */
+  openChildSessions: number;
+  /** A question card or plan the user has not answered. */
+  pendingPermission: boolean;
+  /** An interrupt the plugin is delivering to the CLI. */
+  interrupting: boolean;
+}
+
+/**
+ * Whether this session may be stopped and resumed from its conversation later.
+ *
+ * Answering `true` is what lets an idle Antigravity session stop costing memory. Answering it
+ * wrongly loses what the conversation on disk does not hold:
+ *
+ * - `pendingTurns`: the CLI has the line and has not reported its result, so stopping it loses the
+ *   answer nobody else will deliver.
+ * - `backgroundTask`: agy is holding a command it moved to the background; the CLI owns that
+ *   process, and stopping it kills what the user was told is running.
+ * - `followedChildren`, `runningSubagents`, `openChildSessions`: subagent work carries on after the
+ *   parent's turn and its rows come from transcript tailers living in this process; a release
+ *   would cancel children the user still sees running.
+ * - `pendingPermission`: a question or plan is answered against `pendingQuestion` / `pendingPlan`,
+ *   which a resumed session does not have, so the card could no longer be answered.
+ * - `interrupting`: the CLI is being stopped and the turns it owes their canceled result are not
+ *   settled yet.
+ *
+ * Everything else either survives the resume (the conversation id, the stored timeline, and every
+ * row already published to Paseo) or is rebuilt on open (commands, skills, MCP entries, the launch
+ * selectors). The file snapshots kept for edit diffs are not among them: they only make an already
+ * published diff more complete, and a resumed session rebuilds them as files are read.
+ */
+export function canStopRuntime(lifetime: RuntimeLifetime): boolean {
+  return (
+    lifetime.pendingTurns === 0 &&
+    !lifetime.backgroundTask &&
+    lifetime.followedChildren === 0 &&
+    lifetime.runningSubagents === 0 &&
+    lifetime.openChildSessions === 0 &&
+    !lifetime.pendingPermission &&
+    !lifetime.interrupting
+  );
 }
 
 async function closeSession(

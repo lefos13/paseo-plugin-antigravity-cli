@@ -654,6 +654,11 @@ export class SubagentTranscript {
     }
   }
 
+  /** Whether this transcript is still watched and polled; a degraded or lost child is not. */
+  get live(): boolean {
+    return !this.stopped;
+  }
+
   /**
    * Reads the transcript now, whether or not it changed: for a caller about to stop following a
    * running child, and for a host whose last subagent just finished and may have finished with it.

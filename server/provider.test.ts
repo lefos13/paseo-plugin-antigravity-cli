@@ -30,7 +30,7 @@ import {
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { z } from "zod";
 import { DEFAULT_ACCOUNT_ID, addAccount, removeAccount, setActive } from "./accounts";
-import { createProvider, resolveChildCwd } from "./provider";
+import { canStopRuntime, createProvider, resolveChildCwd, type RuntimeLifetime } from "./provider";
 import { parseTranscriptLines, renderChild } from "./subagents";
 import { writeConversationDb } from "./testing/conversation-db";
 import { installFakeSecurity, type FakeSecurity } from "./testing/fake-security";
@@ -42,6 +42,7 @@ const OFFERED = [
   "prompt.image",
   "prompt.output_schema",
   "prompt.steer",
+  "session.can_stop_runtime",
   "session.configure",
   "session.list",
   "session.persistence",
@@ -2469,6 +2470,200 @@ describe("session.configure", () => {
     const argv = readArgv();
     expect(argv[argv.indexOf("--model") + 1]).toBe("gemini-3.7-flash-low");
     expect(argv).toContain("--conversation");
+  });
+});
+
+describe("session.can_stop_runtime", () => {
+  /** Sends the request the daemon's idle sweep sends, and returns the answer it reads. */
+  async function ask(connection: ProviderConnection, events: ProviderEvent[]): Promise<boolean> {
+    const requestId = `can-stop-${events.length}`;
+    await connection.send({
+      type: "session.can_stop_runtime",
+      requestId,
+      sessionId: "session-1",
+    } as ProviderInput);
+    const reply = events.find(
+      (event) => event.type === "session.can_stop_runtime" && event.requestId === requestId,
+    );
+    expect(reply).toBeDefined();
+    return reply?.type === "session.can_stop_runtime" ? reply.canStop : false;
+  }
+
+  it("offers the capability only when the daemon negotiates it", async () => {
+    const { connection } = await connect();
+    expect(connection.capabilities).toContain("session.can_stop_runtime");
+
+    // An older daemon offers nothing, so the plugin must not select it — and a request it should
+    // never send is then refused rather than silently answered.
+    const older = await createProvider().connect({
+      versions: [1],
+      capabilities: OFFERED.filter((capability) => capability !== "session.can_stop_runtime"),
+    });
+    openConnections.push(older);
+    watchConnection(older);
+    expect(older.capabilities).not.toContain("session.can_stop_runtime");
+    await openSession(older);
+    await expect(
+      older.send({ type: "session.can_stop_runtime", requestId: "r1", sessionId: "session-1" } as ProviderInput),
+    ).rejects.toThrow("session.can_stop_runtime");
+  });
+
+  it("answers that an idle session may stop", async () => {
+    const { connection, events } = await connect();
+    await openSession(connection);
+    expect(await ask(connection, events)).toBe(true);
+
+    await prompt(connection, "hello");
+    await waitFor(() => turns(events, "completed")[0], "the turn to complete");
+    // Nothing outlives a finished turn: the conversation and its rows are on disk.
+    expect(await ask(connection, events)).toBe(true);
+  });
+
+  it("refuses while a turn is in flight", async () => {
+    process.env.FAKE_SCENARIO = "schema";
+    process.env.FAKE_SCHEMA_GATE = join(tempDir, "schema-gate");
+    const { connection, events } = await connect();
+    await openSession(connection);
+    await promptContent(connection, [{ type: "text", text: "answer" }], "m1", {
+      type: "object",
+      properties: { color: { type: "string" } },
+      required: ["color"],
+    });
+    await waitFor(() => turns(events, "started")[0], "the turn to start");
+
+    expect(await ask(connection, events)).toBe(false);
+
+    writeFileSync(process.env.FAKE_SCHEMA_GATE ?? "", "");
+    await waitFor(() => turns(events, "completed")[0], "the turn to complete");
+  });
+
+  it("refuses while a background command holds the CLI", async () => {
+    process.env.FAKE_SCENARIO = "background";
+    process.env.PASEO_ANTIGRAVITY_BACKFILL_DELAY_MS = "50";
+    process.env.FAKE_BACKGROUND_GATE = join(tempDir, "background-gate");
+    const home = join(tempDir, "home");
+    mkdirSync(home, { recursive: true });
+    process.env.HOME = home;
+    const { connection, events } = await connect();
+    await openSession(connection);
+    await prompt(connection, "start it");
+    await waitFor(() => turns(events, "completed")[0], "the held turn to complete");
+
+    // The turn is over, but the command it started is not: the CLI owning it is what would die.
+    expect(await ask(connection, events)).toBe(false);
+
+    writeFileSync(process.env.FAKE_BACKGROUND_GATE ?? "", "");
+  });
+
+  it("refuses while a question is unanswered", async () => {
+    process.env.FAKE_SCENARIO = "ask-question";
+    process.env.FAKE_QUESTION_GATE = join(tempDir, "question-gate");
+    const home = join(tempDir, "home");
+    mkdirSync(home, { recursive: true });
+    process.env.HOME = home;
+    const { connection, events } = await connect();
+    await openSession(connection);
+    await prompt(connection, "pick a colour");
+    await waitFor(
+      () => events.find((event) => event.type === "session.permission"),
+      "the question card",
+    );
+
+    // The answer is routed back through `pendingQuestion`, which a resumed session would not have.
+    expect(await ask(connection, events)).toBe(false);
+  });
+
+  it("refuses while a plan waits for an answer", async () => {
+    const { connection, events } = await connect();
+    await openSession(connection, { mode: "plan" });
+    await prompt(connection, "add a cache");
+    await waitFor(
+      () => events.find((event) => event.type === "session.permission"),
+      "the plan card",
+    );
+
+    // Approving it would start the implementing turn, which a released session would not know.
+    expect(await ask(connection, events)).toBe(false);
+  });
+
+  it("refuses for every state that outlives a turn", () => {
+    const idle: RuntimeLifetime = {
+      pendingTurns: 0,
+      backgroundTask: false,
+      followedChildren: 0,
+      runningSubagents: 0,
+      openChildSessions: 0,
+      pendingPermission: false,
+      interrupting: false,
+    };
+    expect(canStopRuntime(idle)).toBe(true);
+
+    // A line agy has not answered: its result is the only copy.
+    expect(canStopRuntime({ ...idle, pendingTurns: 1 })).toBe(false);
+    // A CLI owning a background command the turn's transcript cannot restart.
+    expect(canStopRuntime({ ...idle, backgroundTask: true })).toBe(false);
+    // A child transcript still followed: its tailer lives in this process.
+    expect(canStopRuntime({ ...idle, followedChildren: 1 })).toBe(false);
+    // A subagent row nothing has settled yet.
+    expect(canStopRuntime({ ...idle, runningSubagents: 1 })).toBe(false);
+    // A child session the host still counts as live.
+    expect(canStopRuntime({ ...idle, openChildSessions: 1 })).toBe(false);
+    // A question or plan the user can still answer.
+    expect(canStopRuntime({ ...idle, pendingPermission: true })).toBe(false);
+    // An interrupt still being delivered.
+    expect(canStopRuntime({ ...idle, interrupting: true })).toBe(false);
+  });
+
+  it("rejects a request for a session it does not have", async () => {
+    const { connection } = await connect();
+    await expect(
+      connection.send({
+        type: "session.can_stop_runtime",
+        requestId: "r1",
+        sessionId: "missing",
+      } as ProviderInput),
+    ).rejects.toThrow("Unknown session");
+  });
+
+  it("resumes the released conversation and its history after the runtime stops", async () => {
+    const conversationId = "11111111-2222-3333-4444-555555555555";
+    const { connection, events } = await connect();
+    await openSession(connection);
+    await prompt(connection, "hello");
+    await waitFor(() => turns(events, "completed")[0], "the first turn");
+    expect(await ask(connection, events)).toBe(true);
+    const persistence = events.find((event) => event.type === "session.persistence");
+    expect(persistence?.type === "session.persistence" && persistence.persistence).toBeTruthy();
+
+    // What the idle sweep does when the answer is true.
+    await connection.send({ type: "session.close", requestId: "close-1", sessionId: "session-1" });
+    await waitFor(
+      () => events.find((event) => event.type === "session.closed" && event.sessionId === "session-1"),
+      "the session to close",
+    );
+
+    // What the daemon does on the next prompt: the same persistence, history replayed.
+    const resumed = await connect();
+    await resumed.connection.send({
+      type: "session.open",
+      requestId: "open-2",
+      sessionId: "session-2",
+      config: sessionConfig(),
+      history: "replay",
+      ...(persistence?.type === "session.persistence" ? { persistence: persistence.persistence } : {}),
+    } as ProviderInput);
+    expect(
+      timelineItems(resumed.events).some(
+        (item) => item.type === "assistant_message" && item.text === "echo:hello\n",
+      ),
+    ).toBe(true);
+
+    await prompt(resumed.connection, "again", "m2", "session-2");
+    await waitFor(() => turns(resumed.events, "completed", "session-2")[0], "the resumed turn");
+    const launches = readArgvLog();
+    const resumedLaunch = launches.at(-1) ?? [];
+    expect(resumedLaunch).toContain("--conversation");
+    expect(resumedLaunch[resumedLaunch.indexOf("--conversation") + 1]).toBe(conversationId);
   });
 });
 
