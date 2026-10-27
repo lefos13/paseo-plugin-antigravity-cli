@@ -1,0 +1,51 @@
+fixtures/29a-missing-tool.*, 29b-interrupted-tool.*, 29c-failed-command.* — agy 1.4.8 tool-error probes
+Captured 2026-10-27 on `agy --version` 1.4.8. Scratch git repo under a temp dir (`git init`, no commits).
+Paths and the user name anonymized to /Users/dev and dev. No probe ran inside this plugin's repo.
+
+Command (from the scratch repo), stdin one `{"event":"user","message":{…}}` line:
+
+  agy --input-format stream-json --output-format stream-json \
+    --add-dir "$PWD" --disable-slash-commands --print-timeout 0 \
+    --dangerously-skip-permissions --model gemini-3.8-flash-low
+
+`--dangerously-skip-permissions` so no approval prompt can block a headless run. `--model` is
+passed only to keep the runs short; the default model is the account's own selection, and the
+step shapes below are the CLI's, not the model's. Transcripts were read from
+~/.gemini/antigravity-cli/brain/<conversation_id>/.system_generated/logs/transcript.jsonl (path
+verified for all three). Interrupt was SIGINT to the `agy` process, as `server/agy.ts` does.
+
+Prompts:
+  29a  "Call the tool named `frobnicate_widget` with no arguments, then tell me what happened."
+       Repeated once, forced: "Emit a tool call to `frobnicate_widget` with the argument {"x":1}
+       now. Do not reply in prose and do not use any other tool." Same outcome.
+  29b  "Use the run_command tool to run exactly `sleep 30` and nothing else. Wait for it to finish."
+       SIGINT sent 3 s after the tool step appeared.
+  29c  "Use the run_command tool to run exactly `ls /nonexistent-dir-xyz` and then tell me what it
+       printed."
+
+VERDICT (a) A made-up tool never reaches the stream: no `tool` step at all, so no state and no
+  `tool_info.error`. The model declines in prose (two different prompts) and the turn ends SUCCESS.
+  The transcript holds one PLANNER_RESPONSE with no `tool_calls`. Nothing for the plugin to render.
+
+VERDICT (b) The interrupted tool step is still `ACTIVE` when agy stops; the CLI never reports a
+  terminal state for it. The turn ends `result.status:"ERROR"`, `error:"interrupted"`, and no
+  later step runs. The transcript holds the PLANNER_RESPONSE tool call with no result entry after
+  it. The plugin already settles the open row as canceled from `isInterrupted`
+  (`finalizeToolCalls`, server/provider.ts). A resume/backfill of this transcript sees a call with
+  no result, which `renderBackfill` renders `running`: unchanged from earlier versions and out of
+  this task's scope.
+
+VERDICT (c) A command that exits non-zero is NOT an ERROR: the step is `DONE` with the failure in
+  `tool_info.output` ("Command exited with code 1.\n\nCommand output:\nls: …"). The transcript's
+  GENERIC result is `DONE` with that text and no `error`. The model's recovery arrives in the same
+  turn: one `result` event, SUCCESS, answer after the tool step. Same shape as the missing-file
+  `view_file` ERROR in fixtures/17-ask-question.ndjson:7 and fixtures/14-subagent-worktree.ndjson:9
+  (that one is `ERROR`; the recovery is still the next `agent_response` in the same turn and one
+  `result` at the end).
+
+OVERALL CANCELED VERDICT: agy 1.4.8 never emitted `CANCELED`, `CANCELLED`, or any other terminal
+step state. Over `fixtures/` after this capture
+(`grep -rho '"state":"[A-Z_]*"' fixtures | sort | uniq -c`): 139 ACTIVE, 140 DONE, 2 ERROR — the
+same three states as before. The only terminal-over-a-call states are DONE, ERROR and, for an
+interrupted turn, the result's `error:"interrupted"` with the step left ACTIVE. No new state to
+map, so no code change follows from these captures.

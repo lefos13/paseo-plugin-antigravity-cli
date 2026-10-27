@@ -1824,6 +1824,17 @@ describe("image and file attachments", () => {
   });
 });
 
+/** The three agy 1.4.8 captures of a tool that does not exist, is interrupted, and exits non-zero. */
+const MISSING_TOOL_FIXTURE = fileURLToPath(
+  new URL("../fixtures/29a-missing-tool.ndjson", import.meta.url),
+);
+const INTERRUPTED_TOOL_FIXTURE = fileURLToPath(
+  new URL("../fixtures/29b-interrupted-tool.ndjson", import.meta.url),
+);
+const FAILED_COMMAND_FIXTURE = fileURLToPath(
+  new URL("../fixtures/29c-failed-command.ndjson", import.meta.url),
+);
+
 describe("tool calls", () => {
   it("maps tool steps to native rows with a stable id across running and completed", async () => {
     process.env.FAKE_SCENARIO = "tool";
@@ -1864,6 +1875,66 @@ describe("tool calls", () => {
       detail: { type: "read", filePath: join(realpathSync(tempDir), "missing.md") },
       error: { message: expect.stringContaining("no such file or directory") },
     });
+  });
+
+  it("renders no tool row for a tool that does not exist", async () => {
+    // agy 1.4.8 never turns a call to a made-up tool into a step: the model declines in prose and
+    // the turn succeeds (fixtures/29a-missing-tool.ndjson). Nothing may be invented as a call.
+    const { connection, events } = await connect();
+    await openSession(connection, {
+      providerOptions: { agyPath: replayAgy(MISSING_TOOL_FIXTURE, []) },
+    });
+    await prompt(connection, "call frobnicate_widget");
+    await waitFor(() => turns(events, "completed")[0], "the turn to complete");
+
+    expect(timelineItems(events).filter((item) => item.type === "tool_call")).toEqual([]);
+    expect(paseoView(events).finalText).toContain("no tool by that name exists");
+    expect(turns(events, "failed")).toHaveLength(0);
+  });
+
+  it("renders the interrupted command of a captured run as canceled, as the step stays ACTIVE", async () => {
+    // agy 1.4.8 reports no terminal state for a tool it interrupts: the step is left ACTIVE and the
+    // result carries error "interrupted" (fixtures/29b-interrupted-tool.ndjson).
+    const { connection, events } = await connect();
+    await openSession(connection, {
+      providerOptions: { agyPath: replayAgy(INTERRUPTED_TOOL_FIXTURE, []) },
+    });
+    await prompt(connection, "run sleep 30");
+    await waitFor(() => turns(events, "canceled")[0], "the turn to be canceled");
+
+    const calls = timelineItems(events).filter((item) => item.type === "tool_call");
+    expect(calls.map((item) => item.status)).toEqual(["running", "canceled"]);
+    expect(calls[1]).toMatchObject({
+      id: calls[0]?.id,
+      name: "run_command",
+      detail: { type: "shell", command: "sleep 30" },
+      error: null,
+    });
+    expect(turns(events, "failed")).toHaveLength(0);
+  });
+
+  it("renders a command that exits non-zero as completed, not failed", async () => {
+    // agy 1.4.8 reports a non-zero exit as DONE with the failure in `output`, and the model
+    // recovers in the same turn (fixtures/29c-failed-command.ndjson). Only ERROR is a failed row.
+    const { connection, events } = await connect();
+    await openSession(connection, {
+      providerOptions: { agyPath: replayAgy(FAILED_COMMAND_FIXTURE, []) },
+    });
+    await prompt(connection, "list a directory that does not exist");
+    await waitFor(() => turns(events, "completed")[0], "the turn to complete");
+
+    const calls = timelineItems(events).filter((item) => item.type === "tool_call");
+    expect(calls.map((item) => item.status)).toEqual(["running", "completed"]);
+    expect(calls[1]).toMatchObject({
+      id: calls[0]?.id,
+      detail: {
+        type: "shell",
+        command: "ls /nonexistent-dir-xyz",
+        output: expect.stringContaining("Command exited with code 1."),
+      },
+      error: null,
+    });
+    expect(turns(events, "failed")).toHaveLength(0);
   });
 
   it("republishes a tool call left running as canceled when the turn is interrupted", async () => {

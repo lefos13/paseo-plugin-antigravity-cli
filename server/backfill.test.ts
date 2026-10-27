@@ -88,4 +88,32 @@ describe("renderBackfill", () => {
     expect(rows.get(3)).toMatchObject({ status: "completed", error: null });
     expect(rows.get(5)).toMatchObject({ status: "running", error: null });
   });
+
+  it("leaves a non-zero command completed and an interrupted call running, from the 1.4.8 captures", () => {
+    // 29c: `ls` exited 1, and agy wrote the result as a plain GENERIC line, so the call completed.
+    const command = new Map(
+      replay("29c-failed-command.transcript.jsonl").rows.map((row) => [row.stepIndex, row.item]),
+    );
+    expect(command.get(2)).toMatchObject({
+      type: "tool_call",
+      name: "run_command",
+      status: "completed",
+      error: null,
+      detail: { type: "shell", command: "ls /nonexistent-dir-xyz" },
+    });
+    expect(
+      [...command.values()].filter((item) => item.type === "tool_call" && item.status === "failed"),
+    ).toEqual([]);
+
+    // 29b: SIGINT ended the turn before the call's result was written, so nothing settles it.
+    const interrupted = new Map(
+      replay("29b-interrupted-tool.transcript.jsonl").rows.map((row) => [row.stepIndex, row.item]),
+    );
+    expect(interrupted.get(2)).toMatchObject({
+      type: "tool_call",
+      name: "run_command",
+      status: "running",
+      error: null,
+    });
+  });
 });
