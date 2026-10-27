@@ -24,6 +24,7 @@ import { invalidateCatalogCache } from "./server/catalog";
 import { createProvider } from "./server/provider";
 import { forgetAccountQuota, readAccountQuota } from "./server/quota";
 import { launchSignIn } from "./server/signin";
+import { createUsageSource } from "./server/usage";
 
 /**
  * Contributes the Antigravity provider and the account RPCs behind the sidebar screen. The
@@ -32,6 +33,7 @@ import { launchSignIn } from "./server/signin";
  */
 export default function contribute(server: PluginServerContext) {
   server.registerProvider(createProvider());
+  server.registerUsageSource(createUsageSource());
 
   server.handle(accountsList, () => ({
     active: readAccounts().active,

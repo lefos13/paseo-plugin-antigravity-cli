@@ -99,7 +99,7 @@ import { hasEditContent, mapToolDetail, snapshotDiff } from "./tools";
 
 type JsonValue = string | number | boolean | null | JsonValue[] | { [key: string]: JsonValue };
 
-const PROVIDER_ID = "antigravity-cli";
+export const PROVIDER_ID = "antigravity-cli";
 /** The name the daemon gives its own MCP server in a session's `mcpServers` (0.14). */
 const PASEO_MCP_SERVER = "paseo";
 const STDERR_TAIL = 20;

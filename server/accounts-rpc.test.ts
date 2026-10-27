@@ -3,6 +3,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { PluginServerContext } from "@getpaseo/plugin/server";
+import type { UsageSourceRegistration } from "@getpaseo/plugin/server/usage";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   accountsAdd,
@@ -45,6 +46,8 @@ const contracts = [
 
 /** Handlers keyed by RPC name; names are the only stable handle across module instances. */
 let handlers: Record<string, (input: never) => unknown> = {};
+/** Usage sources keyed by source id, as the daemon would receive them. */
+let usageSources: Record<string, UsageSourceRegistration> = {};
 
 let root: string;
 let paseoHome: string;
@@ -63,12 +66,16 @@ beforeEach(() => {
   clearQuotaCache();
 
   handlers = {};
+  usageSources = {};
   const register = (contract: { name: string }, handler: (input: never) => unknown) => {
     handlers[contract.name] = handler;
   };
   contribute({
     registerProvider: () => {},
     handle: register,
+    registerUsageSource: (source: UsageSourceRegistration) => {
+      usageSources[source.id] = source;
+    },
   } as unknown as PluginServerContext);
 });
 
@@ -118,6 +125,42 @@ describe("account RPC contracts", () => {
       expect(contract.name).toMatch(/^[a-z][a-z0-9._-]*$/);
       expect(handlers[contract.name]).toBeTypeOf("function");
     }
+  });
+
+  it("registers the Antigravity usage source for Paseo's usage summary", async () => {
+    const source = usageSources["antigravity-cli"];
+
+    expect(source).toMatchObject({ id: "antigravity-cli", label: "Antigravity", icon: "icon.svg" });
+    // Discovery reads the same account store as the RPCs.
+    await expect(source.discover({ kind: "global" })).resolves.toEqual([
+      {
+        key: "default",
+        label: "Default",
+        harness: "Antigravity",
+        input: { accountId: "default" },
+      },
+    ]);
+    // The daemon validates every stored locator through the source's schema.
+    expect(source.input.safeParse({ accountId: "default" }).success).toBe(true);
+    expect(source.input.safeParse({ accountId: "default", extra: true }).success).toBe(false);
+  });
+
+  it("serves usage from the existing quota cache, so a refresh adds no agy process", async () => {
+    const logPath = join(root, "usage-quota.log");
+    process.env.FAKE_QUOTA_LOG = logPath;
+    const source = usageSources["antigravity-cli"];
+
+    await expect(source.fetch({ accountId: "default" })).resolves.toMatchObject({
+      status: "available",
+      windows: expect.arrayContaining([expect.objectContaining({ id: expect.any(String) })]),
+    });
+    expect(quotaRuns(logPath)).toBe(1);
+
+    // A second Paseo refresh inside the five minutes is answered by the plugin's cache.
+    await expect(source.fetch({ accountId: "default" })).resolves.toMatchObject({
+      status: "available",
+    });
+    expect(quotaRuns(logPath)).toBe(1);
   });
 
   it("accepts only well-formed input and output", () => {
