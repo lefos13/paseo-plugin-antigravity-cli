@@ -3,6 +3,7 @@ import { readFile, stat } from "node:fs/promises";
 import { dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { ProviderTimelineItem } from "@getpaseo/plugin/server/provider";
+import { toolFailureError } from "./protocol";
 import { mapToolDetail } from "./tools";
 
 /**
@@ -67,7 +68,10 @@ export interface TranscriptEntry {
   /** The line's `type`, exactly as written. */
   readonly type: string;
   readonly content?: string;
-  /** The failure text of an `ERROR_MESSAGE` step. */
+  /**
+   * The line's `error`: the failure text of an `ERROR_MESSAGE` step, or the reason a `GENERIC`
+   * tool result was written in ERROR.
+   */
   readonly error?: string;
   readonly toolCalls: readonly TranscriptToolCall[];
 }
@@ -275,15 +279,22 @@ export function renderChild(
       }
       // The GENERIC lines between this response and the next one are its tool results, in call
       // order: the k-th result belongs to the k-th call.
-      const results: string[] = [];
+      const results: TranscriptEntry[] = [];
       for (let scan = position + 1; scan < sorted.length; scan += 1) {
         const next = sorted[scan];
         if (next === undefined || next.type !== TRANSCRIPT_GENERIC) break;
-        results.push(next.content ?? "");
+        results.push(next);
       }
       entry.toolCalls.forEach((call, index) => {
         const decoded = decodeArgs(call.args);
-        const output = results[index];
+        const result = results[index];
+        const output = result === undefined ? undefined : (result.content ?? "");
+        // A failed call's result is a GENERIC line in ERROR with the reason in `error`: the child
+        // carried on, but that call is terminal.
+        const failure =
+          result?.error !== undefined && result.error.trim().length > 0
+            ? toolFailureError(result.error)
+            : null;
         const spawned =
           call.name === INVOKE_SUBAGENT
             ? readSpawns(childItemId(context, entry.stepIndex, "spawn"), entry.stepIndex, index, decoded.parameters, output)
@@ -313,11 +324,16 @@ export function renderChild(
           },
           context.cwd,
         );
-        items.push(
-          output === undefined
-            ? { type: "tool_call", id, callId: id, name: call.name, detail, status: "running", error: null }
-            : { type: "tool_call", id, callId: id, name: call.name, detail, status: "completed", error: null },
-        );
+        items.push({
+          type: "tool_call",
+          id,
+          callId: id,
+          name: call.name,
+          detail,
+          ...(failure !== null
+            ? { status: "failed" as const, error: failure }
+            : { status: output === undefined ? ("running" as const) : ("completed" as const), error: null }),
+        });
         actions.push({
           index: actionIndex,
           toolName: call.name,

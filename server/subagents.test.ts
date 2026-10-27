@@ -143,6 +143,40 @@ describe("renderChild on the captured transcripts", () => {
     });
   });
 
+  it("fails a call whose GENERIC result carries agy's error", () => {
+    // Since agy 1.4.8 a failed call's result is written as a GENERIC line in ERROR, with the
+    // reason in `error` beside the content the call never produced
+    // (fixtures/17-ask-question.transcript.jsonl:5).
+    const error =
+      "declaring permissions: cortex tool view_file: convert tool call for permissions: " +
+      "model output error: invalid tool call error (invalid_args) failed to read file: " +
+      "stat /Users/dev/agy-subagent-probe2/a.txt: no such file or directory";
+    const text =
+      [
+        { step_index: 0, type: "USER_INPUT", content: "go" },
+        {
+          step_index: 1,
+          type: "PLANNER_RESPONSE",
+          tool_calls: [{ name: "view_file", args: { AbsolutePath: '"/Users/dev/agy-subagent-probe2/a.txt"' } }],
+        },
+        { step_index: 2, type: "GENERIC", status: "ERROR", error },
+        { step_index: 3, type: "PLANNER_RESPONSE", content: "The file is missing." },
+      ]
+        .map((line) => JSON.stringify(line))
+        .join("\n") + "\n";
+    const parsed = parseTranscriptLines(text);
+    expect(parsed.malformed).toBe(0);
+
+    const render = renderChild(parsed.entries, context("child-1"));
+    expect(render.items[1]).toMatchObject({
+      type: "tool_call",
+      id: "agy-sub:child-1:1:tool:0",
+      name: "view_file",
+      status: "failed",
+      error: { message: error },
+    });
+  });
+
   it("takes the report a child sent its parent and the summary of every call", () => {
     const render = capturedRender(CHILD_A);
     expect(render.report).toBe(

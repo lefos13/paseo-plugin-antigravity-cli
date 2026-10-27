@@ -10,7 +10,8 @@
  *   FAKE_SCENARIO        text (default) | tool | tool-error | edit | edit-applied | queued
  *                        | interrupt | error | fail | tool-hang | stdin-closed | schema
  *                        | schema-invalid | subagent | subagent-error | ask-question
- *                        | background | background-wait | recovered-error | error-after-answer
+ *                        | background | background-wait | backfill-tool-error
+ *                        | recovered-error | error-after-answer
  *   FAKE_SUBAGENT_COUNT       children the `subagent` scenario spawns (default 1)
  *   FAKE_SUBAGENT_TRANSCRIPT  what the `subagent` scenario writes for each child: valid (default),
  *                             malformed (unreadable lines only), missing (no file at all),
@@ -28,8 +29,8 @@
  *                        carries on at once, as agy does when nobody intervenes
  *   FAKE_QUESTION_EFFECT file the `ask-question` scenario writes "User Skipped" into when it carries
  *                        on, the way the captured model wrote its skip into color.txt
- *   FAKE_BACKGROUND_GATE file the `background` and `background-wait` scenarios' background task
- *                        runs until
+ *   FAKE_BACKGROUND_GATE file the `background`, `background-wait` and `backfill-tool-error`
+ *                        scenarios' background task runs until
  *   FAKE_BACKGROUND_RESUME file the `background` scenario writes its pid into once the task has
  *                        ended, when set: the transcript then carries on past the answer the way
  *                        agy does when a background task's result reaches the model, and the
@@ -1278,6 +1279,109 @@ readline.createInterface({ input }).on("line", async (line) => {
         duration_seconds: 0.05,
       },
     });
+  }
+
+  if (scenario === "backfill-tool-error") {
+    // A failed call the stream reports at once, then a command that holds the rest of the stream
+    // while the transcript carries on, as in the `background` scenario. The transcript's copy of
+    // the failed call has no error, so the stream's failed row must survive it; the transcript's
+    // next call fails with agy's reason, which only the backfill can publish (agy 1.4.8).
+    const planner = step;
+    const failed = planner + 1;
+    const held = planner + 2;
+    const next = held + 1;
+    const nextTool = next + 1;
+    step = nextTool + 1;
+    const encode = (value) => JSON.stringify(value);
+    const missing = `${process.cwd()}/missing.md`;
+    const later = `${process.cwd()}/later.md`;
+    const reason = (target) =>
+      "declaring permissions: cortex tool view_file: convert tool call for permissions: " +
+      "model output error: invalid tool call error (invalid_args) failed to read file: " +
+      `stat ${target}: no such file or directory`;
+    const path = join(
+      homedir(),
+      ".gemini",
+      "antigravity-cli",
+      "brain",
+      conversationId,
+      ".system_generated",
+      "logs",
+      "transcript.jsonl",
+    );
+    await writeChildLines(
+      path,
+      [
+        { step_index: planner - 1, source: "USER_EXPLICIT", type: "USER_INPUT", status: "DONE", content: `<USER_REQUEST>\n${text}\n</USER_REQUEST>` },
+        {
+          step_index: planner,
+          source: "MODEL",
+          type: "PLANNER_RESPONSE",
+          status: "DONE",
+          content: "Starting.",
+          tool_calls: [
+            { name: "view_file", args: { AbsolutePath: encode(missing), toolSummary: encode("View missing.md") } },
+            { name: "run_command", args: { CommandLine: encode("npm start") } },
+          ],
+        },
+        { step_index: failed, source: "MODEL", type: "GENERIC", status: "DONE", content: "File contents the stream never delivered." },
+        { step_index: held, source: "MODEL", type: "GENERIC", status: "RUNNING", content: "Tool is running as a background task with task id: task-1" },
+        {
+          step_index: next,
+          source: "MODEL",
+          type: "PLANNER_RESPONSE",
+          status: "DONE",
+          content: "Reading on.",
+          tool_calls: [
+            { name: "view_file", args: { AbsolutePath: encode(later), toolSummary: encode("View later.md") } },
+          ],
+        },
+        { step_index: nextTool, source: "MODEL", type: "GENERIC", status: "ERROR", error: reason(later) },
+      ].map((line) => JSON.stringify(line)),
+    );
+
+    send(stepEvent(planner, "DONE", "agent_response", { text_delta: "Starting.", usage: stepUsage }));
+    send(
+      stepEvent(failed, "ACTIVE", "tool", {
+        tool_name: "view_file",
+        tool_info: { name: "view_file", parameters: { AbsolutePath: missing } },
+      }),
+    );
+    send(
+      stepEvent(failed, "ERROR", "tool", {
+        tool_name: "view_file",
+        duration_seconds: 0.004,
+        tool_info: {
+          name: "view_file",
+          parameters: { AbsolutePath: missing },
+          error: { type: "TOOL_ERROR", message: reason(missing) },
+        },
+      }),
+    );
+    send(
+      stepEvent(held, "ACTIVE", "tool", {
+        tool_name: "run_command",
+        tool_info: { name: "run_command", parameters: { CommandLine: "npm start" } },
+      }),
+    );
+
+    await waitForGate("FAKE_BACKGROUND_GATE");
+    send(
+      stepEvent(held, "DONE", "tool", {
+        tool_name: "run_command",
+        tool_info: { name: "run_command", parameters: { CommandLine: "npm start" }, output: "started" },
+      }),
+    );
+    send(stepEvent(next, "DONE", "agent_response", { text_delta: "Reading on.", usage: stepUsage }));
+    send(
+      stepEvent(nextTool, "DONE", "tool", {
+        tool_name: "view_file",
+        tool_info: { name: "view_file", parameters: { AbsolutePath: later }, output: "contents" },
+      }),
+    );
+    send(stepEvent(step, "DONE", "agent_response", { text_delta: "All done.", usage: stepUsage }));
+    sendResult(turnResult(turns, "All done."));
+    return;
   }
 
   if (scenario === "tool-error") {

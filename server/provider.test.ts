@@ -4082,6 +4082,67 @@ describe("background commands", () => {
   });
 });
 
+describe("backfill tool failures", () => {
+  it("keeps a live failed row failed and publishes the transcript's own failure", async () => {
+    const home = join(tempDir, "home");
+    mkdirSync(home, { recursive: true });
+    process.env.HOME = home;
+    process.env.FAKE_SCENARIO = "backfill-tool-error";
+    process.env.PASEO_ANTIGRAVITY_BACKFILL_DELAY_MS = "50";
+    process.env.FAKE_BACKGROUND_GATE = join(tempDir, "background-gate");
+
+    const { connection, events } = await connect();
+    await openSession(connection);
+    await prompt(connection, "start it");
+
+    // The transcript names an answer the stream has not reached yet, so seeing it proves the
+    // poller rendered the conversation while the live failed row was already published.
+    await waitFor(
+      () => [...paseoView(events).messages.values()].find((text) => text === "Reading on."),
+      "the backfilled row beyond the stream",
+    );
+
+    const reads = (name: string) =>
+      timelineItems(events)
+        .filter((item) => item.type === "tool_call")
+        .filter(
+          (item) => item.detail.type === "read" && item.detail.filePath === join(realpathSync(tempDir), name),
+        );
+
+    // The stream failed this call; the transcript's GENERIC line for the same step says DONE with
+    // content. Backfill must not republish that step as completed.
+    const live = reads("missing.md");
+    expect(live.map((item) => item.status)).toEqual(["running", "failed"]);
+    expect(live.at(-1)).toMatchObject({
+      id: live[0]?.id,
+      error: { message: expect.stringContaining(`stat ${join(realpathSync(tempDir), "missing.md")}`) },
+    });
+
+    // This call is only in the transcript, whose GENERIC result is in ERROR: the backfill
+    // publishes it failed, keyed the way the stream keys the step it stands for.
+    const backfilled = reads("later.md");
+    expect(backfilled.map((item) => item.status)).toEqual(["failed"]);
+    expect(backfilled[0]).toMatchObject({
+      error: { message: expect.stringContaining(`stat ${join(realpathSync(tempDir), "later.md")}`) },
+    });
+    expect(backfilled[0]?.id).toMatch(/^agy:tool:.+:5$/);
+    expect(backfilled[0]?.callId).toBe(backfilled[0]?.id);
+
+    writeFileSync(process.env.FAKE_BACKGROUND_GATE ?? "", "");
+    await waitFor(() => turns(events, "completed")[0], "the turn to complete");
+
+    // The stream caught up and reported the transcript's step DONE. The row backfill already owns
+    // stays failed, and the live row is still exactly the stream's own two publishes.
+    expect(reads("missing.md").map((item) => item.status)).toEqual(["running", "failed"]);
+    expect(reads("later.md").map((item) => item.status)).toEqual(["failed"]);
+    expect(
+      timelineItems(events).filter(
+        (item) => item.type === "assistant_message" && item.text === "Reading on.",
+      ),
+    ).toHaveLength(1);
+  });
+});
+
 describe("plan mode", () => {
   function permissions(events: ProviderEvent[]) {
     return events.flatMap((event) => (event.type === "session.permission" ? [event.request] : []));

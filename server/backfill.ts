@@ -1,6 +1,7 @@
 import { readFile, stat } from "node:fs/promises";
 import { join } from "node:path";
 import type { ProviderTimelineItem } from "@getpaseo/plugin/server/provider";
+import { toolFailureError } from "./protocol";
 import { decodeArgs, parseTranscriptLines, type TranscriptEntry } from "./subagents";
 import { mapToolDetail } from "./tools";
 
@@ -100,6 +101,13 @@ export function renderBackfill(
       const stepIndex = entry.stepIndex + 1 + index;
       const result = byStep.get(stepIndex);
       const output = result?.type === GENERIC ? (result.content ?? "") : undefined;
+      // agy writes a failed call's result as a GENERIC line in ERROR, with the reason in `error`
+      // (fixtures/17-ask-question.transcript.jsonl:5). That result is terminal for the call even
+      // though the turn carried on.
+      const failure =
+        result?.type === GENERIC && result.error !== undefined && result.error.trim().length > 0
+          ? toolFailureError(result.error)
+          : null;
       const { parameters } = decodeArgs(call.args);
       const id = ids.tool(stepIndex);
       const detail = mapToolDetail(
@@ -114,11 +122,13 @@ export function renderBackfill(
         name: call.name,
         detail,
         metadata: { stepIndex, parameters: structuredClone(parameters) as JsonValue },
-        error: null,
       };
       rows.push({
         stepIndex,
-        item: output === undefined ? { ...base, status: "running" } : { ...base, status: "completed" },
+        item:
+          failure !== null
+            ? { ...base, status: "failed", error: failure }
+            : { ...base, status: output === undefined ? "running" : "completed", error: null },
       });
     });
   }
