@@ -1,6 +1,6 @@
 {
   "id": "antigravity-cli",
   "requirements": {
-    "paseo": ">=0.9.1"
+    "paseo": ">=0.14.0"
   }
 }
