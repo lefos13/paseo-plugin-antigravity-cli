@@ -1384,6 +1384,14 @@ describe("prompt content", () => {
     await waitFor(() => turns(events, "completed", "session-2")[0], "the resumed turn");
 
     expect(readPrompts().at(-1)).toBe("again");
+    // Nothing is prepended to a resumed conversation, so the notice saying so is not repeated.
+    expect(
+      events.flatMap((event) =>
+        event.type === "session.notice" && event.notice.id === "system-prompt-preamble"
+          ? [event.sessionId]
+          : [],
+      ),
+    ).toEqual(["session-1"]);
     expect(readArgv()).toContain("--conversation");
     expect(readArgv()[readArgv().indexOf("--conversation") + 1]).toBe(conversationId);
   });
@@ -1424,6 +1432,23 @@ describe("prompt content", () => {
     expect(notice).not.toMatchObject({
       notice: { description: expect.stringContaining("other Paseo plugins") },
     });
+  });
+
+  it("does not repeat the MCP warning when a conversation is resumed", async () => {
+    const { connection, events } = await connect();
+    await openSession(
+      connection,
+      { mcpServers: { github: { type: "stdio", command: "gh-mcp" } } },
+      { persistence: { version: 1, data: { conversationId: "11111111-2222-3333-4444-555555555555" } } },
+    );
+
+    await waitFor(
+      () => events.find((event) => event.type === "session.ready"),
+      "the session to be ready",
+    );
+    expect(
+      events.filter((event) => event.type === "session.notice" && event.notice.id === "mcp-unsupported"),
+    ).toEqual([]);
   });
 });
 

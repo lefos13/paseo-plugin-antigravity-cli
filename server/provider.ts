@@ -848,7 +848,11 @@ async function openSession(
   // Leftovers from a process that died without releasing its entries: the ledger is the only
   // record of them, and this is where the set of live sessions is known.
   await sweepMcpLedger(new Set(state.sessions.keys()));
-  if (session.mcp !== "applied" && Object.keys(config.mcpServers).length > 0) {
+  // The two notices below describe how a conversation starts, so they are shown once, when it is
+  // new. A resumed conversation already has them in its timeline, and Paseo resumes one every time
+  // it brings back a runtime it released while idle.
+  const newConversation = conversationId === null;
+  if (newConversation && session.mcp !== "applied" && Object.keys(config.mcpServers).length > 0) {
     // Tools other plugins attach to an agent are served only by the daemon's own server, which it
     // always names `paseo`; without it there are no such tools to mention.
     const attachedTools =
@@ -886,7 +890,7 @@ async function openSession(
       "This conversation already existed in Antigravity, so its earlier turns are not part of Paseo's timeline and are not replayed. Antigravity still has them, and the next reply continues the conversation.",
     );
   }
-  if (config.systemPrompt && config.systemPrompt.trim().length > 0) {
+  if (newConversation && config.systemPrompt && config.systemPrompt.trim().length > 0) {
     emitNotice(
       session,
       emit,
