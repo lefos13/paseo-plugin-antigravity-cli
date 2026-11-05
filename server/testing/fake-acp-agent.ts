@@ -86,67 +86,144 @@ export class FakeAcpAgent {
 
     this.initResult = {
       protocolVersion: 1,
-      agentCapabilities: { loadSession: true },
-      promptCapabilities: { image: true, embeddedContext: true },
-      sessionCapabilities: {
-        resume: true,
-        close: true,
-        load: true,
-        list: true,
-        additionalDirectories: true,
-      },
-      _meta: {
-        antigravity: {
-          tier: "pro",
-          systemPrompt: { append: true },
+      agentCapabilities: {
+        loadSession: true,
+        load_session: true,
+        promptCapabilities: { image: true, audio: false, embeddedContext: true },
+        sessionCapabilities: {
+          resume: {},
+          close: {},
+          load: {},
+          list: {},
+          additionalDirectories: {},
         },
+        session_capabilities: {
+          resume: {},
+          close: {},
+          load: {},
+          list: {},
+          additionalDirectories: {},
+        },
+        auth: { logout: {} },
+        _meta: { antigravity: { tier: true, systemPrompt: { append: true } } },
       },
-      authMethods: [{ id: "oauth-personal", name: "Personal" }],
+      agentInfo: { name: "Antigravity ACP Server", version: "1.5.0" },
+      authMethods: [
+        {
+          id: "oauth-personal",
+          name: "Log in with Google",
+          description: "Log in with your Google account",
+        },
+        {
+          id: "oauth-business",
+          name: "Log in with Gemini Enterprise",
+          description: "Log in with your Gemini Enterprise account",
+        },
+        {
+          id: "gemini-api-key",
+          name: "Gemini API key",
+          description: "Use an API key with Gemini Developer API",
+        },
+        {
+          id: "agent-platform",
+          name: "Gemini Enterprise Agent Platform",
+          description:
+            "Use Gemini Enterprise Agent Platform (formerly Vertex AI) with Application Default Credentials",
+        },
+      ],
       ...options.initializeResult,
     };
 
     this.newSessionResult = {
-      sessionId: "fake-session-001",
+      sessionId: "33bb33e6-aa54-40ed-87de-f4b4953dd305",
       models: {
-        currentModelId: "gemini-3.8-flash-high",
         availableModels: [
-          { id: "gemini-3.8-flash-high", name: "Gemini 3.8 Flash High" },
-          { id: "gemini-3.8-pro", name: "Gemini 3.8 Pro" },
+          { modelId: "gemini-3.8-flash-high", name: "Gemini 3.8 Flash (High)" },
+          { modelId: "gemini-3.8-flash-medium", name: "Gemini 3.8 Flash (Medium)" },
+          { modelId: "gemini-3.8-flash-low", name: "Gemini 3.8 Flash (Low)" },
         ],
+        currentModelId: "gemini-3.8-flash-high",
       },
       modes: {
         currentModeId: "default",
         availableModes: [
-          { id: "default", name: "Default" },
-          { id: "plan", name: "Plan" },
-          { id: "accept-edits", name: "Accept Edits" },
+          {
+            id: "default",
+            name: "Default",
+            description: "Ask before edits and commands, per your permission settings.",
+          },
+          {
+            id: "accept-edits",
+            name: "Accept edits",
+            description: "Approve file edits in the workspace without asking.",
+          },
+          {
+            id: "plan",
+            name: "Plan",
+            description: "Plan carefully before executing a task.",
+          },
         ],
       },
       configOptions: [
         {
           id: "model",
+          name: "Model",
+          category: "model",
           type: "select",
-          currentValue: "gemini-3.8-flash-high",
-          options: [{ value: "gemini-3.8-flash-high", name: "Gemini 3.8 Flash High" }],
+          currentValue: "gemini-3.8-flash",
+          options: [{ value: "gemini-3.8-flash", name: "Gemini 3.8 Flash" }],
         },
         {
           id: "thought_level",
+          name: "Thinking Level",
+          category: "thought_level",
           type: "select",
           currentValue: "high",
           options: [
             { value: "low", name: "Low" },
+            { value: "medium", name: "Medium" },
             { value: "high", name: "High" },
+          ],
+        },
+        {
+          id: "mode",
+          name: "Mode",
+          category: "mode",
+          type: "select",
+          currentValue: "default",
+          options: [
+            {
+              value: "default",
+              name: "Default",
+              description: "Ask before edits and commands, per your permission settings.",
+            },
+            {
+              value: "accept-edits",
+              name: "Accept edits",
+              description: "Approve file edits in the workspace without asking.",
+            },
+            {
+              value: "plan",
+              name: "Plan",
+              description: "Plan carefully before executing a task.",
+            },
           ],
         },
       ],
       _meta: {
-        antigravity: { tier: "pro" },
+        antigravity: {
+          tier: {
+            name: "Google AI Pro",
+            id: "g1-pro-tier",
+            upgradeUri: "https://antigravity.google/g1-upgrade",
+          },
+        },
       },
       ...options.newSessionResult,
     };
 
     this.resumeSessionResult = {
-      sessionId: "fake-session-001",
+      sessionId: "33bb33e6-aa54-40ed-87de-f4b4953dd305",
       ...options.resumeSessionResult,
     };
 

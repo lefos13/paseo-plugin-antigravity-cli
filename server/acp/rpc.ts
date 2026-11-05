@@ -144,7 +144,7 @@ export class JsonRpcConnection extends EventEmitter {
     });
 
     this.output.on("close", () => {
-      this.teardown(this.closeError ?? new Error("JSON-RPC output stream closed"));
+      scheduleTeardown(new Error("JSON-RPC output stream closed"));
     });
   }
 

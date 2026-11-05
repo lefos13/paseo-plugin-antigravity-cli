@@ -4,8 +4,11 @@ import { z } from "zod";
  * Zod schemas and TypeScript types for the Agent Client Protocol (ACP)
  * as implemented by Antigravity CLI (`agy acp` 1.5.0+).
  *
- * All schemas use `.passthrough()` to remain forward-compatible with
- * additional agy vendor fields or future protocol revisions.
+ * Rules:
+ * - Only strictly required fields (fields the client actually reads: e.g. sessionId,
+ *   stopReason, sessionUpdate, toolCallId, optionId) are enforced.
+ * - Everything else is marked optional and uses `.passthrough()`.
+ * - A vendor tweak in agy must not break the session.
  */
 
 // ============================================================================
@@ -45,44 +48,12 @@ export type AcpPromptContent =
 
 export const acpInitializeResultSchema = z
   .object({
-    protocolVersion: z.number(),
-    agentCapabilities: z
+    protocolVersion: z.number().optional(),
+    agentCapabilities: z.record(z.string(), z.unknown()).optional(),
+    agentInfo: z
       .object({
-        loadSession: z.boolean().optional(),
-      })
-      .passthrough()
-      .optional(),
-    promptCapabilities: z
-      .object({
-        image: z.boolean().optional(),
-        embeddedContext: z.boolean().optional(),
-      })
-      .passthrough()
-      .optional(),
-    sessionCapabilities: z
-      .object({
-        resume: z.boolean().optional(),
-        close: z.boolean().optional(),
-        load: z.boolean().optional(),
-        list: z.boolean().optional(),
-        additionalDirectories: z.boolean().optional(),
-      })
-      .passthrough()
-      .optional(),
-    _meta: z
-      .object({
-        antigravity: z
-          .object({
-            tier: z.string().optional(),
-            systemPrompt: z
-              .object({
-                append: z.boolean().optional(),
-              })
-              .passthrough()
-              .optional(),
-          })
-          .passthrough()
-          .optional(),
+        name: z.string().optional(),
+        version: z.string().optional(),
       })
       .passthrough()
       .optional(),
@@ -92,6 +63,7 @@ export const acpInitializeResultSchema = z
           .object({
             id: z.string().optional(),
             name: z.string().optional(),
+            description: z.string().optional(),
           })
           .passthrough(),
       )
@@ -107,7 +79,8 @@ export type AcpInitializeResult = z.infer<typeof acpInitializeResultSchema>;
 
 export const acpModelInfoSchema = z
   .object({
-    id: z.string(),
+    modelId: z.string().optional(),
+    id: z.string().optional(),
     name: z.string().optional(),
   })
   .passthrough();
@@ -116,7 +89,7 @@ export type AcpModelInfo = z.infer<typeof acpModelInfoSchema>;
 
 export const acpModeInfoSchema = z
   .object({
-    id: z.string(),
+    id: z.string().optional(),
     name: z.string().optional(),
     description: z.string().optional(),
   })
@@ -124,21 +97,22 @@ export const acpModeInfoSchema = z
 
 export type AcpModeInfo = z.infer<typeof acpModeInfoSchema>;
 
+export const acpConfigOptionOptionSchema = z
+  .object({
+    value: z.string().optional(),
+    name: z.string().optional(),
+    description: z.string().optional(),
+  })
+  .passthrough();
+
 export const acpConfigOptionSchema = z
   .object({
-    id: z.string(),
+    id: z.string().optional(),
+    name: z.string().optional(),
+    category: z.string().optional(),
     type: z.string().optional(),
     currentValue: z.unknown().optional(),
-    options: z
-      .array(
-        z
-          .object({
-            value: z.string(),
-            name: z.string().optional(),
-          })
-          .passthrough(),
-      )
-      .optional(),
+    options: z.array(acpConfigOptionOptionSchema).optional(),
   })
   .passthrough();
 
@@ -162,17 +136,7 @@ export const acpNewSessionResultSchema = z
       .passthrough()
       .optional(),
     configOptions: z.array(acpConfigOptionSchema).optional(),
-    _meta: z
-      .object({
-        antigravity: z
-          .object({
-            tier: z.string().optional(),
-          })
-          .passthrough()
-          .optional(),
-      })
-      .passthrough()
-      .optional(),
+    _meta: z.record(z.string(), z.unknown()).optional(),
   })
   .passthrough();
 
@@ -192,8 +156,8 @@ export type AcpResumeSessionResult = z.infer<typeof acpResumeSessionResultSchema
 
 export const acpTextContentSchema = z
   .object({
-    type: z.literal("text"),
-    text: z.string(),
+    type: z.string().optional(),
+    text: z.string().optional(),
   })
   .passthrough();
 
@@ -202,7 +166,7 @@ export type AcpTextContent = z.infer<typeof acpTextContentSchema>;
 export const acpDiffContentSchema = z
   .object({
     type: z.literal("diff"),
-    path: z.string(),
+    path: z.string().optional(),
     oldText: z.string().optional(),
     newText: z.string().optional(),
   })
@@ -212,21 +176,15 @@ export type AcpDiffContent = z.infer<typeof acpDiffContentSchema>;
 
 export const acpToolLocationSchema = z
   .object({
-    path: z.string(),
+    path: z.string().optional(),
   })
   .passthrough();
 
 export const acpToolCallUpdateSchema = z
   .object({
-    sessionUpdate: z.union([z.literal("tool_call"), z.literal("tool_call_update")]),
+    sessionUpdate: z.string(),
     toolCallId: z.string(),
-    status: z.union([
-      z.literal("pending"),
-      z.literal("in_progress"),
-      z.literal("completed"),
-      z.literal("failed"),
-      z.string(),
-    ]),
+    status: z.string().optional(),
     kind: z.string().optional(),
     title: z.string().optional(),
     locations: z.array(acpToolLocationSchema).optional(),
@@ -243,12 +201,8 @@ export type AcpToolCallUpdate = z.infer<typeof acpToolCallUpdateSchema>;
 
 export const acpMessageChunkUpdateSchema = z
   .object({
-    sessionUpdate: z.union([
-      z.literal("user_message_chunk"),
-      z.literal("agent_message_chunk"),
-      z.literal("agent_thought_chunk"),
-    ]),
-    content: acpTextContentSchema,
+    sessionUpdate: z.string(),
+    content: acpTextContentSchema.optional(),
   })
   .passthrough();
 
@@ -257,14 +211,16 @@ export type AcpMessageChunkUpdate = z.infer<typeof acpMessageChunkUpdateSchema>;
 export const acpAvailableCommandsUpdateSchema = z
   .object({
     sessionUpdate: z.literal("available_commands_update"),
-    availableCommands: z.array(
-      z
-        .object({
-          name: z.string(),
-          description: z.string().optional(),
-        })
-        .passthrough(),
-    ),
+    availableCommands: z
+      .array(
+        z
+          .object({
+            name: z.string().optional(),
+            description: z.string().optional(),
+          })
+          .passthrough(),
+      )
+      .optional(),
   })
   .passthrough();
 
@@ -273,7 +229,7 @@ export type AcpAvailableCommandsUpdate = z.infer<typeof acpAvailableCommandsUpda
 export const acpCurrentModeUpdateSchema = z
   .object({
     sessionUpdate: z.literal("current_mode_update"),
-    currentModeId: z.string(),
+    currentModeId: z.string().optional(),
   })
   .passthrough();
 
@@ -282,7 +238,7 @@ export type AcpCurrentModeUpdate = z.infer<typeof acpCurrentModeUpdateSchema>;
 export const acpConfigOptionUpdateSchema = z
   .object({
     sessionUpdate: z.literal("config_option_update"),
-    configOptions: z.array(acpConfigOptionSchema),
+    configOptions: z.array(acpConfigOptionSchema).optional(),
   })
   .passthrough();
 
@@ -330,14 +286,8 @@ export type AcpSessionUpdateNotification = z.infer<typeof acpSessionUpdateNotifi
 export const acpPermissionOptionSchema = z
   .object({
     optionId: z.string(),
-    name: z.string(),
-    kind: z.union([
-      z.literal("allow_once"),
-      z.literal("allow_always"),
-      z.literal("reject_once"),
-      z.literal("reject_always"),
-      z.string(),
-    ]),
+    name: z.string().optional(),
+    kind: z.string().optional(),
   })
   .passthrough();
 
@@ -345,9 +295,9 @@ export type AcpPermissionOption = z.infer<typeof acpPermissionOptionSchema>;
 
 export const acpRequestPermissionParamsSchema = z
   .object({
-    sessionId: z.string(),
+    sessionId: z.string().optional(),
     toolCall: z.unknown().optional(),
-    options: z.array(acpPermissionOptionSchema),
+    options: z.array(acpPermissionOptionSchema).optional(),
   })
   .passthrough();
 
@@ -364,17 +314,11 @@ export interface AcpRequestPermissionResult {
 
 export const acpElicitationParamsSchema = z
   .object({
-    sessionId: z.string(),
+    sessionId: z.string().optional(),
     toolCallId: z.string().optional(),
-    mode: z.string(),
+    mode: z.string().optional(),
     message: z.string().optional(),
-    requestedSchema: z
-      .object({
-        type: z.literal("object").optional(),
-        properties: z.record(z.string(), z.unknown()).optional(),
-      })
-      .passthrough()
-      .optional(),
+    requestedSchema: z.record(z.string(), z.unknown()).optional(),
   })
   .passthrough();
 

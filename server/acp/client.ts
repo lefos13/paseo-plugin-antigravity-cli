@@ -102,6 +102,10 @@ export class AgyAcpClient extends EventEmitter {
   private closeEmitted = false;
   private exitPromise: Promise<void> | null = null;
   private resolveExit: (() => void) | null = null;
+  private readersPending = 0;
+  private processExited = false;
+  private reportedExit = false;
+  private exitInfo: AgyAcpExitInfo | null = null;
   private readonly stderrBuffer: string[] = [];
   private readonly maxStderrLines: number;
   private readonly closeSessionTimeoutMs: number;
@@ -181,6 +185,10 @@ export class AgyAcpClient extends EventEmitter {
     this.exitPromise = new Promise<void>((resolve) => {
       this.resolveExit = resolve;
     });
+    this.readersPending = 0;
+    this.processExited = false;
+    this.reportedExit = false;
+    this.exitInfo = null;
 
     if (child.stderr) {
       const reader = createInterface({ input: child.stderr });
@@ -191,6 +199,11 @@ export class AgyAcpClient extends EventEmitter {
           this.emit("stderr", trimmed);
         }
       });
+      reader.on("close", () => {
+        this.readersPending -= 1;
+        this.reportExitIfDrained();
+      });
+      this.readersPending += 1;
     }
 
     child.stdin?.on("error", (error) => {
@@ -201,31 +214,15 @@ export class AgyAcpClient extends EventEmitter {
       this.recordStderr(`failed to launch ${binary}: ${error.message}`);
       this.emit("crash", error);
       this.connection?.close(error);
-      this.resolveExit?.();
-      this.resolveExit = null;
-      this.child = null;
+      this.processExited = true;
+      this.readersPending = 0;
+      this.reportExitIfDrained();
     });
 
     child.on("exit", (code, signal) => {
-      const exitInfo: AgyAcpExitInfo = { code, signal };
-      this.emit("exit", exitInfo);
-
-      if (code !== 0 && code !== null) {
-        const tailSummary =
-          this.stderrBuffer.length > 0
-            ? `:\n${this.stderrBuffer.slice(-5).join("\n")}`
-            : "";
-        const err = new Error(
-          `agy acp exited with code ${code}${signal ? ` (signal ${signal})` : ""}${tailSummary}`,
-        );
-        this.connection?.close(err);
-      } else {
-        this.connection?.close(new Error("agy acp process exited"));
-      }
-
-      this.resolveExit?.();
-      this.resolveExit = null;
-      this.child = null;
+      this.exitInfo = { code, signal };
+      this.processExited = true;
+      this.reportExitIfDrained();
     });
 
     if (!child.stdout || !child.stdin) {
@@ -512,6 +509,39 @@ export class AgyAcpClient extends EventEmitter {
     if (this.closeEmitted) return;
     this.closeEmitted = true;
     this.emit("close");
+  }
+
+  private reportExitIfDrained(): void {
+    if (this.reportedExit) return;
+    if (!this.processExited) return;
+    // Drain pending stderr only when the process exited on its own (signal === null) to ensure
+    // buffered messages are captured. If killed by a signal, child processes (e.g. sleep) might
+    // hold stderr open, so report exit immediately.
+    if (this.readersPending > 0 && this.exitInfo?.signal === null) {
+      return;
+    }
+    this.reportedExit = true;
+
+    const exitInfo = this.exitInfo ?? { code: null, signal: null };
+    this.emit("exit", exitInfo);
+
+    if (exitInfo.code !== 0 && exitInfo.code !== null) {
+      const tailSummary =
+        this.stderrBuffer.length > 0
+          ? `:\n${this.stderrBuffer.slice(-5).join("\n")}`
+          : "";
+      const err = new Error(
+        `agy acp exited with code ${exitInfo.code}${exitInfo.signal ? ` (signal ${exitInfo.signal})` : ""}${tailSummary}`,
+      );
+      this.connection?.close(err);
+    } else {
+      this.connection?.close(new Error("agy acp process exited"));
+    }
+
+    this.child = null;
+    const resolve = this.resolveExit;
+    this.resolveExit = null;
+    resolve?.();
   }
 
   private recordStderr(line: string): void {
