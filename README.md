@@ -1,13 +1,13 @@
 # Antigravity CLI provider for Paseo
 
 Runs Google's official Antigravity CLI (`agy`) as a Paseo provider: Paseo owns the session, the CLI
-does the work, and every turn, tool call, and message is rendered from the CLI's `stream-json`
-protocol. Nothing about Antigravity is reimplemented — the plugin spawns the `agy` binary that is
+does the work, and every turn, tool call, and message is rendered through `agy acp` (or the legacy
+`stream-json` protocol). Nothing about Antigravity is reimplemented — the plugin spawns the `agy` binary that is
 already installed and signed in on your machine.
 
 - Provider id: `antigravity-cli`
 - Requires: Paseo ≥ 0.9.1 (provider protocol version 1), Node 24 for the plugin process, and
-  Antigravity CLI 1.2.9–1.3.5 for the behaviour described below (`/compact` and *Auto* mode need 1.3.5). The plugin also ships a client
+  Antigravity CLI ≥ 1.5.0 for the default ACP driver (or 1.2.9–1.3.5 for the legacy NDJSON driver). The plugin also ships a client
   entry (the [accounts screen](#multiple-accounts)), so the connected Paseo **app** must satisfy the
   same minimum — a compatible daemon does not make an older app compatible.
 
@@ -34,7 +34,8 @@ Check it with `paseo plugin ls`; `antigravity-cli` should be `running`. `agy --v
 [Multiple accounts](#multiple-accounts).
 
 Unlike [`agy-provider`](https://paseo.cafe/plugins/agy-provider), which adapts Antigravity's ACP
-server through Paseo's ACP shim, this plugin drives the `agy` CLI directly over its documented
+server through Paseo's ACP shim, this plugin connects to the `agy` CLI directly over its native
+Agent Client Protocol server (`agy acp`, default, requiring `agy` ≥ 1.5.0) or its legacy headless
 `stream-json` mode. The `agy` it launches is the first of `providerOptions.agyPath`,
 `PASEO_ANTIGRAVITY_BIN`, the installer's location — `~/.local/bin/agy`, or on Windows
 `%LOCALAPPDATA%\agy\bin\agy.exe` — (checked explicitly, because a daemon started by a GUI app often
@@ -42,13 +43,15 @@ has no such directory on `PATH`), then `agy` from `PATH`.
 
 ## What the plugin supports
 
-One `agy` process per session: each prompt is one NDJSON turn and exactly one `result` back, and a
-prompt sent while a turn runs is queued by the CLI as the next turn. Model, tier, mode, and settings
-are launch flags, so a change restarts the CLI on the next turn and resumes the same conversation;
-Antigravity conversations can be imported read-only, the conversation id agy reports is persisted,
-each subagent becomes a child session ([Subagents](#subagents)), and `permission` covers plan approval
-and the questions agy cannot ask ([Questions](#questions-ask_question)). Images and uploaded files go
-over by file, because a `stream-json` turn carries text only.
+By default, the plugin connects to `agy acp`: each session communicates over ACP with steering
+messages supported mid-turn, so you can steer a running turn directly. On ACP, structured output
+prompts run as isolated one-shot turns, and MCP sharing is passed directly during initialization.
+If the installed `agy` is older than 1.5.0, sessions automatically fall back to the legacy NDJSON
+driver (`stream-json`), where prompts run as sequential turns and mid-turn messages are queued.
+Model, tier, mode, and settings are configured per-agent; Antigravity conversations can be imported
+read-only, the conversation id agy reports is persisted, each subagent becomes a child session
+([Subagents](#subagents)), and `permission` covers plan approval and interactive cards.
+Images and uploaded files go over by file.
 
 Models come from `agy models` (cached ten minutes; `force` rediscovers), so the composer offers one
 model per family with the tiers that family has — High, Medium and Low today. `providerOptions.effort`
@@ -98,23 +101,18 @@ In Plan mode the question comes first and the plan card follows the answer turn.
 
 ### Background commands
 
-When the model starts a long-running command in the background, agy holds back every later step until
-it exits. After 5 s of that the plugin reads the conversation's own transcript and publishes the held
-steps, so the turn keeps showing progress.
+When the model starts a long-running command in the background:
 
-If the model's answer is only "waiting for it to finish" (agy's own instruction right after the
-launch, even when the model checks on the task or reads its log first), the turn stays running: agy
-waits for the command itself (up to 30 minutes), hands the model its result, and the model finishes
-the same turn. Once the command ends the plugin goes back to the stream. A message sent meanwhile is
-queued behind the turn, as with any running turn.
-
-If the model answers after doing other work, such as a dev server started and then checked, the turn
-completes as soon as the transcript shows that answer. The CLI holding the command is left running, so
-the server stays up (a notice says so), but it cannot take another turn: your next message stops it,
-and the command with it, and resumes the conversation in a fresh CLI. When that command finishes
-later, agy hands its result to the model, which carries on in the answered turn; the plugin stops the
-CLI at the first step past the answer, with a notice, so nothing runs that you cannot see. Send a
-message such as "continue" to pick up from there.
+- **On ACP (default):** When a command is backgrounded and the turn finishes, Paseo monitors the
+  conversation transcript. When the command completes, Paseo updates the command's tool row with its
+  actual output and status, and automatically starts an auto-continue turn
+  (`[Automatic message from Paseo] Background command "<command>" finished...`) so the model can continue
+  the work without manual user action. Multiple task completions arriving within ~2 s are coalesced into
+  a single continuation prompt.
+- **On NDJSON (legacy):** agy holds back every later step until it exits. After 5 s of that the plugin
+  reads the conversation's own transcript and publishes the held steps, so the turn keeps showing progress.
+  If the model answers after doing other work, the CLI holding the command is left running until the user
+  sends another message.
 
 ## Subagents
 
@@ -125,6 +123,12 @@ each tool call with its result, the errors agy recorded in the subagent's run, w
 compacted, and the final answer. A child spawned with `Workspace: branch` runs in
 its own git worktree, which becomes that child session's working directory; a `Workspace: inherit`
 child keeps the parent's.
+
+On ACP sessions, when a subagent finishes after the parent turn ended, the plugin automatically prompts
+the parent session with an auto-continue message containing the subagent's role and final reply
+(`[Automatic message from Paseo] Subagent "<Role>" finished. Its final reply:...`). Multiple completions
+arriving within ~2 s are coalesced. If the user messages while a continuation is pending, the automatic
+message is dropped. A safety cap pauses automatic continuations after 5 consecutive turns without a user message.
 
 A subagent that starts subagents of its own nests them: its timeline gets a row per grandchild, and
 each grandchild is a child session of that subagent, to any depth. agy's stream only names the
@@ -168,15 +172,17 @@ turn relaunches with it.
 
 ## What it cannot do, and why
 
-- **Steering** is impossible: a line written to agy's stdin while a turn runs is queued as the *next*
-  turn — even with `"queuedMessages": "send-immediately"`, which agy 1.2.14 applies in its terminal UI
+- **Steering on legacy NDJSON:** Steering messages into a running turn is supported on the default ACP
+  driver. Over the legacy NDJSON driver, a line written to agy's stdin while a turn runs is queued as the
+  *next* turn — even with `"queuedMessages": "send-immediately"`, which agy 1.2.14 applies in its terminal UI
   only — so Paseo replaces the active turn instead of offering to steer it.
-- **Structured output needs an object**: agy 1.2.14 refuses a `--json-schema` whose root is not
+- **Structured output needs an object**: agy refuses a `--json-schema` whose root is not
   `"type": "object"`, so such a prompt fails with `code: "schema_unsupported"` before the CLI is
-  touched. A root that lists `properties` without a `type` gets `"type": "object"` added.
+  touched. On ACP, structured output prompts run as an isolated one-shot process. A root that lists
+  `properties` without a `type` gets `"type": "object"` added.
 - **Tool permission prompts** cannot be surfaced either — agy resolves tool approval internally from
   its own `toolPermission` setting. Choose the behaviour in session settings.
-- **Rewind**: Antigravity's `/rewind` is interactive-only; nothing in `stream-json` exposes it.
+- **Rewind**: Antigravity's `/rewind` is interactive-only; neither driver exposes it.
 - **Shared-installer skills** (`~/.agents/skills/`) are offered and expanded by the plugin, not the
   CLI: the turn is sent the `SKILL.md` body, capped at 64 KiB (a larger one fails with
   `code: "skill_too_large"`).
@@ -185,9 +191,10 @@ turn relaunches with it.
 
 | Setting | Behaviour |
 |---|---|
+| **Transport** | *ACP (default)* / *NDJSON (legacy)*; selects the driver transport for the session. Requires `agy` ≥ 1.5.0 for ACP. Can be defaulted to NDJSON globally via `PASEO_ANTIGRAVITY_TRANSPORT=ndjson`. |
 | **Tool approval** | Default *Use Antigravity setting*, no flag; *Skip all permissions* passes `--dangerously-skip-permissions`. |
 | **Sandbox** | Off/On; *On* passes `--sandbox`. |
-| **Share Paseo tools with Antigravity** | Off/On, *Off* by default — see [MCP sharing](#sharing-paseos-mcp-servers-opt-in). |
+| **Share Paseo tools with Antigravity** | Off/On, *Off* by default — on ACP, tools are shared directly with `agy acp`; on NDJSON, written to `.agents/mcp_config.json`. See [MCP sharing](#sharing-paseos-mcp-servers-opt-in). |
 | **Agent profile** | An optional select of the custom agents `agy` has here; *Default* passes no `--agent`. |
 
 The select only offers what `agy` will launch: agents under the workspace's `.agents/agents/` and its
@@ -325,17 +332,17 @@ Limitations:
 
 Antigravity reads MCP servers from `~/.gemini/config/mcp_config.json` and from
 `<dir>/.agents/mcp_config.json` for each directory it was given. With **Share Paseo tools with
-Antigravity** on, the plugin writes Paseo's `mcpServers` into `<cwd>/.agents/mcp_config.json` as
-`paseo-<name>` entries before the CLI starts.
+Antigravity** on:
 
-- Off by default, and those entries hold whatever credentials the servers use, so inside a git work
-  tree the plugin adds the file's path, relative to the repository root, to that repository's own
-  `.git/info/exclude`: `git add .` then treats it like a `.gitignore` line and the token in it cannot
-  be committed by accident. The plugin never edits `.gitignore` and removes its lines when the last
-  Paseo session there closes; outside a git work tree, keep the file out of your commits yourself.
-- On the last `session.close` the plugin removes only its own entries, deletes the file only if it
-  created it, never overwrites one that is not valid JSON, and `agy mcp list` will not show these
-  entries because it reads only your global config — look at `<cwd>/.agents/mcp_config.json`.
+- **On ACP (default):** Paseo passes configured MCP servers directly to `agy acp` during session
+  initialization. No `.agents/mcp_config.json` file is written to disk, and credentials remain in memory.
+- **On NDJSON (legacy):** The plugin writes Paseo's `mcpServers` into `<cwd>/.agents/mcp_config.json` as
+  `paseo-<name>` entries before the CLI starts. Inside a git work tree the plugin adds the file's path,
+  relative to the repository root, to that repository's own `.git/info/exclude`: `git add .` then treats
+  it like a `.gitignore` line and the token in it cannot be committed by accident. The plugin never
+  edits `.gitignore` and removes its lines when the last Paseo session there closes; outside a git work
+  tree, keep the file out of your commits yourself. On the last `session.close` the plugin removes only
+  its own entries and deletes the file only if it created it.
 
 ## Files the plugin writes
 
