@@ -5,6 +5,7 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import type {
   ProviderCapability,
   ProviderEvent,
+  ProviderInput,
   ProviderPrompt,
   ProviderSessionConfig,
   ProviderTimelineItem,
@@ -16,6 +17,7 @@ import {
   buildSettings,
   ACP_CAPABILITIES,
   CAPABILITIES,
+  IMPLEMENT_PLAN_TEXT,
 } from "../provider";
 import type { AcpPromptResult } from "./schema";
 import { createAcpConnection, type AcpConnectionOptions } from "./session";
@@ -1220,6 +1222,1181 @@ describe("ACP Session & Connection (Phase 3a)", () => {
     expect(fakeAgent.requestsFor("session/close")).toHaveLength(1);
     expect(events.some((e) => e.type === "session.closed" && e.sessionId === "s1")).toBe(true);
     expect(events.some((e) => e.type === "request.completed" && e.requestId === "req-close")).toBe(true);
+
+    await connection.close();
+  });
+});
+
+describe("ACP Cards & Interactive Flows (Phase 3b)", () => {
+  let tempDir: string;
+  let fakeAgent: FakeAcpAgent;
+  let events: ProviderEvent[];
+  let options: AcpConnectionOptions;
+
+  beforeEach(() => {
+    tempDir = mkdtempSync(join(tmpdir(), "acp-cards-test-"));
+    fakeAgent = new FakeAcpAgent({ enableSteering: true });
+    events = [];
+    options = {
+      transport: fakeAgent.clientTransport,
+    };
+  });
+
+  afterEach(() => {
+    fakeAgent.close();
+    try {
+      rmSync(tempDir, { recursive: true, force: true });
+    } catch {
+      // Best effort cleanup
+    }
+  });
+
+  function makeConfig(overrides: Partial<ProviderSessionConfig> = {}): ProviderSessionConfig {
+    return {
+      cwd: tempDir,
+      env: {},
+      mcpServers: {},
+      settings: {},
+      persist: true,
+      ...overrides,
+    };
+  }
+
+  function permissions(): Extract<ProviderEvent, { type: "session.permission" }>[] {
+    return events.filter(
+      (e): e is Extract<ProviderEvent, { type: "session.permission" }> => e.type === "session.permission",
+    );
+  }
+
+  function resolvedPermissions(): Extract<ProviderEvent, { type: "session.permission_resolved" }>[] {
+    return events.filter(
+      (e): e is Extract<ProviderEvent, { type: "session.permission_resolved" }> =>
+        e.type === "session.permission_resolved",
+    );
+  }
+
+  function timelineItems(): ProviderTimelineItem[] {
+    return events
+      .filter((e): e is Extract<ProviderEvent, { type: "timeline.item" }> => e.type === "timeline.item")
+      .map((e) => e.item);
+  }
+
+  async function waitFor<T>(predicate: () => T | undefined, label: string, timeoutMs = 3000): Promise<T> {
+    const start = Date.now();
+    while (Date.now() - start < timeoutMs) {
+      const val = predicate();
+      if (val !== undefined) return val;
+      await new Promise((r) => setTimeout(r, 10));
+    }
+    throw new Error(`Timed out waiting for ${label}`);
+  }
+
+  async function waitForTurnCompletion(
+    sessionId = "s1",
+    turnId?: string,
+    timeoutMs = 3000,
+  ): Promise<Extract<ProviderEvent, { type: "session.turn" }>> {
+    const start = Date.now();
+    while (Date.now() - start < timeoutMs) {
+      const turns = events.filter(
+        (e): e is Extract<ProviderEvent, { type: "session.turn" }> =>
+          e.type === "session.turn" &&
+          e.sessionId === sessionId &&
+          (e.state === "completed" || e.state === "failed" || e.state === "canceled"),
+      );
+      if (turnId) {
+        const match = turns.find((t) => t.turnId === turnId);
+        if (match) return match;
+      } else if (turns.length > 0) {
+        return turns[turns.length - 1];
+      }
+      await new Promise((r) => setTimeout(r, 10));
+    }
+    throw new Error(`Timed out waiting for turn completion in session ${sessionId}`);
+  }
+
+  it("permission allow: maps request_permission onto Paseo permission request and resolves allow_once on allow", async () => {
+    const connection = createAcpConnection(ACP_CAPABILITIES, options);
+    connection.onEvent((e) => events.push(e));
+
+    await connection.send({
+      type: "session.open",
+      requestId: "r1",
+      sessionId: "s1",
+      config: makeConfig(),
+      history: "skip",
+    });
+
+    let recordedOutcome: any = null;
+
+    fakeAgent.setPromptHandler(async ({ sessionId }) => {
+      fakeAgent.emitToolCall(sessionId, "call_275190", "pending", {
+        name: "write_file",
+        args: { Content: "hi\n", Path: "/private/tmp/x/hello.txt" },
+        kind: "edit",
+        title: "File hello.txt",
+        locations: [{ path: "/private/tmp/x/hello.txt" }],
+      });
+
+      const outcome = await fakeAgent.requestPermission({
+        sessionId,
+        toolCall: {
+          sessionUpdate: "tool_call",
+          toolCallId: "call_275190",
+          name: "write_file",
+          args: { Content: "hi\n", Path: "/private/tmp/x/hello.txt" },
+          status: "pending",
+          kind: "edit",
+          title: "File hello.txt",
+          locations: [{ path: "/private/tmp/x/hello.txt" }],
+        },
+        options: [
+          { optionId: "allow", name: "Allow", kind: "allow_once" },
+          { optionId: "deny", name: "Deny", kind: "reject_once" },
+        ],
+      });
+
+      recordedOutcome = outcome;
+      fakeAgent.emitToolCall(sessionId, "call_275190", "completed");
+      return { stopReason: "end_turn" };
+    });
+
+    await connection.send({
+      type: "session.prompt",
+      sessionId: "s1",
+      prompt: {
+        clientMessageId: "m1",
+        delivery: "auto",
+        input: {
+          type: "message",
+          content: [{ type: "text", text: "Create file" }],
+        },
+      },
+    });
+
+    const permReq = await waitFor(() => permissions()[0], "permission request");
+    expect(permReq.request).toMatchObject({
+      id: "call_275190",
+      kind: "tool",
+      name: "write_file",
+      detail: expect.objectContaining({ type: "edit" }),
+      actions: [
+        expect.objectContaining({ id: "allow", behavior: "allow" }),
+        expect.objectContaining({ id: "deny", behavior: "deny" }),
+      ],
+    });
+
+    await connection.send({
+      type: "session.permission",
+      sessionId: "s1",
+      permissionId: permReq.request.id,
+      response: { behavior: "allow", selectedActionId: "allow" },
+    });
+
+    await waitFor(() => resolvedPermissions()[0], "permission resolved");
+    await waitForTurnCompletion("s1");
+
+    expect(recordedOutcome).toEqual({ outcome: { outcome: "selected", optionId: "allow" } });
+    await connection.close();
+  });
+
+  it("permission deny: resolves reject_once on deny", async () => {
+    const connection = createAcpConnection(ACP_CAPABILITIES, options);
+    connection.onEvent((e) => events.push(e));
+
+    await connection.send({
+      type: "session.open",
+      requestId: "r1",
+      sessionId: "s1",
+      config: makeConfig(),
+      history: "skip",
+    });
+
+    let recordedOutcome: any = null;
+
+    fakeAgent.setPromptHandler(async ({ sessionId }) => {
+      fakeAgent.emitToolCall(sessionId, "call_275190", "pending", {
+        name: "write_file",
+        args: { Content: "hi\n", Path: "/private/tmp/x/hello.txt" },
+      });
+
+      const outcome = await fakeAgent.requestPermission({
+        sessionId,
+        toolCall: {
+          sessionUpdate: "tool_call",
+          toolCallId: "call_275190",
+          name: "write_file",
+          args: { Content: "hi\n", Path: "/private/tmp/x/hello.txt" },
+        },
+        options: [
+          { optionId: "allow", name: "Allow", kind: "allow_once" },
+          { optionId: "deny", name: "Deny", kind: "reject_once" },
+        ],
+      });
+
+      recordedOutcome = outcome;
+      fakeAgent.emitToolCall(sessionId, "call_275190", "failed");
+      return { stopReason: "end_turn" };
+    });
+
+    await connection.send({
+      type: "session.prompt",
+      sessionId: "s1",
+      prompt: {
+        clientMessageId: "m1",
+        delivery: "auto",
+        input: {
+          type: "message",
+          content: [{ type: "text", text: "Create file" }],
+        },
+      },
+    });
+
+    const permReq = await waitFor(() => permissions()[0], "permission request");
+    await connection.send({
+      type: "session.permission",
+      sessionId: "s1",
+      permissionId: permReq.request.id,
+      response: { behavior: "deny" },
+    });
+
+    await waitFor(() => resolvedPermissions()[0], "permission resolved");
+    await waitForTurnCompletion("s1");
+
+    expect(recordedOutcome).toEqual({ outcome: { outcome: "selected", optionId: "deny" } });
+    await connection.close();
+  });
+
+  it("permission always: resolves allow_always or reject_always when offered and chosen", async () => {
+    const connection = createAcpConnection(ACP_CAPABILITIES, options);
+    connection.onEvent((e) => events.push(e));
+
+    await connection.send({
+      type: "session.open",
+      requestId: "r1",
+      sessionId: "s1",
+      config: makeConfig(),
+      history: "skip",
+    });
+
+    let recordedOutcome: any = null;
+
+    fakeAgent.setPromptHandler(async ({ sessionId }) => {
+      const outcome = await fakeAgent.requestPermission({
+        sessionId,
+        toolCall: {
+          sessionUpdate: "tool_call",
+          toolCallId: "call_275190",
+          name: "run_command",
+        },
+        options: [
+          { optionId: "allow", name: "Allow", kind: "allow_once" },
+          { optionId: "allow_always", name: "Always Allow", kind: "allow_always" },
+          { optionId: "deny", name: "Deny", kind: "reject_once" },
+          { optionId: "reject_always", name: "Never Allow", kind: "reject_always" },
+        ],
+      });
+
+      recordedOutcome = outcome;
+      return { stopReason: "end_turn" };
+    });
+
+    await connection.send({
+      type: "session.prompt",
+      sessionId: "s1",
+      prompt: {
+        clientMessageId: "m1",
+        delivery: "auto",
+        input: {
+          type: "message",
+          content: [{ type: "text", text: "Run command" }],
+        },
+      },
+    });
+
+    const permReq = await waitFor(() => permissions()[0], "permission request");
+    await connection.send({
+      type: "session.permission",
+      sessionId: "s1",
+      permissionId: permReq.request.id,
+      response: { behavior: "allow", selectedActionId: "allow_always" },
+    });
+
+    await waitFor(() => resolvedPermissions()[0], "permission resolved");
+    await waitForTurnCompletion("s1");
+
+    expect(recordedOutcome).toEqual({ outcome: { outcome: "selected", optionId: "allow_always" } });
+    await connection.close();
+  });
+
+  it("multiple pending permissions: tracks and resolves independent requests", async () => {
+    const connection = createAcpConnection(ACP_CAPABILITIES, options);
+    connection.onEvent((e) => events.push(e));
+
+    await connection.send({
+      type: "session.open",
+      requestId: "r1",
+      sessionId: "s1",
+      config: makeConfig(),
+      history: "skip",
+    });
+
+    const outcomes: any[] = [];
+
+    fakeAgent.setPromptHandler(async ({ sessionId }) => {
+      const p1 = fakeAgent.requestPermission({
+        sessionId,
+        toolCall: {
+          sessionUpdate: "tool_call",
+          toolCallId: "call_1",
+          name: "write_file",
+        },
+        options: [
+          { optionId: "opt_allow_1", name: "Allow", kind: "allow_once" },
+          { optionId: "opt_deny_1", name: "Deny", kind: "reject_once" },
+        ],
+      });
+
+      const p2 = fakeAgent.requestPermission({
+        sessionId,
+        toolCall: {
+          sessionUpdate: "tool_call",
+          toolCallId: "call_2",
+          name: "run_command",
+        },
+        options: [
+          { optionId: "opt_allow_2", name: "Allow", kind: "allow_once" },
+          { optionId: "opt_deny_2", name: "Deny", kind: "reject_once" },
+        ],
+      });
+
+      const res = await Promise.all([p1, p2]);
+      outcomes.push(...res);
+      return { stopReason: "end_turn" };
+    });
+
+    await connection.send({
+      type: "session.prompt",
+      sessionId: "s1",
+      prompt: {
+        clientMessageId: "m1",
+        delivery: "auto",
+        input: {
+          type: "message",
+          content: [{ type: "text", text: "Multi permissions" }],
+        },
+      },
+    });
+
+    await waitFor(() => (permissions().length === 2 ? true : undefined), "both permission requests");
+    expect(permissions().map((p) => p.request.id)).toEqual(["call_1", "call_2"]);
+
+    // Resolve call_1 first
+    await connection.send({
+      type: "session.permission",
+      sessionId: "s1",
+      permissionId: "call_1",
+      response: { behavior: "allow" },
+    });
+
+    await waitFor(
+      () => (resolvedPermissions().some((r) => r.permissionId === "call_1") ? true : undefined),
+      "call_1 resolved",
+    );
+    expect(outcomes).toHaveLength(0); // call_2 is still waiting!
+
+    // Now resolve call_2
+    await connection.send({
+      type: "session.permission",
+      sessionId: "s1",
+      permissionId: "call_2",
+      response: { behavior: "deny" },
+    });
+
+    await waitFor(
+      () => (resolvedPermissions().some((r) => r.permissionId === "call_2") ? true : undefined),
+      "call_2 resolved",
+    );
+    await waitForTurnCompletion("s1");
+
+    expect(outcomes).toEqual([
+      { outcome: { outcome: "selected", optionId: "opt_allow_1" } },
+      { outcome: { outcome: "selected", optionId: "opt_deny_2" } },
+    ]);
+    await connection.close();
+  });
+
+  it("permission cancelled on interrupt: resolves outcome cancelled and clears card", async () => {
+    const connection = createAcpConnection(ACP_CAPABILITIES, options);
+    connection.onEvent((e) => events.push(e));
+
+    await connection.send({
+      type: "session.open",
+      requestId: "r1",
+      sessionId: "s1",
+      config: makeConfig(),
+      history: "skip",
+    });
+
+    let outcomePromise: Promise<any> | null = null;
+
+    fakeAgent.setPromptHandler(async ({ sessionId }) => {
+      outcomePromise = fakeAgent.requestPermission({
+        sessionId,
+        toolCall: {
+          sessionUpdate: "tool_call",
+          toolCallId: "call_interrupt",
+          name: "write_file",
+        },
+        options: [{ optionId: "allow", name: "Allow", kind: "allow_once" }],
+      });
+      return { stopReason: "cancelled" };
+    });
+
+    await connection.send({
+      type: "session.prompt",
+      sessionId: "s1",
+      prompt: {
+        clientMessageId: "m1",
+        delivery: "auto",
+        input: {
+          type: "message",
+          content: [{ type: "text", text: "Interrupt test" }],
+        },
+      },
+    });
+
+    await waitFor(() => permissions()[0], "permission request");
+
+    await connection.send({
+      type: "session.interrupt",
+      requestId: "req-int",
+      sessionId: "s1",
+    });
+
+    const outcome = await outcomePromise;
+    expect(outcome).toEqual({ outcome: { outcome: "cancelled" } });
+    expect(resolvedPermissions().some((r) => r.permissionId === "call_interrupt")).toBe(true);
+    await connection.close();
+  });
+
+  it("permission cancelled on close: resolves outcome cancelled and clears card", async () => {
+    const connection = createAcpConnection(ACP_CAPABILITIES, options);
+    connection.onEvent((e) => events.push(e));
+
+    await connection.send({
+      type: "session.open",
+      requestId: "r1",
+      sessionId: "s1",
+      config: makeConfig(),
+      history: "skip",
+    });
+
+    let outcomePromise: Promise<any> | null = null;
+
+    fakeAgent.setPromptHandler(async ({ sessionId }) => {
+      outcomePromise = fakeAgent.requestPermission({
+        sessionId,
+        toolCall: {
+          sessionUpdate: "tool_call",
+          toolCallId: "call_close",
+          name: "write_file",
+        },
+        options: [{ optionId: "allow", name: "Allow", kind: "allow_once" }],
+      });
+      return { stopReason: "cancelled" };
+    });
+
+    await connection.send({
+      type: "session.prompt",
+      sessionId: "s1",
+      prompt: {
+        clientMessageId: "m1",
+        delivery: "auto",
+        input: {
+          type: "message",
+          content: [{ type: "text", text: "Close test" }],
+        },
+      },
+    });
+
+    await waitFor(() => permissions()[0], "permission request");
+
+    await connection.send({
+      type: "session.close",
+      requestId: "req-close",
+      sessionId: "s1",
+    });
+
+    const outcome = await outcomePromise;
+    expect(outcome).toEqual({ outcome: { outcome: "cancelled" } });
+    expect(resolvedPermissions().some((r) => r.permissionId === "call_close")).toBe(true);
+    await connection.close();
+  });
+
+  it("skip policy auto-allow: auto-allows without card when approvalPolicy is skip", async () => {
+    const connection = createAcpConnection(ACP_CAPABILITIES, options);
+    connection.onEvent((e) => events.push(e));
+
+    await connection.send({
+      type: "session.open",
+      requestId: "r1",
+      sessionId: "s1",
+      config: makeConfig({ settings: { approvalPolicy: "skip" } }),
+      history: "skip",
+    });
+
+    let outcomeResult: any = null;
+
+    fakeAgent.setPromptHandler(async ({ sessionId }) => {
+      const outcome = await fakeAgent.requestPermission({
+        sessionId,
+        toolCall: {
+          sessionUpdate: "tool_call",
+          toolCallId: "call_skip",
+          name: "write_file",
+        },
+        options: [
+          { optionId: "allow", name: "Allow", kind: "allow_once" },
+          { optionId: "deny", name: "Deny", kind: "reject_once" },
+        ],
+      });
+      outcomeResult = outcome;
+      return { stopReason: "end_turn" };
+    });
+
+    await connection.send({
+      type: "session.prompt",
+      sessionId: "s1",
+      prompt: {
+        clientMessageId: "m1",
+        delivery: "auto",
+        input: {
+          type: "message",
+          content: [{ type: "text", text: "Auto allow prompt" }],
+        },
+      },
+    });
+
+    await waitForTurnCompletion("s1");
+    expect(permissions()).toHaveLength(0); // No card emitted!
+    expect(outcomeResult).toEqual({ outcome: { outcome: "selected", optionId: "allow" } });
+    await connection.close();
+  });
+
+  it("question single-select: renders question card and responds with const", async () => {
+    const connection = createAcpConnection(ACP_CAPABILITIES, options);
+    connection.onEvent((e) => events.push(e));
+
+    await connection.send({
+      type: "session.open",
+      requestId: "r1",
+      sessionId: "s1",
+      config: makeConfig(),
+      history: "skip",
+    });
+
+    let elicitationOutcome: any = null;
+
+    fakeAgent.setPromptHandler(async ({ sessionId }) => {
+      fakeAgent.emitToolCall(sessionId, "call_175877", "pending", {
+        name: "ask_question",
+        args: {
+          questions: [
+            {
+              question: "Which color do you prefer?",
+              options: ["Red", "Blue"],
+              is_multi_select: false,
+            },
+          ],
+        },
+      });
+
+      const outcome = await fakeAgent.createElicitation({
+        sessionId,
+        toolCallId: "call_175877",
+        mode: "form",
+        message: "The agent has a question.",
+        requestedSchema: {
+          type: "object",
+          properties: {
+            q1: {
+              type: "string",
+              title: "Which color do you prefer?",
+              oneOf: [
+                { const: "1", title: "(Recommended) Red" },
+                { const: "2", title: "Blue" },
+              ],
+            },
+            q1_other: {
+              type: "string",
+              title: "Other",
+              description: "Optional free-form answer to: Which color do you prefer?",
+            },
+          },
+        },
+      });
+
+      elicitationOutcome = outcome;
+      fakeAgent.emitToolCall(sessionId, "call_175877", "completed");
+      return { stopReason: "end_turn" };
+    });
+
+    await connection.send({
+      type: "session.prompt",
+      sessionId: "s1",
+      prompt: {
+        clientMessageId: "m1",
+        delivery: "auto",
+        input: {
+          type: "message",
+          content: [{ type: "text", text: "Ask me a question" }],
+        },
+      },
+    });
+
+    const questionCard = await waitFor(() => permissions()[0], "question card");
+    expect(questionCard.request).toMatchObject({
+      id: "question:call_175877",
+      kind: "question",
+      name: "ask_question",
+      title: "Which color do you prefer?",
+    });
+
+    // Check brain icon tool row emitted
+    const brainRows = timelineItems().filter(
+      (item): item is Extract<ProviderTimelineItem, { type: "tool_call" }> =>
+        item.type === "tool_call" && item.name === "ask_question",
+    );
+    expect(brainRows.length).toBeGreaterThan(0);
+    expect((brainRows[0].detail as any)?.icon).toBe("brain");
+
+    // User answers "Blue"
+    await connection.send({
+      type: "session.permission",
+      sessionId: "s1",
+      permissionId: questionCard.request.id,
+      response: {
+        behavior: "allow",
+        updatedInput: { answers: { "Question 1": "Blue" } },
+      },
+    });
+
+    await waitFor(() => resolvedPermissions()[0], "question card resolved");
+    await waitForTurnCompletion("s1");
+
+    expect(elicitationOutcome).toEqual({
+      action: "accept",
+      content: { q1: "2" },
+    });
+
+    // Tool row updated with answered text
+    const updatedBrainRows = timelineItems().filter(
+      (item): item is Extract<ProviderTimelineItem, { type: "tool_call" }> =>
+        item.type === "tool_call" && item.name === "ask_question",
+    );
+    expect((updatedBrainRows.at(-1)?.detail as any)?.text).toContain("Which color do you prefer?\nBlue");
+    await connection.close();
+  });
+
+  it("question multi-select: responds with array of consts", async () => {
+    const connection = createAcpConnection(ACP_CAPABILITIES, options);
+    connection.onEvent((e) => events.push(e));
+
+    await connection.send({
+      type: "session.open",
+      requestId: "r1",
+      sessionId: "s1",
+      config: makeConfig(),
+      history: "skip",
+    });
+
+    let elicitationOutcome: any = null;
+
+    fakeAgent.setPromptHandler(async ({ sessionId }) => {
+      fakeAgent.emitToolCall(sessionId, "call_multi", "pending", {
+        name: "ask_question",
+        args: {
+          questions: [
+            {
+              question: "Which fruits do you like?",
+              options: ["Apple", "Pear", "Plum"],
+              is_multi_select: true,
+            },
+          ],
+        },
+      });
+
+      const outcome = await fakeAgent.createElicitation({
+        sessionId,
+        toolCallId: "call_multi",
+        mode: "form",
+        message: "The agent has a question.",
+        requestedSchema: {
+          type: "object",
+          properties: {
+            q1: {
+              type: "array",
+              title: "Which fruits do you like?",
+              items: {
+                anyOf: [
+                  { const: "1", title: "Apple" },
+                  { const: "2", title: "Pear" },
+                  { const: "3", title: "Plum" },
+                ],
+              },
+            },
+          },
+        },
+      });
+
+      elicitationOutcome = outcome;
+      return { stopReason: "end_turn" };
+    });
+
+    await connection.send({
+      type: "session.prompt",
+      sessionId: "s1",
+      prompt: {
+        clientMessageId: "m1",
+        delivery: "auto",
+        input: {
+          type: "message",
+          content: [{ type: "text", text: "Fruits" }],
+        },
+      },
+    });
+
+    const card = await waitFor(() => permissions()[0], "multi-select card");
+    await connection.send({
+      type: "session.permission",
+      sessionId: "s1",
+      permissionId: card.request.id,
+      response: {
+        behavior: "allow",
+        updatedInput: { answers: { "Question 1": "Apple, Plum" } },
+      },
+    });
+
+    await waitForTurnCompletion("s1");
+    expect(elicitationOutcome).toEqual({
+      action: "accept",
+      content: { q1: ["1", "3"] },
+    });
+    await connection.close();
+  });
+
+  it("question free-text other: responds with q1_other", async () => {
+    const connection = createAcpConnection(ACP_CAPABILITIES, options);
+    connection.onEvent((e) => events.push(e));
+
+    await connection.send({
+      type: "session.open",
+      requestId: "r1",
+      sessionId: "s1",
+      config: makeConfig(),
+      history: "skip",
+    });
+
+    let elicitationOutcome: any = null;
+
+    fakeAgent.setPromptHandler(async ({ sessionId }) => {
+      const outcome = await fakeAgent.createElicitation({
+        sessionId,
+        toolCallId: "call_freetext",
+        mode: "form",
+        requestedSchema: {
+          type: "object",
+          properties: {
+            q1: {
+              type: "string",
+              title: "Which color do you prefer?",
+              oneOf: [{ const: "1", title: "Red" }],
+            },
+            q1_other: {
+              type: "string",
+              title: "Other",
+            },
+          },
+        },
+      });
+
+      elicitationOutcome = outcome;
+      return { stopReason: "end_turn" };
+    });
+
+    await connection.send({
+      type: "session.prompt",
+      sessionId: "s1",
+      prompt: {
+        clientMessageId: "m1",
+        delivery: "auto",
+        input: {
+          type: "message",
+          content: [{ type: "text", text: "Color" }],
+        },
+      },
+    });
+
+    const card = await waitFor(() => permissions()[0], "card");
+    await connection.send({
+      type: "session.permission",
+      sessionId: "s1",
+      permissionId: card.request.id,
+      response: {
+        behavior: "allow",
+        updatedInput: { answers: { "Question 1": "Purple" } },
+      },
+    });
+
+    await waitForTurnCompletion("s1");
+    expect(elicitationOutcome).toEqual({
+      action: "accept",
+      content: { q1_other: "Purple" },
+    });
+    await connection.close();
+  });
+
+  it("question skip: responds with empty content on deny / dismiss", async () => {
+    const connection = createAcpConnection(ACP_CAPABILITIES, options);
+    connection.onEvent((e) => events.push(e));
+
+    await connection.send({
+      type: "session.open",
+      requestId: "r1",
+      sessionId: "s1",
+      config: makeConfig(),
+      history: "skip",
+    });
+
+    let elicitationOutcome: any = null;
+
+    fakeAgent.setPromptHandler(async ({ sessionId }) => {
+      fakeAgent.emitToolCall(sessionId, "call_skip", "pending", {
+        name: "ask_question",
+        args: { questions: [{ question: "Skip me?", options: ["Yes", "No"], is_multi_select: false }] },
+      });
+
+      const outcome = await fakeAgent.createElicitation({
+        sessionId,
+        toolCallId: "call_skip",
+        mode: "form",
+        requestedSchema: {
+          type: "object",
+          properties: {
+            q1: { type: "string", title: "Skip me?", oneOf: [{ const: "1", title: "Yes" }] },
+          },
+        },
+      });
+
+      elicitationOutcome = outcome;
+      return { stopReason: "end_turn" };
+    });
+
+    await connection.send({
+      type: "session.prompt",
+      sessionId: "s1",
+      prompt: {
+        clientMessageId: "m1",
+        delivery: "auto",
+        input: {
+          type: "message",
+          content: [{ type: "text", text: "Skip prompt" }],
+        },
+      },
+    });
+
+    const card = await waitFor(() => permissions()[0], "card");
+    await connection.send({
+      type: "session.permission",
+      sessionId: "s1",
+      permissionId: card.request.id,
+      response: { behavior: "deny" },
+    });
+
+    await waitForTurnCompletion("s1");
+    expect(elicitationOutcome).toEqual({
+      action: "accept",
+      content: {},
+    });
+
+    const brainRows = timelineItems().filter(
+      (item): item is Extract<ProviderTimelineItem, { type: "tool_call" }> =>
+        item.type === "tool_call" && item.name === "ask_question",
+    );
+    expect((brainRows.at(-1)?.detail as any)?.text).toContain("Dismissed");
+    await connection.close();
+  });
+
+  it("question cancel on interrupt: responds with cancel on interrupt", async () => {
+    const connection = createAcpConnection(ACP_CAPABILITIES, options);
+    connection.onEvent((e) => events.push(e));
+
+    await connection.send({
+      type: "session.open",
+      requestId: "r1",
+      sessionId: "s1",
+      config: makeConfig(),
+      history: "skip",
+    });
+
+    let elicitationPromise: Promise<any> | null = null;
+
+    fakeAgent.setPromptHandler(async ({ sessionId }) => {
+      elicitationPromise = fakeAgent.createElicitation({
+        sessionId,
+        toolCallId: "call_q_int",
+        mode: "form",
+        requestedSchema: {
+          type: "object",
+          properties: {
+            q1: { type: "string", title: "Wait for me?", oneOf: [{ const: "1", title: "Yes" }] },
+          },
+        },
+      });
+      return { stopReason: "cancelled" };
+    });
+
+    await connection.send({
+      type: "session.prompt",
+      sessionId: "s1",
+      prompt: {
+        clientMessageId: "m1",
+        delivery: "auto",
+        input: {
+          type: "message",
+          content: [{ type: "text", text: "Interrupt prompt" }],
+        },
+      },
+    });
+
+    await waitFor(() => permissions()[0], "card");
+    await connection.send({
+      type: "session.interrupt",
+      requestId: "req-int",
+      sessionId: "s1",
+    });
+
+    const outcome = await elicitationPromise;
+    expect(outcome).toEqual({ action: "cancel" });
+    expect(resolvedPermissions().some((r) => r.permissionId === "question:call_q_int")).toBe(true);
+    await connection.close();
+  });
+
+  it("plan card from RequestFeedback write_file in plan mode", async () => {
+    const connection = createAcpConnection(ACP_CAPABILITIES, options);
+    connection.onEvent((e) => events.push(e));
+
+    await connection.send({
+      type: "session.open",
+      requestId: "r1",
+      sessionId: "s1",
+      config: makeConfig({ mode: "plan" }),
+      history: "skip",
+    });
+
+    fakeAgent.setPromptHandler(async ({ sessionId }) => {
+      fakeAgent.emitToolCall(sessionId, "call_plan_write", "pending", {
+        name: "write_file",
+        args: {
+          Path: "/Users/test/.gemini/antigravity-cli/brain/123/plan.md",
+          Content: "# Concrete Plan\n1. Modify client\n2. Add tests",
+          ArtifactMetadata: { RequestFeedback: true, Summary: "Add tests" },
+        },
+      });
+      fakeAgent.emitToolCall(sessionId, "call_plan_write", "completed", {
+        name: "write_file",
+        args: {
+          Path: "/Users/test/.gemini/antigravity-cli/brain/123/plan.md",
+          Content: "# Concrete Plan\n1. Modify client\n2. Add tests",
+          ArtifactMetadata: { RequestFeedback: true, Summary: "Add tests" },
+        },
+      });
+      return { stopReason: "end_turn" };
+    });
+
+    await connection.send({
+      type: "session.prompt",
+      sessionId: "s1",
+      prompt: {
+        clientMessageId: "m1",
+        delivery: "auto",
+        input: {
+          type: "message",
+          content: [{ type: "text", text: "Create plan" }],
+        },
+      },
+    });
+
+    const planCard = await waitFor(() => permissions()[0], "plan card");
+    expect(planCard.request).toMatchObject({
+      kind: "plan",
+      name: "plan",
+      title: "Implement this plan?",
+      detail: { type: "plan", text: "# Concrete Plan\n1. Modify client\n2. Add tests" },
+      actions: [
+        expect.objectContaining({ id: "implement", behavior: "allow", intent: "implement" }),
+        expect.objectContaining({ id: "dismiss", behavior: "deny", intent: "dismiss" }),
+      ],
+    });
+    await waitForTurnCompletion("s1");
+    await connection.close();
+  });
+
+  it("implement flow (set_mode + prompt): switches mode to accept-edits and sends IMPLEMENT_PLAN_TEXT", async () => {
+    const connection = createAcpConnection(ACP_CAPABILITIES, options);
+    connection.onEvent((e) => events.push(e));
+
+    await connection.send({
+      type: "session.open",
+      requestId: "r1",
+      sessionId: "s1",
+      config: makeConfig({ mode: "plan" }),
+      history: "skip",
+    });
+
+    fakeAgent.setPromptHandler(async ({ sessionId, prompt }) => {
+      const text = (prompt[0] as any)?.text;
+      if (text === IMPLEMENT_PLAN_TEXT) {
+        return { stopReason: "end_turn" };
+      }
+
+      fakeAgent.emitToolCall(sessionId, "call_plan_write", "completed", {
+        name: "write_file",
+        args: {
+          Content: "# Plan to implement",
+          ArtifactMetadata: { RequestFeedback: true },
+        },
+      });
+      return { stopReason: "end_turn" };
+    });
+
+    await connection.send({
+      type: "session.prompt",
+      sessionId: "s1",
+      prompt: {
+        clientMessageId: "m1",
+        delivery: "auto",
+        input: {
+          type: "message",
+          content: [{ type: "text", text: "Plan something" }],
+        },
+      },
+    });
+
+    const planCard = await waitFor(() => permissions()[0], "plan card");
+    await waitForTurnCompletion("s1");
+
+    // Approve the plan
+    await connection.send({
+      type: "session.permission",
+      sessionId: "s1",
+      permissionId: planCard.request.id,
+      response: { behavior: "allow", selectedActionId: "implement" },
+    });
+
+    // Wait for the implementing turn to complete
+    await waitFor(
+      () => (events.filter((e) => e.type === "session.turn" && e.state === "completed")[1] ? true : undefined),
+      "implementing turn",
+    );
+
+    // 1. set_mode called with accept-edits
+    const setModeReqs = fakeAgent.requestsFor("session/set_mode");
+    expect(setModeReqs.some((r) => (r.params as any).modeId === "accept-edits")).toBe(true);
+
+    // 2. session.config emitted with accept-edits
+    const configEvents = events.filter((e) => e.type === "session.config");
+    expect((configEvents.at(-1) as any)?.config.mode).toBe("accept-edits");
+
+    // 3. Implementing prompt sent
+    const promptReqs = fakeAgent.requestsFor("session/prompt");
+    expect(promptReqs).toHaveLength(2);
+    expect((promptReqs[1].params as any).prompt[0].text).toBe(IMPLEMENT_PLAN_TEXT);
+
+    await connection.close();
+  });
+
+  it("/plan command: switches mode to plan, prompts argument, and restores original mode on implement", async () => {
+    const connection = createAcpConnection(ACP_CAPABILITIES, options);
+    connection.onEvent((e) => events.push(e));
+
+    await connection.send({
+      type: "session.open",
+      requestId: "r1",
+      sessionId: "s1",
+      config: makeConfig({ mode: "default" }),
+      history: "skip",
+    });
+
+    fakeAgent.setPromptHandler(async ({ sessionId, prompt }) => {
+      const text = (prompt[0] as any)?.text;
+      if (text === IMPLEMENT_PLAN_TEXT) {
+        return { stopReason: "end_turn" };
+      }
+
+      fakeAgent.emitToolCall(sessionId, "call_plan_write", "completed", {
+        name: "write_file",
+        args: {
+          Content: "# Plan from /plan command",
+          ArtifactMetadata: { RequestFeedback: true },
+        },
+      });
+      return { stopReason: "end_turn" };
+    });
+
+    await connection.send({
+      type: "session.prompt",
+      sessionId: "s1",
+      prompt: {
+        clientMessageId: "m1",
+        delivery: "auto",
+        input: {
+          type: "command",
+          name: "plan",
+          arguments: "add a cache layer",
+        },
+      },
+    });
+
+    // Verify /plan switched mode to plan and sent prompt argument
+    await waitFor(
+      () => (fakeAgent.requestsFor("session/set_mode").length > 0 ? true : undefined),
+      "set_mode plan",
+    );
+    expect(fakeAgent.requestsFor("session/set_mode")[0].params).toMatchObject({ modeId: "plan" });
+    expect(fakeAgent.requestsFor("session/prompt")[0].params).toMatchObject({
+      prompt: [{ type: "text", text: "add a cache layer" }],
+    });
+
+    const userMsgs = timelineItems().filter((item) => item.type === "user_message");
+    expect((userMsgs[0] as any).text).toBe("/plan add a cache layer");
+
+    const planCard = await waitFor(() => permissions()[0], "plan card");
+    await waitForTurnCompletion("s1");
+
+    // Approve the plan
+    const configsCountBefore = events.filter((e) => e.type === "session.config").length;
+    await connection.send({
+      type: "session.permission",
+      sessionId: "s1",
+      permissionId: planCard.request.id,
+      response: { behavior: "allow", selectedActionId: "implement" },
+    });
+
+    await waitFor(
+      () => (events.filter((e) => e.type === "session.turn" && e.state === "completed")[1] ? true : undefined),
+      "implementing turn",
+    );
+
+    // Restores original mode (default) rather than accept-edits because session was originally default
+    const setModes = fakeAgent.requestsFor("session/set_mode");
+    expect((setModes.at(-1)?.params as any).modeId).toBe("default");
+    expect(events.filter((e) => e.type === "session.config").length).toBe(configsCountBefore);
+
+    // Prompt sent with IMPLEMENT_PLAN_TEXT
+    const promptReqs = fakeAgent.requestsFor("session/prompt");
+    expect((promptReqs.at(-1)?.params as any).prompt[0].text).toBe(IMPLEMENT_PLAN_TEXT);
 
     await connection.close();
   });

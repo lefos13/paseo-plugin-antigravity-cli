@@ -67,7 +67,14 @@ export function findSkippedQuestion(
   return questions.length > 0 ? { callStep, questions } : null;
 }
 
-function readQuestions(value: unknown): AgyQuestion[] {
+export function readQuestions(value: unknown): AgyQuestion[] {
+  if (typeof value === "string") {
+    try {
+      value = JSON.parse(value);
+    } catch {
+      return [];
+    }
+  }
   if (!Array.isArray(value)) return [];
   const questions: AgyQuestion[] = [];
   for (const item of value) {

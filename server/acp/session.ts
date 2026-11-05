@@ -37,8 +37,20 @@ import {
   renderPart,
   resolveAccountId,
   turnFailure,
+  IMPLEMENT_MODE_ID,
+  IMPLEMENT_PLAN_TEXT,
+  PLAN_COMMAND,
+  PLAN_MODE_ID,
   type ConfigStateSession,
 } from "../provider";
+import {
+  questionRequest,
+  questionRow,
+  readAnswers,
+  readQuestions,
+  NO_ANSWER,
+  type AgyQuestion,
+} from "../questions";
 import {
   AgyAcpClient,
   type AgyAcpClientConfig,
@@ -48,9 +60,14 @@ import {
 import type {
   AcpAvailableCommandsUpdate,
   AcpCurrentModeUpdate,
+  AcpElicitationParams,
+  AcpElicitationResult,
   AcpMessageChunkUpdate,
+  AcpPermissionOption,
   AcpPromptContent,
   AcpPromptResult,
+  AcpRequestPermissionParams,
+  AcpRequestPermissionResult,
   AcpSessionInfoUpdate,
   AcpSessionUpdate,
   AcpToolCallUpdate,
@@ -226,7 +243,14 @@ export function toAcpPromptContent(prompt: ProviderPrompt): {
 } {
   if (prompt.input.type === "command") {
     const args = prompt.input.arguments.trim();
+    const isPlan = prompt.input.name === PLAN_COMMAND;
     const text = args.length > 0 ? `/${prompt.input.name} ${args}` : `/${prompt.input.name}`;
+    if (isPlan) {
+      return {
+        content: [{ type: "text", text: args.length > 0 ? args : "plan" }],
+        shown: text,
+      };
+    }
     return {
       content: [{ type: "text", text }],
       shown: text,
@@ -266,6 +290,27 @@ export function toAcpPromptContent(prompt: ProviderPrompt): {
   };
 }
 
+export interface PendingPermission {
+  readonly id: string;
+  readonly toolCallId: string;
+  readonly options: AcpPermissionOption[];
+  readonly resolve: (result: AcpRequestPermissionResult) => void;
+}
+
+export interface PendingQuestion {
+  readonly id: string;
+  readonly toolCallId: string;
+  readonly questions: readonly AgyQuestion[];
+  readonly schema?: Record<string, unknown>;
+  readonly resolve: (result: AcpElicitationResult) => void;
+}
+
+export interface PendingPlan {
+  readonly id: string;
+  readonly text: string;
+  readonly previousMode?: string;
+}
+
 export interface AcpActiveTurn {
   readonly turnId: string;
   readonly clientMessageId: string;
@@ -277,6 +322,9 @@ export interface AcpActiveTurn {
   thoughtIndex: number;
   readonly openTools: Map<string, ProviderToolCallItem>;
   activePromptPromise: Promise<AcpPromptResult>;
+  isPlan?: boolean;
+  previousMode?: string;
+  latestPlan?: { text: string };
 }
 
 export class AcpSession implements ConfigStateSession {
@@ -296,6 +344,11 @@ export class AcpSession implements ConfigStateSession {
   interrupting = false;
   closing = false;
   commands: ProviderCommand[] = [];
+
+  pendingPlan: PendingPlan | null = null;
+  readonly pendingQuestions = new Map<string, PendingQuestion>();
+  readonly pendingPermissions = new Map<string, PendingPermission>();
+  lastAskQuestionToolCall?: AcpToolCallUpdate;
 
   // Optional transport provider for scripted testing
   injectedTransport?: AgyAcpClientTransport | (() => AgyAcpClientTransport);
@@ -416,6 +469,194 @@ function resolveToolItem(
   };
 }
 
+function cancelPendingPermissions(session: AcpSession, emit: Emit): void {
+  for (const [id, pending] of session.pendingPermissions.entries()) {
+    pending.resolve({ outcome: { outcome: "cancelled" } });
+    emit({
+      type: "session.permission_resolved",
+      sessionId: session.sessionId,
+      permissionId: id,
+    });
+  }
+  session.pendingPermissions.clear();
+}
+
+function cancelPendingQuestions(session: AcpSession, emit: Emit): void {
+  for (const [id, pending] of session.pendingQuestions.entries()) {
+    pending.resolve({ action: "cancel" });
+    publish(
+      session,
+      emit,
+      questionRow(pending.toolCallId, pending.questions, { kind: "dismissed" }),
+    );
+    emit({
+      type: "session.permission_resolved",
+      sessionId: session.sessionId,
+      permissionId: id,
+    });
+  }
+  session.pendingQuestions.clear();
+}
+
+function resolvePendingPlan(session: AcpSession, emit: Emit): void {
+  const plan = session.pendingPlan;
+  if (!plan) return;
+  session.pendingPlan = null;
+  emit({
+    type: "session.permission_resolved",
+    sessionId: session.sessionId,
+    permissionId: plan.id,
+  });
+}
+
+function offerPlan(
+  session: AcpSession,
+  emit: Emit,
+  turn: AcpActiveTurn,
+  text: string,
+): void {
+  if (text.trim().length === 0) return;
+  resolvePendingPlan(session, emit);
+  const id = `plan:${turn.turnId}`;
+  session.pendingPlan = { id, text, previousMode: turn.previousMode };
+  emit({
+    type: "session.permission",
+    sessionId: session.sessionId,
+    request: {
+      id,
+      name: "plan",
+      kind: "plan",
+      title: "Implement this plan?",
+      detail: { type: "plan", text },
+      actions: [
+        {
+          id: "implement",
+          label: "Implement",
+          behavior: "allow",
+          variant: "primary",
+          intent: "implement",
+        },
+        {
+          id: "dismiss",
+          label: "Keep planning",
+          behavior: "deny",
+          variant: "secondary",
+          intent: "dismiss",
+        },
+      ],
+    },
+  });
+}
+
+function extractPlanText(toolUpdate: AcpToolCallUpdate): string | null {
+  if (toolUpdate.name !== "write_file") return null;
+
+  const rawArgs =
+    typeof toolUpdate.args === "object" && toolUpdate.args !== null && !Array.isArray(toolUpdate.args)
+      ? (toolUpdate.args as Record<string, unknown>)
+      : typeof toolUpdate.rawInput === "object" && toolUpdate.rawInput !== null && !Array.isArray(toolUpdate.rawInput)
+        ? (toolUpdate.rawInput as Record<string, unknown>)
+        : undefined;
+
+  if (!rawArgs) return null;
+
+  const metadata =
+    typeof rawArgs.ArtifactMetadata === "object" && rawArgs.ArtifactMetadata !== null
+      ? (rawArgs.ArtifactMetadata as Record<string, unknown>)
+      : undefined;
+
+  if (metadata?.RequestFeedback !== true) return null;
+
+  const content =
+    typeof rawArgs.Content === "string"
+      ? rawArgs.Content
+      : typeof rawArgs.content === "string"
+        ? rawArgs.content
+        : "";
+
+  return content.length > 0 ? content : null;
+}
+
+function parseQuestionsFromSchema(schema: Record<string, unknown>): AgyQuestion[] {
+  const questions: AgyQuestion[] = [];
+  const props = schema.properties as Record<string, Record<string, unknown>> | undefined;
+  if (!props) return [];
+
+  for (const [key, prop] of Object.entries(props)) {
+    if (key.endsWith("_other")) continue;
+    const qText =
+      typeof prop.title === "string"
+        ? prop.title
+        : typeof prop.description === "string"
+          ? prop.description
+          : key;
+    const isMulti = prop.type === "array";
+    const options: string[] = [];
+    const choices = Array.isArray(prop.oneOf)
+      ? prop.oneOf
+      : Array.isArray(prop.anyOf)
+        ? prop.anyOf
+        : typeof prop.items === "object" && prop.items !== null
+          ? (Array.isArray((prop.items as any).oneOf)
+              ? (prop.items as any).oneOf
+              : Array.isArray((prop.items as any).anyOf)
+                ? (prop.items as any).anyOf
+                : [])
+          : [];
+
+    for (const choice of choices) {
+      if (choice && typeof choice === "object") {
+        const title =
+          typeof choice.title === "string"
+            ? choice.title
+            : typeof choice.name === "string"
+              ? choice.name
+              : typeof choice.const === "string"
+                ? choice.const
+                : "";
+        if (title) options.push(title);
+      }
+    }
+
+    questions.push({
+      question: qText,
+      options,
+      multiSelect: isMulti,
+    });
+  }
+  return questions;
+}
+
+function findChoiceMatch(choices: any[], text: string): any {
+  if (!Array.isArray(choices) || choices.length === 0) return null;
+  const norm = (s: string) =>
+    s
+      .replace(/^\(Recommended\)\s*/i, "")
+      .trim()
+      .toLowerCase();
+  const target = norm(text);
+
+  for (const c of choices) {
+    if (!c || typeof c !== "object") continue;
+    const title = typeof c.title === "string" ? c.title : typeof c.name === "string" ? c.name : "";
+    if (norm(title) === target || title.trim().toLowerCase() === text.trim().toLowerCase()) {
+      return c;
+    }
+  }
+
+  for (const c of choices) {
+    if (!c || typeof c !== "object") continue;
+    if (c.const !== undefined && String(c.const).toLowerCase() === target) {
+      return c;
+    }
+    if (c.value !== undefined && String(c.value).toLowerCase() === target) {
+      return c;
+    }
+  }
+
+  return null;
+}
+
 function handleSessionUpdate(session: AcpSession, update: AcpSessionUpdate, emit: Emit): void {
   const turn = session.activeTurn;
 
@@ -460,6 +701,19 @@ function handleSessionUpdate(session: AcpSession, update: AcpSessionUpdate, emit
       }
       const toolUpdate = update as AcpToolCallUpdate;
       const callId = toolUpdate.toolCallId;
+
+      // Plan detection: write_file with ArtifactMetadata.RequestFeedback === true
+      const planText = extractPlanText(toolUpdate);
+      if (planText) {
+        turn.latestPlan = { text: planText };
+      }
+
+      // Special handling for ask_question: save tool call and do not emit plain tool row
+      if (toolUpdate.name === "ask_question") {
+        session.lastAskQuestionToolCall = toolUpdate;
+        return;
+      }
+
       const previous = turn.openTools.get(callId);
       const item = resolveToolItem(toolUpdate, previous, session.config.cwd);
 
@@ -470,6 +724,16 @@ function handleSessionUpdate(session: AcpSession, update: AcpSessionUpdate, emit
       }
 
       publish(session, emit, item);
+
+      // If write_file plan tool call completed in plan mode, offer plan card
+      if (
+        (turn.isPlan || session.selection.mode === PLAN_MODE_ID) &&
+        toolUpdate.status === "completed" &&
+        turn.latestPlan &&
+        !session.pendingPlan
+      ) {
+        offerPlan(session, emit, turn, turn.latestPlan.text);
+      }
       break;
     }
 
@@ -518,6 +782,10 @@ function handleSessionUpdate(session: AcpSession, update: AcpSessionUpdate, emit
 }
 
 function handleProcessExitOrCrash(session: AcpSession, error: Error, emit: Emit): void {
+  cancelPendingPermissions(session, emit);
+  cancelPendingQuestions(session, emit);
+  resolvePendingPlan(session, emit);
+
   const turn = session.activeTurn;
   const client = session.client;
   session.client = null;
@@ -575,9 +843,7 @@ async function ensureClient(session: AcpSession, emit: Emit): Promise<AgyAcpClie
       if (home !== null) syncShadowHome(session.accountId);
 
       const env = home === null ? session.config.env : { ...session.config.env, HOME: home };
-      const perm = readToolPermission(accountGeminiRoot(session.accountId));
-      const skipPermissions =
-        approvalPolicy(session) === "skip" || perm === "always-proceed";
+      const skipPermissions = approvalPolicy(session) === "skip";
 
       const rawTransport =
         session.injectedTransport ??
@@ -596,13 +862,105 @@ async function ensureClient(session: AcpSession, emit: Emit): Promise<AgyAcpClie
         },
         {
           transport,
-          onRequestPermission: async () => {
-            // TODO(acp-3b): Permission cards
-            return { outcome: { outcome: "cancelled" } };
+          onRequestPermission: async (params) => {
+            if (session.closing || session.interrupting) {
+              return { outcome: { outcome: "cancelled" } };
+            }
+
+            // Skip policy auto-allows without emitting a card
+            const skip = approvalPolicy(session) === "skip";
+            if (skip) {
+              const allowOpt =
+                params.options?.find((o) => o.kind === "allow_once") ??
+                params.options?.find((o) => o.kind?.startsWith("allow")) ??
+                params.options?.find((o) => o.optionId === "allow");
+              if (allowOpt) {
+                return { outcome: { outcome: "selected", optionId: allowOpt.optionId } };
+              }
+              return { outcome: { outcome: "cancelled" } };
+            }
+
+            const toolCall = params.toolCall as AcpToolCallUpdate | undefined;
+            const toolCallId = toolCall?.toolCallId ?? `call_${randomUUID().slice(0, 8)}`;
+            const permissionId = toolCallId;
+            const options = params.options ?? [];
+
+            const { promise, resolve } = Promise.withResolvers<AcpRequestPermissionResult>();
+            const pending: PendingPermission = {
+              id: permissionId,
+              toolCallId,
+              options,
+              resolve,
+            };
+            session.pendingPermissions.set(permissionId, pending);
+
+            const detail = toolCall ? mapAcpToolDetail(toolCall, session.config.cwd) : undefined;
+            emit({
+              type: "session.permission",
+              sessionId: session.sessionId,
+              request: {
+                id: permissionId,
+                name: toolCall?.name ?? toolCall?.title ?? "tool",
+                kind: "tool",
+                title: toolCall?.title,
+                detail,
+                actions: options.map((opt) => ({
+                  id: opt.optionId,
+                  label: opt.name ?? (opt.kind?.startsWith("allow") ? "Allow" : "Deny"),
+                  behavior: opt.kind?.startsWith("allow") ? "allow" : "deny",
+                })),
+              },
+            });
+
+            return promise;
           },
-          onElicitation: async () => {
-            // TODO(acp-3b): Question cards
-            return { action: "cancel" };
+          onElicitation: async (params) => {
+            if (session.closing || session.interrupting) {
+              return { action: "cancel" };
+            }
+
+            const toolCallId = params.toolCallId ?? `call_${randomUUID().slice(0, 8)}`;
+            let questions: AgyQuestion[] = [];
+
+            if (
+              session.lastAskQuestionToolCall &&
+              (!params.toolCallId || session.lastAskQuestionToolCall.toolCallId === params.toolCallId)
+            ) {
+              const rawArgs =
+                typeof session.lastAskQuestionToolCall.args === "object" && session.lastAskQuestionToolCall.args !== null
+                  ? (session.lastAskQuestionToolCall.args as Record<string, unknown>)
+                  : typeof session.lastAskQuestionToolCall.rawInput === "object" && session.lastAskQuestionToolCall.rawInput !== null
+                    ? (session.lastAskQuestionToolCall.rawInput as Record<string, unknown>)
+                    : undefined;
+              questions = readQuestions(rawArgs?.questions);
+            }
+
+            if (questions.length === 0 && params.requestedSchema?.properties) {
+              questions = parseQuestionsFromSchema(params.requestedSchema);
+            }
+
+            const id = `question:${toolCallId}`;
+            const request = questionRequest(id, questions);
+
+            const { promise, resolve } = Promise.withResolvers<AcpElicitationResult>();
+            const pending: PendingQuestion = {
+              id,
+              toolCallId,
+              questions,
+              schema: params.requestedSchema,
+              resolve,
+            };
+            session.pendingQuestions.set(id, pending);
+            session.pendingQuestions.set(toolCallId, pending);
+
+            publish(session, emit, questionRow(toolCallId, questions, { kind: "pending" }));
+            emit({
+              type: "session.permission",
+              sessionId: session.sessionId,
+              request,
+            });
+
+            return promise;
           },
         },
       );
@@ -714,6 +1072,9 @@ async function runTurnPrompt(
 
     if (result.stopReason === "cancelled" || session.interrupting) {
       session.interrupting = false;
+      cancelPendingPermissions(session, emit);
+      cancelPendingQuestions(session, emit);
+      resolvePendingPlan(session, emit);
       for (const tool of turn.openTools.values()) {
         publish(session, emit, {
           ...tool,
@@ -754,6 +1115,15 @@ async function runTurnPrompt(
       }
       turn.openTools.clear();
 
+      // If plan mode turn finished with a plan, offer it if not already offered
+      if (
+        (turn.isPlan || session.selection.mode === PLAN_MODE_ID) &&
+        turn.latestPlan &&
+        !session.pendingPlan
+      ) {
+        offerPlan(session, emit, turn, turn.latestPlan.text);
+      }
+
       emit({
         type: "session.turn",
         sessionId: session.sessionId,
@@ -791,6 +1161,17 @@ async function promptSession(
       },
     });
     return;
+  }
+
+  const isPlanCommand = prompt.input.type === "command" && prompt.input.name === PLAN_COMMAND;
+  const isPlanMode = isPlanCommand || session.selection.mode === PLAN_MODE_ID;
+  const previousMode = session.selection.mode;
+
+  if (session.pendingPlan !== null) {
+    resolvePendingPlan(session, emit);
+    if (session.selection.mode !== previousMode && session.selection.mode && session.client?.running) {
+      void session.client.setMode(session.selection.mode);
+    }
   }
 
   const { content, shown } = toAcpPromptContent(prompt);
@@ -923,6 +1304,8 @@ async function promptSession(
     thoughtIndex: 0,
     openTools: new Map(),
     activePromptPromise: promptPromise,
+    isPlan: isPlanMode,
+    previousMode,
   };
   session.activeTurn = activeTurn;
 
@@ -930,6 +1313,9 @@ async function promptSession(
     let client: AgyAcpClient;
     try {
       client = await ensureClient(session, emit);
+      if (isPlanCommand) {
+        await client.setMode(PLAN_MODE_ID);
+      }
     } catch (err) {
       const errorMsg = err instanceof Error ? err.message : String(err);
       session.activeTurn = null;
@@ -958,6 +1344,225 @@ async function promptSession(
       );
     }
   })();
+}
+
+async function respondToPermission(
+  input: Extract<ProviderInput, { type: "session.permission" }>,
+  session: AcpSession,
+  emit: Emit,
+): Promise<void> {
+  const permId = input.permissionId;
+
+  // 1. Plan card
+  if (session.pendingPlan && (session.pendingPlan.id === permId || permId.startsWith("plan:"))) {
+    const plan = session.pendingPlan;
+    session.pendingPlan = null;
+    emit({
+      type: "session.permission_resolved",
+      sessionId: session.sessionId,
+      permissionId: permId,
+    });
+
+    if (input.response.behavior === "allow") {
+      if (session.selection.mode === PLAN_MODE_ID) {
+        session.selection.mode = IMPLEMENT_MODE_ID;
+        if (session.client?.running) {
+          await session.client.setMode(IMPLEMENT_MODE_ID);
+        }
+        emit({
+          type: "session.config",
+          sessionId: session.sessionId,
+          config: configState(session),
+        });
+      } else {
+        const restoreMode = plan.previousMode ?? session.selection.mode;
+        if (restoreMode && session.client?.running) {
+          await session.client.setMode(restoreMode);
+        }
+      }
+
+      await promptSession(
+        {
+          type: "session.prompt",
+          sessionId: session.sessionId,
+          prompt: {
+            clientMessageId: `plan-impl-${randomUUID().slice(0, 8)}`,
+            delivery: "auto",
+            input: {
+              type: "message",
+              content: [{ type: "text", text: IMPLEMENT_PLAN_TEXT }],
+            },
+          },
+        },
+        session,
+        emit,
+      );
+    } else {
+      if (session.selection.mode !== PLAN_MODE_ID) {
+        const restoreMode = plan.previousMode ?? session.selection.mode;
+        if (restoreMode && session.client?.running) {
+          await session.client.setMode(restoreMode);
+        }
+      }
+    }
+    return;
+  }
+
+  // 2. Question card
+  const question =
+    session.pendingQuestions.get(permId) ??
+    session.pendingQuestions.get(`question:${permId}`) ??
+    [...session.pendingQuestions.values()].find((q) => q.toolCallId === permId);
+
+  if (question) {
+    session.pendingQuestions.delete(question.id);
+    session.pendingQuestions.delete(question.toolCallId);
+    emit({
+      type: "session.permission_resolved",
+      sessionId: session.sessionId,
+      permissionId: permId,
+    });
+
+    if (input.response.behavior === "allow") {
+      const answers = readAnswers(question.questions, input.response);
+      publish(
+        session,
+        emit,
+        questionRow(question.toolCallId, question.questions, { kind: "answered", answers }),
+      );
+
+      const content: Record<string, unknown> = {};
+      const props = (question.schema?.properties as Record<string, any> | undefined) ?? {};
+      const nonOtherKeys = Object.keys(props).filter((k) => !k.endsWith("_other"));
+
+      for (let i = 0; i < question.questions.length; i++) {
+        const q = question.questions[i];
+        const answer = answers[i];
+        if (!answer || answer === NO_ANSWER) continue;
+
+        const propKey = props[`q${i + 1}`] ? `q${i + 1}` : (nonOtherKeys[i] ?? `q${i + 1}`);
+        const otherKey = `${propKey}_other`;
+        const propSchema = props[propKey];
+        const choices = Array.isArray(propSchema?.oneOf)
+          ? propSchema.oneOf
+          : Array.isArray(propSchema?.anyOf)
+            ? propSchema.anyOf
+            : typeof propSchema?.items === "object" && propSchema.items !== null
+              ? (Array.isArray(propSchema.items.oneOf)
+                  ? propSchema.items.oneOf
+                  : Array.isArray(propSchema.items.anyOf)
+                    ? propSchema.items.anyOf
+                    : [])
+              : [];
+
+        if (q.multiSelect) {
+          const parts = answer.split(",").map((p) => p.trim()).filter((p) => p.length > 0);
+          const consts: string[] = [];
+          const writeIns: string[] = [];
+          for (const part of parts) {
+            const match = findChoiceMatch(choices, part);
+            if (match) {
+              consts.push(String(match.const ?? match.value ?? consts.length + 1));
+            } else {
+              writeIns.push(part);
+            }
+          }
+          if (consts.length > 0) {
+            content[propKey] = consts;
+          }
+          if (writeIns.length > 0) {
+            content[otherKey] = writeIns.join(", ");
+          }
+        } else {
+          const match = findChoiceMatch(choices, answer);
+          if (match) {
+            content[propKey] = String(match.const ?? match.value ?? "1");
+          } else {
+            content[otherKey] = answer;
+          }
+        }
+      }
+
+      question.resolve({ action: "accept", content });
+    } else {
+      publish(
+        session,
+        emit,
+        questionRow(question.toolCallId, question.questions, { kind: "dismissed" }),
+      );
+      question.resolve({ action: "accept", content: {} });
+    }
+    return;
+  }
+
+  // 3. Tool permission card
+  const permission =
+    session.pendingPermissions.get(permId) ??
+    session.pendingPermissions.get(permId.replace(/^permission:/, "")) ??
+    [...session.pendingPermissions.values()].find((p) => p.toolCallId === permId);
+
+  if (permission) {
+    session.pendingPermissions.delete(permission.id);
+    session.pendingPermissions.delete(permission.toolCallId);
+    emit({
+      type: "session.permission_resolved",
+      sessionId: session.sessionId,
+      permissionId: permId,
+    });
+
+    const response = input.response;
+    let selectedOption: AcpPermissionOption | undefined;
+
+    if (response.selectedActionId) {
+      selectedOption = permission.options.find(
+        (opt) => opt.optionId === response.selectedActionId,
+      );
+    }
+
+    if (!selectedOption) {
+      const isAllow = response.behavior === "allow";
+      const isAlways =
+        (isAllow && response.updatedPermissions && response.updatedPermissions.length > 0) ||
+        response.selectedActionId?.includes("always");
+
+      if (isAllow) {
+        if (isAlways) {
+          selectedOption = permission.options.find((opt) => opt.kind === "allow_always");
+        }
+        if (!selectedOption) {
+          selectedOption =
+            permission.options.find((opt) => opt.kind === "allow_once") ??
+            permission.options.find((opt) => opt.kind?.startsWith("allow")) ??
+            permission.options.find((opt) => opt.optionId === "allow");
+        }
+      } else {
+        if (isAlways) {
+          selectedOption = permission.options.find((opt) => opt.kind === "reject_always");
+        }
+        if (!selectedOption) {
+          selectedOption =
+            permission.options.find((opt) => opt.kind === "reject_once") ??
+            permission.options.find((opt) => opt.kind?.startsWith("reject")) ??
+            permission.options.find((opt) => opt.optionId === "deny");
+        }
+      }
+    }
+
+    if (selectedOption) {
+      permission.resolve({
+        outcome: { outcome: "selected", optionId: selectedOption.optionId },
+      });
+    } else {
+      permission.resolve({ outcome: { outcome: "cancelled" } });
+    }
+    return;
+  }
+
+  emit({
+    type: "session.permission_resolved",
+    sessionId: session.sessionId,
+    permissionId: permId,
+  });
 }
 
 async function configureSession(
@@ -1143,6 +1748,9 @@ async function dispatch(
     case "session.interrupt": {
       const session = requireAcpSession(state, input.sessionId);
       session.interrupting = true;
+      cancelPendingPermissions(session, emit);
+      cancelPendingQuestions(session, emit);
+      resolvePendingPlan(session, emit);
       session.client?.cancel();
       emit({ type: "request.completed", requestId: input.requestId });
       return;
@@ -1154,7 +1762,11 @@ async function dispatch(
     }
     case "session.can_stop_runtime": {
       const session = requireAcpSession(state, input.sessionId);
-      const canStop = session.activeTurn === null;
+      const canStop =
+        session.activeTurn === null &&
+        session.pendingPermissions.size === 0 &&
+        session.pendingQuestions.size === 0 &&
+        session.pendingPlan === null;
       emit({
         type: "session.can_stop_runtime",
         requestId: input.requestId,
@@ -1164,17 +1776,16 @@ async function dispatch(
       return;
     }
     case "session.permission": {
-      // TODO(acp-3b): Permission cards
-      emit({
-        type: "session.permission_resolved",
-        sessionId: input.sessionId,
-        permissionId: input.permissionId,
-      });
+      const session = requireAcpSession(state, input.sessionId);
+      await respondToPermission(input, session, emit);
       return;
     }
     case "session.close": {
       const session = requireAcpSession(state, input.sessionId);
       session.closing = true;
+      cancelPendingPermissions(session, emit);
+      cancelPendingQuestions(session, emit);
+      resolvePendingPlan(session, emit);
       if (session.transcript) {
         await session.transcript.flush();
       }
@@ -1226,6 +1837,9 @@ export function createAcpConnection(
       const closingSessions: Promise<void>[] = [];
       for (const session of state.sessions.values()) {
         session.closing = true;
+        cancelPendingPermissions(session, emit);
+        cancelPendingQuestions(session, emit);
+        resolvePendingPlan(session, emit);
         if (session.transcript) {
           closingSessions.push(session.transcript.flush());
         }

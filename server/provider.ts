@@ -116,7 +116,7 @@ export const PLAN_MODE_ID = "plan";
 /** The slash command that runs as a plugin plan-mode turn instead of agy's own `/plan` workflow. */
 export const PLAN_COMMAND = "plan";
 /** The mode an approved plan is implemented in. */
-const IMPLEMENT_MODE_ID = "accept-edits";
+export const IMPLEMENT_MODE_ID = "accept-edits";
 /**
  * How often the transcript is read for a question's step before giving up. The line was already on
  * disk when the stream reported the step in every probe; the retries cover a slow flush.
@@ -134,7 +134,7 @@ Plan mode is on. Do not create, edit, move or delete any file, and do not run co
 End your turn with a concrete implementation plan for the user to approve: the files to change, what changes in each, and how the result will be verified. Do not implement the plan; the user will approve it first.
 </plan_mode>`;
 /** What the plugin sends once the user approves a plan. */
-const IMPLEMENT_PLAN_TEXT = "The plan is approved. Implement it now.";
+export const IMPLEMENT_PLAN_TEXT = "The plan is approved. Implement it now.";
 
 /**
  * A transient Antigravity outage. Captured verbatim from a real one as
