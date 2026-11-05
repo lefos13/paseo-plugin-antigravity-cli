@@ -47,6 +47,8 @@ export interface AgyAcpClientOptions {
     params: AcpElicitationParams,
   ) => Promise<AcpElicitationResult> | AcpElicitationResult;
   maxStderrLines?: number;
+  closeSessionTimeoutMs?: number;
+  exitGraceStepMs?: number;
 }
 
 export interface AgyAcpNewSessionOptions {
@@ -76,7 +78,8 @@ export type ElicitationHandler = (
 ) => Promise<AcpElicitationResult> | AcpElicitationResult;
 
 const DEFAULT_STDERR_TAIL_LINES = 100;
-const SIGKILL_GRACE_MS = 3_000;
+const CLOSE_SESSION_TIMEOUT_MS = 2_000;
+const EXIT_GRACE_STEP_MS = 1_500;
 
 /**
  * High-level ACP client that manages an Antigravity CLI process running in ACP mode (`agy acp`).
@@ -96,10 +99,13 @@ export class AgyAcpClient extends EventEmitter {
   private currentSessionId: string | null = null;
   private initResult: AcpInitializeResult | null = null;
   private disposed = false;
+  private closeEmitted = false;
   private exitPromise: Promise<void> | null = null;
   private resolveExit: (() => void) | null = null;
   private readonly stderrBuffer: string[] = [];
   private readonly maxStderrLines: number;
+  private readonly closeSessionTimeoutMs: number;
+  private readonly exitGraceStepMs: number;
 
   private requestPermissionHandler?: RequestPermissionHandler;
   private elicitationHandler?: ElicitationHandler;
@@ -110,6 +116,8 @@ export class AgyAcpClient extends EventEmitter {
   ) {
     super();
     this.maxStderrLines = options.maxStderrLines ?? DEFAULT_STDERR_TAIL_LINES;
+    this.closeSessionTimeoutMs = options.closeSessionTimeoutMs ?? CLOSE_SESSION_TIMEOUT_MS;
+    this.exitGraceStepMs = options.exitGraceStepMs ?? EXIT_GRACE_STEP_MS;
     this.requestPermissionHandler = options.onRequestPermission;
     this.elicitationHandler = options.onElicitation;
 
@@ -305,14 +313,19 @@ export class AgyAcpClient extends EventEmitter {
   /**
    * Close the active session (`session/close`).
    */
-  async closeSession(): Promise<void> {
+  async closeSession(options?: { timeoutMs?: number }): Promise<void> {
     const sessionId = this.currentSessionId;
     if (!sessionId) return;
     this.currentSessionId = null;
 
     if (this.connection && !this.connection.isClosed) {
       try {
-        await this.connection.request("session/close", { sessionId });
+        const req = this.connection.request("session/close", { sessionId });
+        if (options?.timeoutMs !== undefined && options.timeoutMs > 0) {
+          await Promise.race([req, delay(options.timeoutMs)]);
+        } else {
+          await req;
+        }
       } catch {
         // Safe to ignore on close if the process or session is already gone
       }
@@ -390,7 +403,7 @@ export class AgyAcpClient extends EventEmitter {
     this.disposed = true;
 
     try {
-      await this.closeSession();
+      await this.closeSession({ timeoutMs: this.closeSessionTimeoutMs });
     } catch {
       // Ignored during teardown
     }
@@ -400,15 +413,50 @@ export class AgyAcpClient extends EventEmitter {
     }
 
     if (this.child) {
-      this.child.stdin?.end();
-      this.child.kill("SIGKILL");
-      if (this.exitPromise) {
-        await Promise.race([this.exitPromise, delay(SIGKILL_GRACE_MS)]);
+      const child = this.child;
+      const exited = this.exitPromise;
+      child.stdin?.end();
+
+      // Step 1: Wait up to ~1.5s for graceful exit after closing stdin
+      let done = false;
+      if (exited) {
+        done = await Promise.race([
+          exited.then(() => true),
+          delay(this.exitGraceStepMs).then(() => false),
+        ]);
       }
+
+      // Step 2: If still running, send SIGTERM and wait up to ~1.5s
+      if (!done && this.child) {
+        try {
+          child.kill("SIGTERM");
+        } catch {
+          // Process might have just exited
+        }
+        if (exited) {
+          done = await Promise.race([
+            exited.then(() => true),
+            delay(this.exitGraceStepMs).then(() => false),
+          ]);
+        }
+      }
+
+      // Step 3: If still running, force kill with SIGKILL
+      if (!done && this.child) {
+        try {
+          child.kill("SIGKILL");
+        } catch {
+          // Process might have just exited
+        }
+        if (exited) {
+          await Promise.race([exited, delay(this.exitGraceStepMs)]);
+        }
+      }
+
       this.child = null;
     }
 
-    this.emit("close");
+    this.emitClose();
   }
 
   private ensureConnection(): void {
@@ -455,9 +503,15 @@ export class AgyAcpClient extends EventEmitter {
       return { action: "cancel" };
     });
 
-    conn.on("close", (err) => {
-      this.emit("close", err);
+    conn.on("close", () => {
+      this.emitClose();
     });
+  }
+
+  private emitClose(): void {
+    if (this.closeEmitted) return;
+    this.closeEmitted = true;
+    this.emit("close");
   }
 
   private recordStderr(line: string): void {

@@ -509,4 +509,117 @@ describe("AgyAcpClient", () => {
     await client.close();
     rmSync(tempDir, { recursive: true, force: true });
   });
+
+  it("bounds closeSession wait during close() when agy hangs on session/close", async () => {
+    const fakeAgent = new FakeAcpAgent();
+    // Simulate hung session/close
+    fakeAgent.connection.onRequest("session/close", () => new Promise(() => {}));
+
+    const client = new AgyAcpClient(
+      { cwd: "/fake/workspace" },
+      {
+        transport: fakeAgent.clientTransport,
+        closeSessionTimeoutMs: 50,
+      },
+    );
+
+    await client.newSession({ cwd: "/fake/workspace" });
+
+    const start = Date.now();
+    await client.close();
+    const elapsed = Date.now() - start;
+
+    expect(elapsed).toBeGreaterThanOrEqual(40);
+    expect(client.running).toBe(false);
+
+    fakeAgent.close();
+  });
+
+  it("emits the 'close' event exactly once during teardown", async () => {
+    const fakeAgent = new FakeAcpAgent();
+    const client = new AgyAcpClient(
+      { cwd: "/fake/workspace" },
+      { transport: fakeAgent.clientTransport },
+    );
+
+    let closeCount = 0;
+    client.on("close", () => {
+      closeCount++;
+    });
+
+    await client.newSession({ cwd: "/fake/workspace" });
+
+    // Explicit close() plus transport close
+    await client.close();
+    fakeAgent.close();
+
+    // Calling close again should also be a no-op
+    await client.close();
+
+    expect(closeCount).toBe(1);
+  });
+
+  it("terminates spawned process gracefully by closing stdin before escalating", async () => {
+    const tempDir = mkdtempSync(join(tmpdir(), "acp-graceful-test-"));
+    const scriptPath = join(tempDir, "graceful.sh");
+    // Script reads stdin until EOF, logs graceful exit to stderr, and exits 0
+    writeFileSync(
+      scriptPath,
+      "#!/bin/sh\nwhile read line; do :; done\necho 'flushed and exited gracefully' >&2\nexit 0\n",
+      { mode: 0o755 },
+    );
+
+    const client = new AgyAcpClient(
+      {
+        cwd: tempDir,
+        binary: scriptPath,
+      },
+      {
+        exitGraceStepMs: 100,
+      },
+    );
+
+    client.start();
+    await new Promise((resolve) => setTimeout(resolve, 20));
+
+    await client.close();
+
+    expect(client.stderrTail).toContain("flushed and exited gracefully");
+    rmSync(tempDir, { recursive: true, force: true });
+  });
+
+  it("escalates to SIGTERM when spawned process ignores stdin closure", async () => {
+    const tempDir = mkdtempSync(join(tmpdir(), "acp-term-test-"));
+    const scriptPath = join(tempDir, "term.sh");
+    // Script ignores stdin closure and loops
+    writeFileSync(
+      scriptPath,
+      "#!/bin/sh\nwhile true; do sleep 1; done\n",
+      { mode: 0o755 },
+    );
+
+    const client = new AgyAcpClient(
+      {
+        cwd: tempDir,
+        binary: scriptPath,
+      },
+      {
+        exitGraceStepMs: 50,
+      },
+    );
+
+    let exitInfo: { code: number | null; signal: NodeJS.Signals | null } | null = null;
+    client.on("exit", (info) => {
+      exitInfo = info;
+    });
+
+    client.start();
+    await new Promise((resolve) => setTimeout(resolve, 20));
+
+    await client.close();
+
+    // The process did not exit on stdin closure, so SIGTERM was sent
+    expect(exitInfo).toEqual({ code: null, signal: "SIGTERM" });
+    rmSync(tempDir, { recursive: true, force: true });
+  });
 });

@@ -211,4 +211,43 @@ describe("JsonRpcConnection", () => {
 
     client.close();
   });
+
+  it("safely drops write failures without unhandled promise rejections when agent closes mid-request", async () => {
+    const toAgent = new PassThrough();
+    const fromAgent = new PassThrough();
+    const client = new JsonRpcConnection(fromAgent, toAgent);
+
+    client.onRequest("slowQuestion", async () => {
+      // Simulate handler throwing when stream is broken
+      throw new Error("Handler failed");
+    });
+
+    // Destroy output stream so any respond or respondError will fail
+    toAgent.destroy(new Error("Stream destroyed by agent death"));
+
+    // Send an incoming request line from the dying agent
+    fromAgent.write(
+      JSON.stringify({
+        jsonrpc: "2.0",
+        id: "die-1",
+        method: "slowQuestion",
+        params: {},
+      }) + "\n",
+    );
+
+    // Also send an incoming request for a method that does not exist
+    fromAgent.write(
+      JSON.stringify({
+        jsonrpc: "2.0",
+        id: "die-2",
+        method: "missingMethod",
+        params: {},
+      }) + "\n",
+    );
+
+    // Wait a tick to ensure no unhandled promise rejection escapes
+    await new Promise((resolve) => setTimeout(resolve, 20));
+
+    client.close();
+  });
 });

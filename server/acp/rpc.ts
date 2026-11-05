@@ -342,7 +342,9 @@ export class JsonRpcConnection extends EventEmitter {
         record.id as number | string,
         record.method,
         record.params,
-      );
+      ).catch(() => {
+        // Write failures on a closed connection or dying agent are safely dropped.
+      });
       return;
     }
 
@@ -392,11 +394,15 @@ export class JsonRpcConnection extends EventEmitter {
   ): Promise<void> {
     const handler = this.requestHandlers.get(method);
     if (!handler) {
-      await this.respondError(
-        id,
-        JSON_RPC_ERRORS.METHOD_NOT_FOUND,
-        `Method not found: ${method}`,
-      );
+      try {
+        await this.respondError(
+          id,
+          JSON_RPC_ERRORS.METHOD_NOT_FOUND,
+          `Method not found: ${method}`,
+        );
+      } catch {
+        // Drop write failures on closed connection or dying stream
+      }
       return;
     }
 
@@ -407,7 +413,11 @@ export class JsonRpcConnection extends EventEmitter {
       const message = err instanceof Error ? err.message : String(err);
       const code = err instanceof JsonRpcError ? err.code : JSON_RPC_ERRORS.INTERNAL_ERROR;
       const data = err instanceof JsonRpcError ? err.data : undefined;
-      await this.respondError(id, code, message, data);
+      try {
+        await this.respondError(id, code, message, data);
+      } catch {
+        // Drop write failures on closed connection or dying stream
+      }
     }
   }
 
