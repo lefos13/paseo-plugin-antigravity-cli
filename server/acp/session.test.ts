@@ -3568,4 +3568,1225 @@ describe("ACP Parity & Advanced Flows (Phase 3c)", () => {
       await connection.close();
     });
   });
+
+  describe("Auto-Continue after turn ended (Phase 4 Item A)", () => {
+    let tempDir: string;
+    let fakeAgent: FakeAcpAgent;
+    let events: ProviderEvent[];
+
+    beforeEach(() => {
+      tempDir = mkdtempSync(join(tmpdir(), "acp-4a-test-"));
+      fakeAgent = new FakeAcpAgent({ enableSteering: true });
+      events = [];
+    });
+
+    afterEach(() => {
+      fakeAgent.close();
+      try {
+        rmSync(tempDir, { recursive: true, force: true });
+      } catch {
+        // Best effort cleanup
+      }
+    });
+
+    function makeConfig(overrides: Partial<ProviderSessionConfig> = {}): ProviderSessionConfig {
+      return {
+        cwd: tempDir,
+        env: {},
+        mcpServers: {},
+        settings: {},
+        persist: true,
+        ...overrides,
+      };
+    }
+
+    function timelineItems(sessionId?: string): ProviderTimelineItem[] {
+      return events
+        .filter(
+          (e): e is Extract<ProviderEvent, { type: "timeline.item" }> =>
+            e.type === "timeline.item" && (!sessionId || e.sessionId === sessionId),
+        )
+        .map((e) => e.item);
+    }
+
+    function toolCallItems(): Extract<ProviderTimelineItem, { type: "tool_call" }>[] {
+      return timelineItems().filter(
+        (i): i is Extract<ProviderTimelineItem, { type: "tool_call" }> => i.type === "tool_call",
+      );
+    }
+
+    async function waitFor<T>(predicate: () => T | undefined, label: string, timeoutMs = 3000): Promise<T> {
+      const start = Date.now();
+      while (Date.now() - start < timeoutMs) {
+        const val = predicate();
+        if (val !== undefined && (val as unknown) !== false) return val;
+        await new Promise((r) => setTimeout(r, 10));
+      }
+      throw new Error(`Timed out waiting for ${label}`);
+    }
+
+    async function waitForTurnCompletion(
+      sessionId = "s1",
+      turnId?: string,
+      timeoutMs = 3000,
+    ): Promise<Extract<ProviderEvent, { type: "session.turn" }>> {
+      const start = Date.now();
+      while (Date.now() - start < timeoutMs) {
+        const turns = events.filter(
+          (e): e is Extract<ProviderEvent, { type: "session.turn" }> =>
+            e.type === "session.turn" &&
+            e.sessionId === sessionId &&
+            (e.state === "completed" || e.state === "failed" || e.state === "canceled"),
+        );
+        if (turnId) {
+          const match = turns.find((t) => t.turnId === turnId);
+          if (match) return match;
+        } else if (turns.length > 0) {
+          return turns[turns.length - 1];
+        }
+        await new Promise((r) => setTimeout(r, 10));
+      }
+      throw new Error(`Timed out waiting for turn completion in session ${sessionId}`);
+    }
+
+    it("subagent finishes after end_turn -> one automatic prompt (content, auto: row)", async () => {
+      const parentConvo = "11111111-2222-3333-4444-555555555555";
+      const childConvo = "cccccccc-0000-4000-8000-000000000000";
+      const childLogUri = pathToFileURL(join(tempDir, "child-auto.jsonl")).href;
+
+      const parentTranscript = [
+        JSON.stringify({
+          step_index: 0,
+          source: "USER_EXPLICIT",
+          type: "USER_INPUT",
+          status: "DONE",
+          content: "<USER_REQUEST>\nParent work\n</USER_REQUEST>",
+        }),
+        JSON.stringify({
+          step_index: 1,
+          source: "MODEL",
+          type: "PLANNER_RESPONSE",
+          status: "DONE",
+          content: `Created the following subagents:\n${JSON.stringify({
+            conversationId: childConvo,
+            logAbsoluteUri: childLogUri,
+          })}`,
+          tool_calls: [
+            {
+              tool_name: "invoke_subagent",
+              tool_args: { Model: "inherit", Prompt: "Subagent task", Role: "Codebase Researcher", TypeName: "research" },
+            },
+          ],
+        }),
+        "",
+      ].join("\n");
+
+      let childTranscript = [
+        JSON.stringify({
+          step_index: 0,
+          source: "USER_EXPLICIT",
+          type: "USER_INPUT",
+          status: "DONE",
+          content: "<USER_REQUEST>\nSubagent task\n</USER_REQUEST>",
+        }),
+        "",
+      ].join("\n");
+
+      const virtualFiles = new Map<string, string>();
+      const parentPath = conversationTranscriptPath(accountGeminiRoot("default"), parentConvo);
+      const childPath = join(tempDir, "child-auto.jsonl");
+      virtualFiles.set(parentPath, parentTranscript);
+      virtualFiles.set(childPath, childTranscript);
+
+      const customOptions: AcpConnectionOptions = {
+        transport: fakeAgent.clientTransport,
+        readTranscriptFile: async (p) => virtualFiles.get(p) ?? "",
+        statTranscriptFile: async (p) => ({
+          size: Buffer.byteLength(virtualFiles.get(p) ?? "", "utf8"),
+          mtimeMs: Date.now(),
+        }),
+        autoContinueDelayMs: 25,
+        backgroundPollMs: 15,
+      };
+
+      const connection = createAcpConnection(ACP_CAPABILITIES, customOptions);
+      connection.onEvent((e) => events.push(e));
+
+      await connection.send({
+        type: "session.open",
+        requestId: "r1",
+        sessionId: "s1",
+        config: makeConfig(),
+        persistence: {
+          version: 1,
+          data: {
+            conversationId: parentConvo,
+            accountId: "default",
+            transport: "acp",
+          },
+        },
+        history: "skip",
+      });
+
+      // Prompt 1: parent spawns subagent and ends its turn
+      fakeAgent.setPromptHandler(async () => {
+        fakeAgent.emitSessionUpdate("s1", {
+          sessionUpdate: "tool_call",
+          toolCallId: "call-sub-auto",
+          name: "invoke_subagent",
+          args: { Model: "inherit", Prompt: "Subagent task", Role: "Codebase Researcher", TypeName: "research" },
+        });
+        return { stopReason: "end_turn", usage: { totalTokens: 10 } };
+      });
+
+      await connection.send({
+        type: "session.prompt",
+        sessionId: "s1",
+        prompt: {
+          clientMessageId: "m1",
+          delivery: "auto",
+          input: {
+            type: "message",
+            content: [{ type: "text", text: "Start task" }],
+          },
+        },
+      });
+
+      await waitForTurnCompletion("s1");
+      const childId = childSessionId("s1", childConvo);
+      await waitFor(() => events.some((e) => e.type === "session.opened" && e.sessionId === childId), "child open");
+
+      // Setup fake agent to handle the automatic prompt
+      fakeAgent.setPromptHandler(async () => {
+        return { stopReason: "end_turn", usage: { totalTokens: 8 } };
+      });
+
+      // Now complete the child transcript after parent ended
+      childTranscript = [
+        JSON.stringify({
+          step_index: 0,
+          source: "USER_EXPLICIT",
+          type: "USER_INPUT",
+          status: "DONE",
+          content: "<USER_REQUEST>\nSubagent task\n</USER_REQUEST>",
+        }),
+        JSON.stringify({
+          step_index: 1,
+          source: "MODEL",
+          type: "PLANNER_RESPONSE",
+          status: "DONE",
+          content: "Found 12 dependencies in package.json.",
+          tool_calls: [],
+        }),
+        "",
+      ].join("\n");
+      virtualFiles.set(childPath, childTranscript);
+
+      // Wait for child turn to complete
+      await waitFor(
+        () => events.some((e) => e.type === "session.turn" && e.sessionId === childId && e.state === "completed"),
+        "child turn completed",
+      );
+
+      // Wait for second turn to start and complete
+      await waitFor(
+        () => events.filter((e) => e.type === "session.turn" && e.sessionId === "s1" && e.state === "completed").length >= 2,
+        "second turn to complete",
+      );
+
+      // Verify prompt requests recorded by fakeAgent
+      const promptRequests = fakeAgent.recordedRequests.filter((r) => r.method === "session/prompt");
+      expect(promptRequests).toHaveLength(2);
+
+      const autoPrompt = promptRequests[1];
+      const params = autoPrompt.params as { prompt: Array<{ type: string; text: string }> };
+      expect(params.prompt[0].text).toBe(
+        `[Automatic message from Paseo] Subagent "Codebase Researcher" finished. Its final reply:\n\nFound 12 dependencies in package.json.`,
+      );
+
+      // Verify timeline item for auto message
+      const userItems = timelineItems("s1").filter((i) => i.type === "user_message");
+      expect(userItems).toHaveLength(2);
+      expect(userItems[1].id).toMatch(/^auto:turn-/);
+      expect(userItems[1].text).toBe(params.prompt[0].text);
+
+      await connection.close();
+    });
+
+    it("coalescing two completions within delay window into one automatic prompt", async () => {
+      const parentConvo = "11111111-2222-3333-4444-555555555555";
+      const childConvo1 = "cccccccc-0000-4000-8000-000000000001";
+      const childConvo2 = "cccccccc-0000-4000-8000-000000000002";
+      const childLogUri1 = pathToFileURL(join(tempDir, "child-coal-1.jsonl")).href;
+      const childLogUri2 = pathToFileURL(join(tempDir, "child-coal-2.jsonl")).href;
+
+      const parentTranscript = [
+        JSON.stringify({
+          step_index: 0,
+          source: "USER_EXPLICIT",
+          type: "USER_INPUT",
+          status: "DONE",
+          content: "<USER_REQUEST>\nParent work\n</USER_REQUEST>",
+        }),
+        JSON.stringify({
+          step_index: 1,
+          source: "MODEL",
+          type: "PLANNER_RESPONSE",
+          status: "DONE",
+          content: `Created the following subagents:\n${JSON.stringify({
+            conversationId: childConvo1,
+            logAbsoluteUri: childLogUri1,
+          })}\n${JSON.stringify({
+            conversationId: childConvo2,
+            logAbsoluteUri: childLogUri2,
+          })}`,
+          tool_calls: [
+            {
+              tool_name: "invoke_subagent",
+              tool_args: { Model: "inherit", Prompt: "Task 1", Role: "Researcher 1", TypeName: "r1" },
+            },
+            {
+              tool_name: "invoke_subagent",
+              tool_args: { Model: "inherit", Prompt: "Task 2", Role: "Researcher 2", TypeName: "r2" },
+            },
+          ],
+        }),
+        "",
+      ].join("\n");
+
+      let childTranscript1 = [
+        JSON.stringify({
+          step_index: 0,
+          source: "USER_EXPLICIT",
+          type: "USER_INPUT",
+          status: "DONE",
+          content: "<USER_REQUEST>\nTask 1\n</USER_REQUEST>",
+        }),
+        "",
+      ].join("\n");
+
+      let childTranscript2 = [
+        JSON.stringify({
+          step_index: 0,
+          source: "USER_EXPLICIT",
+          type: "USER_INPUT",
+          status: "DONE",
+          content: "<USER_REQUEST>\nTask 2\n</USER_REQUEST>",
+        }),
+        "",
+      ].join("\n");
+
+      const virtualFiles = new Map<string, string>();
+      const parentPath = conversationTranscriptPath(accountGeminiRoot("default"), parentConvo);
+      const childPath1 = join(tempDir, "child-coal-1.jsonl");
+      const childPath2 = join(tempDir, "child-coal-2.jsonl");
+      virtualFiles.set(parentPath, parentTranscript);
+      virtualFiles.set(childPath1, childTranscript1);
+      virtualFiles.set(childPath2, childTranscript2);
+
+      const customOptions: AcpConnectionOptions = {
+        transport: fakeAgent.clientTransport,
+        readTranscriptFile: async (p) => virtualFiles.get(p) ?? "",
+        statTranscriptFile: async (p) => ({
+          size: Buffer.byteLength(virtualFiles.get(p) ?? "", "utf8"),
+          mtimeMs: Date.now(),
+        }),
+        autoContinueDelayMs: 60,
+        backgroundPollMs: 15,
+      };
+
+      const connection = createAcpConnection(ACP_CAPABILITIES, customOptions);
+      connection.onEvent((e) => events.push(e));
+
+      await connection.send({
+        type: "session.open",
+        requestId: "r1",
+        sessionId: "s1",
+        config: makeConfig(),
+        persistence: {
+          version: 1,
+          data: {
+            conversationId: parentConvo,
+            accountId: "default",
+            transport: "acp",
+          },
+        },
+        history: "skip",
+      });
+
+      fakeAgent.setPromptHandler(async () => {
+        fakeAgent.emitSessionUpdate("s1", {
+          sessionUpdate: "tool_call",
+          toolCallId: "call-c1",
+          name: "invoke_subagent",
+          args: { Model: "inherit", Prompt: "Task 1", Role: "Researcher 1", TypeName: "r1" },
+        });
+        fakeAgent.emitSessionUpdate("s1", {
+          sessionUpdate: "tool_call",
+          toolCallId: "call-c2",
+          name: "invoke_subagent",
+          args: { Model: "inherit", Prompt: "Task 2", Role: "Researcher 2", TypeName: "r2" },
+        });
+        return { stopReason: "end_turn", usage: { totalTokens: 10 } };
+      });
+
+      await connection.send({
+        type: "session.prompt",
+        sessionId: "s1",
+        prompt: {
+          clientMessageId: "m1",
+          delivery: "auto",
+          input: {
+            type: "message",
+            content: [{ type: "text", text: "Start tasks" }],
+          },
+        },
+      });
+
+      await waitForTurnCompletion("s1");
+      const childId1 = childSessionId("s1", childConvo1);
+      const childId2 = childSessionId("s1", childConvo2);
+      await waitFor(() => events.some((e) => e.type === "session.opened" && e.sessionId === childId1), "child 1 open");
+      await waitFor(() => events.some((e) => e.type === "session.opened" && e.sessionId === childId2), "child 2 open");
+
+      fakeAgent.setPromptHandler(async () => {
+        return { stopReason: "end_turn", usage: { totalTokens: 8 } };
+      });
+
+      // Complete both child transcripts nearly simultaneously
+      childTranscript1 = [
+        JSON.stringify({
+          step_index: 0,
+          source: "USER_EXPLICIT",
+          type: "USER_INPUT",
+          status: "DONE",
+          content: "<USER_REQUEST>\nTask 1\n</USER_REQUEST>",
+        }),
+        JSON.stringify({
+          step_index: 1,
+          source: "MODEL",
+          type: "PLANNER_RESPONSE",
+          status: "DONE",
+          content: "Report from Researcher 1.",
+          tool_calls: [],
+        }),
+        "",
+      ].join("\n");
+      virtualFiles.set(childPath1, childTranscript1);
+
+      childTranscript2 = [
+        JSON.stringify({
+          step_index: 0,
+          source: "USER_EXPLICIT",
+          type: "USER_INPUT",
+          status: "DONE",
+          content: "<USER_REQUEST>\nTask 2\n</USER_REQUEST>",
+        }),
+        JSON.stringify({
+          step_index: 1,
+          source: "MODEL",
+          type: "PLANNER_RESPONSE",
+          status: "DONE",
+          content: "Report from Researcher 2.",
+          tool_calls: [],
+        }),
+        "",
+      ].join("\n");
+      virtualFiles.set(childPath2, childTranscript2);
+
+      // Wait for both child turns to complete
+      await waitFor(
+        () => events.some((e) => e.type === "session.turn" && e.sessionId === childId1 && e.state === "completed"),
+        "child 1 turn completed",
+      );
+      await waitFor(
+        () => events.some((e) => e.type === "session.turn" && e.sessionId === childId2 && e.state === "completed"),
+        "child 2 turn completed",
+      );
+
+      await waitFor(
+        () => events.filter((e) => e.type === "session.turn" && e.sessionId === "s1" && e.state === "completed").length >= 2,
+        "coalesced turn to complete",
+      );
+
+      // Verify only ONE prompt request was sent for both completions!
+      const promptRequests = fakeAgent.recordedRequests.filter((r) => r.method === "session/prompt");
+      expect(promptRequests).toHaveLength(2);
+
+      const autoPrompt = promptRequests[1];
+      const params = autoPrompt.params as { prompt: Array<{ type: string; text: string }> };
+      const text = params.prompt[0].text;
+      expect(text).toContain('Subagent "Researcher 1" finished. Its final reply:\n\nReport from Researcher 1.');
+      expect(text).toContain('Subagent "Researcher 2" finished. Its final reply:\n\nReport from Researcher 2.');
+
+      await connection.close();
+    });
+
+    it("user message first -> automatic continuation is dropped", async () => {
+      const parentConvo = "11111111-2222-3333-4444-555555555555";
+      const childConvo = "cccccccc-0000-4000-8000-000000000003";
+      const childLogUri = pathToFileURL(join(tempDir, "child-drop.jsonl")).href;
+
+      const parentTranscript = [
+        JSON.stringify({
+          step_index: 0,
+          source: "USER_EXPLICIT",
+          type: "USER_INPUT",
+          status: "DONE",
+          content: "<USER_REQUEST>\nParent work\n</USER_REQUEST>",
+        }),
+        JSON.stringify({
+          step_index: 1,
+          source: "MODEL",
+          type: "PLANNER_RESPONSE",
+          status: "DONE",
+          content: `Created the following subagents:\n${JSON.stringify({
+            conversationId: childConvo,
+            logAbsoluteUri: childLogUri,
+          })}`,
+          tool_calls: [
+            {
+              tool_name: "invoke_subagent",
+              tool_args: { Model: "inherit", Prompt: "Subagent task", Role: "Worker", TypeName: "worker" },
+            },
+          ],
+        }),
+        "",
+      ].join("\n");
+
+      let childTranscript = [
+        JSON.stringify({
+          step_index: 0,
+          source: "USER_EXPLICIT",
+          type: "USER_INPUT",
+          status: "DONE",
+          content: "<USER_REQUEST>\nSubagent task\n</USER_REQUEST>",
+        }),
+        "",
+      ].join("\n");
+
+      const virtualFiles = new Map<string, string>();
+      const parentPath = conversationTranscriptPath(accountGeminiRoot("default"), parentConvo);
+      const childPath = join(tempDir, "child-drop.jsonl");
+      virtualFiles.set(parentPath, parentTranscript);
+      virtualFiles.set(childPath, childTranscript);
+
+      const customOptions: AcpConnectionOptions = {
+        transport: fakeAgent.clientTransport,
+        readTranscriptFile: async (p) => virtualFiles.get(p) ?? "",
+        statTranscriptFile: async (p) => ({
+          size: Buffer.byteLength(virtualFiles.get(p) ?? "", "utf8"),
+          mtimeMs: Date.now(),
+        }),
+        autoContinueDelayMs: 150,
+        backgroundPollMs: 15,
+      };
+
+      const connection = createAcpConnection(ACP_CAPABILITIES, customOptions);
+      connection.onEvent((e) => events.push(e));
+
+      await connection.send({
+        type: "session.open",
+        requestId: "r1",
+        sessionId: "s1",
+        config: makeConfig(),
+        persistence: {
+          version: 1,
+          data: {
+            conversationId: parentConvo,
+            accountId: "default",
+            transport: "acp",
+          },
+        },
+        history: "skip",
+      });
+
+      fakeAgent.setPromptHandler(async () => {
+        fakeAgent.emitSessionUpdate("s1", {
+          sessionUpdate: "tool_call",
+          toolCallId: "call-drop-1",
+          name: "invoke_subagent",
+          args: { Model: "inherit", Prompt: "Subagent task", Role: "Worker", TypeName: "worker" },
+        });
+        return { stopReason: "end_turn", usage: { totalTokens: 10 } };
+      });
+
+      await connection.send({
+        type: "session.prompt",
+        sessionId: "s1",
+        prompt: {
+          clientMessageId: "m1",
+          delivery: "auto",
+          input: {
+            type: "message",
+            content: [{ type: "text", text: "Start task" }],
+          },
+        },
+      });
+
+      await waitForTurnCompletion("s1");
+      const childId = childSessionId("s1", childConvo);
+      await waitFor(() => events.some((e) => e.type === "session.opened" && e.sessionId === childId), "child open");
+
+      // Child finishes after parent turn ended
+      childTranscript = [
+        JSON.stringify({
+          step_index: 0,
+          source: "USER_EXPLICIT",
+          type: "USER_INPUT",
+          status: "DONE",
+          content: "<USER_REQUEST>\nSubagent task\n</USER_REQUEST>",
+        }),
+        JSON.stringify({
+          step_index: 1,
+          source: "MODEL",
+          type: "PLANNER_RESPONSE",
+          status: "DONE",
+          content: "Worker completed.",
+          tool_calls: [],
+        }),
+        "",
+      ].join("\n");
+      virtualFiles.set(childPath, childTranscript);
+
+      await waitFor(
+        () => events.some((e) => e.type === "session.turn" && e.sessionId === childId && e.state === "completed"),
+        "child turn completed",
+      );
+
+      // User sends a message immediately before 150ms timer expires!
+      fakeAgent.setPromptHandler(async () => {
+        return { stopReason: "end_turn", usage: { totalTokens: 12 } };
+      });
+
+      await connection.send({
+        type: "session.prompt",
+        sessionId: "s1",
+        prompt: {
+          clientMessageId: "m2",
+          delivery: "auto",
+          input: {
+            type: "message",
+            content: [{ type: "text", text: "User prompt superseding auto" }],
+          },
+        },
+      });
+
+      await waitForTurnCompletion("s1");
+      // Wait for any trailing timers
+      await new Promise((r) => setTimeout(r, 200));
+
+      // Check prompt requests: exactly 2 (m1 and m2), no automatic continuation!
+      const promptRequests = fakeAgent.recordedRequests.filter((r) => r.method === "session/prompt");
+      expect(promptRequests).toHaveLength(2);
+      const params = promptRequests[1].params as { prompt: Array<{ text: string }> };
+      expect(params.prompt[0].text).toBe("User prompt superseding auto");
+
+      await connection.close();
+    });
+
+    it("mid-turn completion -> does nothing (no automatic prompt)", async () => {
+      const parentConvo = "11111111-2222-3333-4444-555555555555";
+      const childConvo = "cccccccc-0000-4000-8000-000000000004";
+      const childLogUri = pathToFileURL(join(tempDir, "child-mid.jsonl")).href;
+
+      const parentTranscript = [
+        JSON.stringify({
+          step_index: 0,
+          source: "USER_EXPLICIT",
+          type: "USER_INPUT",
+          status: "DONE",
+          content: "<USER_REQUEST>\nParent work\n</USER_REQUEST>",
+        }),
+        JSON.stringify({
+          step_index: 1,
+          source: "MODEL",
+          type: "PLANNER_RESPONSE",
+          status: "DONE",
+          content: `Created the following subagents:\n${JSON.stringify({
+            conversationId: childConvo,
+            logAbsoluteUri: childLogUri,
+          })}`,
+          tool_calls: [
+            {
+              tool_name: "invoke_subagent",
+              tool_args: { Model: "inherit", Prompt: "Subagent task", Role: "Worker", TypeName: "worker" },
+            },
+          ],
+        }),
+        "",
+      ].join("\n");
+
+      let childTranscript = [
+        JSON.stringify({
+          step_index: 0,
+          source: "USER_EXPLICIT",
+          type: "USER_INPUT",
+          status: "DONE",
+          content: "<USER_REQUEST>\nSubagent task\n</USER_REQUEST>",
+        }),
+        "",
+      ].join("\n");
+
+      const virtualFiles = new Map<string, string>();
+      const parentPath = conversationTranscriptPath(accountGeminiRoot("default"), parentConvo);
+      const childPath = join(tempDir, "child-mid.jsonl");
+      virtualFiles.set(parentPath, parentTranscript);
+      virtualFiles.set(childPath, childTranscript);
+
+      const customOptions: AcpConnectionOptions = {
+        transport: fakeAgent.clientTransport,
+        readTranscriptFile: async (p) => virtualFiles.get(p) ?? "",
+        statTranscriptFile: async (p) => ({
+          size: Buffer.byteLength(virtualFiles.get(p) ?? "", "utf8"),
+          mtimeMs: Date.now(),
+        }),
+        autoContinueDelayMs: 25,
+        backgroundPollMs: 15,
+      };
+
+      const connection = createAcpConnection(ACP_CAPABILITIES, customOptions);
+      connection.onEvent((e) => events.push(e));
+
+      await connection.send({
+        type: "session.open",
+        requestId: "r1",
+        sessionId: "s1",
+        config: makeConfig(),
+        persistence: {
+          version: 1,
+          data: {
+            conversationId: parentConvo,
+            accountId: "default",
+            transport: "acp",
+          },
+        },
+        history: "skip",
+      });
+
+      fakeAgent.setPromptHandler(async () => {
+        fakeAgent.emitSessionUpdate("s1", {
+          sessionUpdate: "tool_call",
+          toolCallId: "call-mid-1",
+          name: "invoke_subagent",
+          args: { Model: "inherit", Prompt: "Subagent task", Role: "Worker", TypeName: "worker" },
+        });
+
+        const childId = childSessionId("s1", childConvo);
+        await waitFor(() => events.some((e) => e.type === "session.opened" && e.sessionId === childId), "child open");
+
+        // Complete the child transcript WHILE parent turn is still running!
+        childTranscript = [
+          JSON.stringify({
+            step_index: 0,
+            source: "USER_EXPLICIT",
+            type: "USER_INPUT",
+            status: "DONE",
+            content: "<USER_REQUEST>\nSubagent task\n</USER_REQUEST>",
+          }),
+          JSON.stringify({
+            step_index: 1,
+            source: "MODEL",
+            type: "PLANNER_RESPONSE",
+            status: "DONE",
+            content: "Mid-turn child completed.",
+            tool_calls: [],
+          }),
+          "",
+        ].join("\n");
+        virtualFiles.set(childPath, childTranscript);
+
+        await waitFor(
+          () => events.some((e) => e.type === "session.turn" && e.sessionId === childId && e.state === "completed"),
+          "child turn completed",
+        );
+
+        return { stopReason: "end_turn", usage: { totalTokens: 10 } };
+      });
+
+      await connection.send({
+        type: "session.prompt",
+        sessionId: "s1",
+        prompt: {
+          clientMessageId: "m1",
+          delivery: "auto",
+          input: {
+            type: "message",
+            content: [{ type: "text", text: "Start task" }],
+          },
+        },
+      });
+
+      await waitForTurnCompletion("s1");
+      // Wait longer than autoContinueDelayMs to verify no auto-continue starts
+      await new Promise((r) => setTimeout(r, 60));
+
+      const promptRequests = fakeAgent.recordedRequests.filter((r) => r.method === "session/prompt");
+      expect(promptRequests).toHaveLength(1);
+
+      await connection.close();
+    });
+
+    it("the 5-in-a-row cap -> emits notice instead of prompt", async () => {
+      const parentConvo = "11111111-2222-3333-4444-555555555555";
+      const childConvo = "cccccccc-0000-4000-8000-000000000005";
+      const childLogUri = pathToFileURL(join(tempDir, "child-cap.jsonl")).href;
+
+      const parentTranscript = [
+        JSON.stringify({
+          step_index: 0,
+          source: "USER_EXPLICIT",
+          type: "USER_INPUT",
+          status: "DONE",
+          content: "<USER_REQUEST>\nParent work\n</USER_REQUEST>",
+        }),
+        JSON.stringify({
+          step_index: 1,
+          source: "MODEL",
+          type: "PLANNER_RESPONSE",
+          status: "DONE",
+          content: `Created the following subagents:\n${JSON.stringify({
+            conversationId: childConvo,
+            logAbsoluteUri: childLogUri,
+          })}`,
+          tool_calls: [
+            {
+              tool_name: "invoke_subagent",
+              tool_args: { Model: "inherit", Prompt: "Subagent task", Role: "Worker", TypeName: "worker" },
+            },
+          ],
+        }),
+        "",
+      ].join("\n");
+
+      let childTranscript = [
+        JSON.stringify({
+          step_index: 0,
+          source: "USER_EXPLICIT",
+          type: "USER_INPUT",
+          status: "DONE",
+          content: "<USER_REQUEST>\nSubagent task\n</USER_REQUEST>",
+        }),
+        "",
+      ].join("\n");
+
+      const virtualFiles = new Map<string, string>();
+      const parentPath = conversationTranscriptPath(accountGeminiRoot("default"), parentConvo);
+      const childPath = join(tempDir, "child-cap.jsonl");
+      virtualFiles.set(parentPath, parentTranscript);
+      virtualFiles.set(childPath, childTranscript);
+
+      const customOptions: AcpConnectionOptions = {
+        transport: fakeAgent.clientTransport,
+        readTranscriptFile: async (p) => virtualFiles.get(p) ?? "",
+        statTranscriptFile: async (p) => ({
+          size: Buffer.byteLength(virtualFiles.get(p) ?? "", "utf8"),
+          mtimeMs: Date.now(),
+        }),
+        autoContinueDelayMs: 25,
+        backgroundPollMs: 15,
+      };
+
+      const connection = createAcpConnection(ACP_CAPABILITIES, customOptions);
+      connection.onEvent((e) => events.push(e));
+
+      await connection.send({
+        type: "session.open",
+        requestId: "r1",
+        sessionId: "s1",
+        config: makeConfig(),
+        persistence: {
+          version: 1,
+          data: {
+            conversationId: parentConvo,
+            accountId: "default",
+            transport: "acp",
+          },
+        },
+        history: "skip",
+      });
+
+      fakeAgent.setPromptHandler(async () => {
+        fakeAgent.emitSessionUpdate("s1", {
+          sessionUpdate: "tool_call",
+          toolCallId: "call-cap-1",
+          name: "invoke_subagent",
+          args: { Model: "inherit", Prompt: "Subagent task", Role: "Worker", TypeName: "worker" },
+        });
+        return { stopReason: "end_turn", usage: { totalTokens: 10 } };
+      });
+
+      await connection.send({
+        type: "session.prompt",
+        sessionId: "s1",
+        prompt: {
+          clientMessageId: "m1",
+          delivery: "auto",
+          input: {
+            type: "message",
+            content: [{ type: "text", text: "Start task" }],
+          },
+        },
+      });
+
+      await waitForTurnCompletion("s1");
+      const childId = childSessionId("s1", childConvo);
+      await waitFor(() => events.some((e) => e.type === "session.opened" && e.sessionId === childId), "child open");
+
+      // Set consecutiveAutoContinuations directly to 5 to test cap boundary
+      const sessionState = (connection as any).state?.sessions?.get("s1");
+      if (sessionState) {
+        sessionState.consecutiveAutoContinuations = 5;
+      }
+
+      // Complete the child transcript after parent turn ended
+      childTranscript = [
+        JSON.stringify({
+          step_index: 0,
+          source: "USER_EXPLICIT",
+          type: "USER_INPUT",
+          status: "DONE",
+          content: "<USER_REQUEST>\nSubagent task\n</USER_REQUEST>",
+        }),
+        JSON.stringify({
+          step_index: 1,
+          source: "MODEL",
+          type: "PLANNER_RESPONSE",
+          status: "DONE",
+          content: "Worker completed at cap.",
+          tool_calls: [],
+        }),
+        "",
+      ].join("\n");
+      virtualFiles.set(childPath, childTranscript);
+
+      // Wait for notice to be emitted
+      await waitFor(
+        () => events.find((e) => e.type === "session.notice" && e.notice.id === "agy-auto-continue-cap"),
+        "notice to be emitted on cap",
+      );
+
+      const noticeEvent = events.find((e) => e.type === "session.notice" && e.notice.id === "agy-auto-continue-cap") as any;
+      expect(noticeEvent.notice.title).toBe("Subagent finished — send a message to continue");
+
+      // No new turn was started
+      const promptRequests = fakeAgent.recordedRequests.filter((r) => r.method === "session/prompt");
+      expect(promptRequests).toHaveLength(1);
+
+      await connection.close();
+    });
+
+    it("background command completion from fixture transcript -> row updated + automatic prompt", async () => {
+      const parentConvo = "11111111-2222-3333-4444-555555555555";
+
+      let parentTranscript = [
+        JSON.stringify({
+          step_index: 0,
+          source: "USER_EXPLICIT",
+          type: "USER_INPUT",
+          status: "DONE",
+          content: "<USER_REQUEST>\nStart dev server\n</USER_REQUEST>",
+        }),
+        JSON.stringify({
+          step_index: 1,
+          source: "MODEL",
+          type: "PLANNER_RESPONSE",
+          status: "DONE",
+          content: "Starting the dev server.",
+          tool_calls: [
+            {
+              name: "run_command",
+              args: { CommandLine: JSON.stringify("npm start") },
+            },
+          ],
+        }),
+        JSON.stringify({
+          step_index: 2,
+          source: "MODEL",
+          type: "GENERIC",
+          status: "DONE",
+          content: "Tool is running as a background task with task id: task-bg-1",
+        }),
+        "",
+      ].join("\n");
+
+      const virtualFiles = new Map<string, string>();
+      const parentPath = conversationTranscriptPath(accountGeminiRoot("default"), parentConvo);
+      virtualFiles.set(parentPath, parentTranscript);
+
+      const customOptions: AcpConnectionOptions = {
+        transport: fakeAgent.clientTransport,
+        readTranscriptFile: async (p) => virtualFiles.get(p) ?? "",
+        statTranscriptFile: async (p) => ({
+          size: Buffer.byteLength(virtualFiles.get(p) ?? "", "utf8"),
+          mtimeMs: Date.now(),
+        }),
+        autoContinueDelayMs: 25,
+        backgroundPollMs: 15,
+      };
+
+      const connection = createAcpConnection(ACP_CAPABILITIES, customOptions);
+      connection.onEvent((e) => events.push(e));
+
+      await connection.send({
+        type: "session.open",
+        requestId: "r1",
+        sessionId: "s1",
+        config: makeConfig(),
+        persistence: {
+          version: 1,
+          data: {
+            conversationId: parentConvo,
+            accountId: "default",
+            transport: "acp",
+          },
+        },
+        history: "skip",
+      });
+
+      fakeAgent.setPromptHandler(async () => {
+        fakeAgent.emitSessionUpdate("s1", {
+          sessionUpdate: "tool_call",
+          toolCallId: "call-cmd-1",
+          name: "run_command",
+          args: { CommandLine: "npm start" },
+        });
+        return { stopReason: "end_turn", usage: { totalTokens: 10 } };
+      });
+
+      await connection.send({
+        type: "session.prompt",
+        sessionId: "s1",
+        prompt: {
+          clientMessageId: "m1",
+          delivery: "auto",
+          input: {
+            type: "message",
+            content: [{ type: "text", text: "Start dev server" }],
+          },
+        },
+      });
+
+      await waitForTurnCompletion("s1");
+
+      // Verify tool row has background note
+      const initialToolRow = toolCallItems().filter((i) => i.callId === "call-cmd-1").at(-1);
+      expect(initialToolRow).toBeDefined();
+      expect((initialToolRow?.detail as any).output).toContain("Still running in the background when the turn ended");
+
+      // Setup fake agent to handle the automatic prompt for the completed command
+      fakeAgent.setPromptHandler(async () => {
+        return { stopReason: "end_turn", usage: { totalTokens: 5 } };
+      });
+
+      // Update parent transcript with background task completion
+      parentTranscript = [
+        JSON.stringify({
+          step_index: 0,
+          source: "USER_EXPLICIT",
+          type: "USER_INPUT",
+          status: "DONE",
+          content: "<USER_REQUEST>\nStart dev server\n</USER_REQUEST>",
+        }),
+        JSON.stringify({
+          step_index: 1,
+          source: "MODEL",
+          type: "PLANNER_RESPONSE",
+          status: "DONE",
+          content: "Starting the dev server.",
+          tool_calls: [
+            {
+              name: "run_command",
+              args: { CommandLine: JSON.stringify("npm start") },
+            },
+          ],
+        }),
+        JSON.stringify({
+          step_index: 2,
+          source: "MODEL",
+          type: "GENERIC",
+          status: "DONE",
+          content: "Tool is running as a background task with task id: task-bg-1",
+        }),
+        JSON.stringify({
+          step_index: 3,
+          source: "SYSTEM",
+          type: "SYSTEM_MESSAGE",
+          status: "DONE",
+          content: 'Task id "task-bg-1" finished with result:\nServer started and listening on http://localhost:3000',
+        }),
+        "",
+      ].join("\n");
+      virtualFiles.set(parentPath, parentTranscript);
+
+      // Wait for updated tool row
+      await waitFor(
+        () => {
+          const row = toolCallItems().filter((i) => i.callId === "call-cmd-1").at(-1);
+          return (row?.detail as any)?.output === "Server started and listening on http://localhost:3000" ? row : undefined;
+        },
+        "tool row to be updated with real output",
+      );
+
+      // Wait for second turn to complete
+      await waitFor(
+        () => events.filter((e) => e.type === "session.turn" && e.sessionId === "s1" && e.state === "completed").length >= 2,
+        "second turn to complete",
+      );
+
+      const promptRequests = fakeAgent.recordedRequests.filter((r) => r.method === "session/prompt");
+      expect(promptRequests).toHaveLength(2);
+      const autoPrompt = promptRequests[1];
+      const params = autoPrompt.params as { prompt: Array<{ type: string; text: string }> };
+      expect(params.prompt[0].text).toBe(
+        `[Automatic message from Paseo] Background command "npm start" finished. Output:\n\nServer started and listening on http://localhost:3000`,
+      );
+
+      await connection.close();
+    });
+
+    it("watchers stop on session close", async () => {
+      const parentConvo = "11111111-2222-3333-4444-555555555555";
+      const childConvo = "cccccccc-0000-4000-8000-000000000006";
+      const childLogUri = pathToFileURL(join(tempDir, "child-close.jsonl")).href;
+
+      const parentTranscript = [
+        JSON.stringify({
+          step_index: 0,
+          source: "USER_EXPLICIT",
+          type: "USER_INPUT",
+          status: "DONE",
+          content: "<USER_REQUEST>\nParent work\n</USER_REQUEST>",
+        }),
+        JSON.stringify({
+          step_index: 1,
+          source: "MODEL",
+          type: "PLANNER_RESPONSE",
+          status: "DONE",
+          content: `Created the following subagents:\n${JSON.stringify({
+            conversationId: childConvo,
+            logAbsoluteUri: childLogUri,
+          })}`,
+          tool_calls: [
+            {
+              tool_name: "invoke_subagent",
+              tool_args: { Model: "inherit", Prompt: "Subagent task", Role: "Worker", TypeName: "worker" },
+            },
+            {
+              name: "run_command",
+              args: { CommandLine: JSON.stringify("npm test") },
+            },
+          ],
+        }),
+        JSON.stringify({
+          step_index: 2,
+          source: "MODEL",
+          type: "GENERIC",
+          status: "DONE",
+          content: "Tool is running as a background task with task id: task-close-1",
+        }),
+        "",
+      ].join("\n");
+
+      const childTranscript = [
+        JSON.stringify({
+          step_index: 0,
+          source: "USER_EXPLICIT",
+          type: "USER_INPUT",
+          status: "DONE",
+          content: "<USER_REQUEST>\nSubagent task\n</USER_REQUEST>",
+        }),
+        "",
+      ].join("\n");
+
+      const virtualFiles = new Map<string, string>();
+      const parentPath = conversationTranscriptPath(accountGeminiRoot("default"), parentConvo);
+      const childPath = join(tempDir, "child-close.jsonl");
+      virtualFiles.set(parentPath, parentTranscript);
+      virtualFiles.set(childPath, childTranscript);
+
+      const customOptions: AcpConnectionOptions = {
+        transport: fakeAgent.clientTransport,
+        readTranscriptFile: async (p) => virtualFiles.get(p) ?? "",
+        statTranscriptFile: async (p) => ({
+          size: Buffer.byteLength(virtualFiles.get(p) ?? "", "utf8"),
+          mtimeMs: Date.now(),
+        }),
+        autoContinueDelayMs: 25,
+        backgroundPollMs: 15,
+      };
+
+      const connection = createAcpConnection(ACP_CAPABILITIES, customOptions);
+      connection.onEvent((e) => events.push(e));
+
+      await connection.send({
+        type: "session.open",
+        requestId: "r1",
+        sessionId: "s1",
+        config: makeConfig(),
+        persistence: {
+          version: 1,
+          data: {
+            conversationId: parentConvo,
+            accountId: "default",
+            transport: "acp",
+          },
+        },
+        history: "skip",
+      });
+
+      fakeAgent.setPromptHandler(async () => {
+        fakeAgent.emitSessionUpdate("s1", {
+          sessionUpdate: "tool_call",
+          toolCallId: "call-close-sub",
+          name: "invoke_subagent",
+          args: { Model: "inherit", Prompt: "Subagent task", Role: "Worker", TypeName: "worker" },
+        });
+        fakeAgent.emitSessionUpdate("s1", {
+          sessionUpdate: "tool_call",
+          toolCallId: "call-close-cmd",
+          name: "run_command",
+          args: { CommandLine: "npm test" },
+        });
+        return { stopReason: "end_turn", usage: { totalTokens: 10 } };
+      });
+
+      await connection.send({
+        type: "session.prompt",
+        sessionId: "s1",
+        prompt: {
+          clientMessageId: "m1",
+          delivery: "auto",
+          input: {
+            type: "message",
+            content: [{ type: "text", text: "Start work" }],
+          },
+        },
+      });
+
+      await waitForTurnCompletion("s1");
+      const childId = childSessionId("s1", childConvo);
+      await waitFor(() => events.some((e) => e.type === "session.opened" && e.sessionId === childId), "child open");
+
+      // Verify background command watcher is running
+      const sessionState = (connection as any).state?.sessions?.get("s1");
+      expect(sessionState).toBeDefined();
+      expect(sessionState.backgroundCommands.size).toBe(1);
+
+      // Close the session
+      await connection.send({
+        type: "session.close",
+        requestId: "r-close-final",
+        sessionId: "s1",
+      });
+
+      expect(sessionState.closing).toBe(true);
+      expect(sessionState.backgroundWatcherTimer).toBeNull();
+      expect(sessionState.autoContinueTimer).toBeNull();
+      expect(sessionState.backgroundCommands.size).toBe(0);
+      expect(sessionState.parentTranscriptWatcherTimers.size).toBe(0);
+
+      await connection.close();
+    });
+  });
 });

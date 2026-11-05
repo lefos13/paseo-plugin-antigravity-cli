@@ -28,11 +28,11 @@ const USER_INPUT = "USER_INPUT";
 const SYSTEM_MESSAGE = "SYSTEM_MESSAGE";
 
 /** A `run_command` result saying agy moved the command to the background, naming its task. */
-const BACKGROUND_LAUNCH = /Tool is running as a background task with task id: (\S+)/;
+export const BACKGROUND_LAUNCH = /Tool is running as a background task with task id: (\S+)/;
 /** The SYSTEM_MESSAGE agy injects when a background task ends (agy 1.2.x). */
-const BACKGROUND_FINISH = /Task id "([^"]+)" finished/g;
+export const BACKGROUND_FINISH = /Task id "([^"]+)" finished/g;
 /** The SYSTEM_MESSAGE a fresh CLI injects about tasks its predecessor left behind. */
-const BACKGROUND_STOPPED = /background tasks have been stopped/;
+export const BACKGROUND_STOPPED = /background tasks have been stopped/;
 /** Where agy writes the log of a background task, inside the conversation's brain directory. */
 const TASK_LOGS = "/.system_generated/tasks/";
 

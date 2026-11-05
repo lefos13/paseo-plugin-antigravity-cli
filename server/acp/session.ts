@@ -25,7 +25,8 @@ import {
   readAccounts,
   syncShadowHome,
 } from "../accounts";
-import { conversationTranscriptPath } from "../backfill";
+import { conversationTranscriptPath, BACKGROUND_LAUNCH } from "../backfill";
+import { toolFailureError } from "../protocol";
 import { readToolPermission } from "../agysettings";
 import { buildCatalog, DEFAULT_MODE_ID, resolveThinking } from "../catalog";
 import { discoverCommands, SYSTEM_COMMANDS, type AgyCommand } from "../commands";
@@ -33,12 +34,15 @@ import { PASEO_MCP_PREFIX, type McpServerConfig } from "../mcp";
 import { pluginDataDir, unsafePathChars } from "../plugindata";
 import { listConversations } from "../sessions";
 import {
+  decodeArgs,
   parseCreatedSubagents,
+  parseTranscriptLines,
   SubagentTranscript,
   type ChildAction,
   type ChildRender,
   type CreatedSubagent,
   type SubagentTranscriptConfig,
+  type TranscriptEntry,
 } from "../subagents";
 import { mapToolDetail } from "../tools";
 import { TranscriptStore, transcriptExists } from "../transcript";
@@ -334,7 +338,7 @@ export interface PendingPlan {
 
 export interface AcpActiveTurn {
   readonly turnId: string;
-  readonly clientMessageId: string;
+  readonly clientMessageId?: string;
   currentMessageId: string;
   currentMessageText: string;
   currentThoughtId: string;
@@ -361,8 +365,24 @@ export interface AcpSubagentFollow {
   status: "running" | "completed" | "failed";
   opened: boolean;
   done: boolean;
+  autoNotified?: boolean;
   transcript?: SubagentTranscript;
   store: TranscriptStore | null;
+}
+
+export interface AutoContinueItem {
+  type: "subagent" | "command";
+  title: string;
+  body: string;
+}
+
+export interface TrackedBackgroundCommand {
+  callId: string;
+  rowId: string;
+  name: string;
+  command: string;
+  tool: ProviderToolCallItem;
+  afterStepIndex?: number;
 }
 
 export interface DiscoveredChild {
@@ -621,6 +641,17 @@ export class AcpSession implements ConfigStateSession {
   readonly followedChildren = new Set<string>();
   readonly childSessions = new Set<string>();
 
+  consecutiveAutoContinuations = 0;
+  pendingAutoItems: AutoContinueItem[] = [];
+  autoContinueTimer: NodeJS.Timeout | null = null;
+  readonly autoContinueDelayMs: number;
+
+  readonly backgroundCommands = new Map<string, TrackedBackgroundCommand>();
+  backgroundWatcherTimer: NodeJS.Timeout | null = null;
+  readonly backgroundPollMs: number;
+
+  readonly parentTranscriptWatcherTimers = new Set<NodeJS.Timeout>();
+
   constructor(
     sessionId: string,
     config: ProviderSessionConfig,
@@ -631,6 +662,8 @@ export class AcpSession implements ConfigStateSession {
     readTranscriptFile?: (path: string) => Promise<string> | string,
     statTranscriptFile?: (path: string) => Promise<{ size: number; mtimeMs: number }>,
     childCapabilities: readonly ProviderCapability[] = [],
+    autoContinueDelayMs?: number,
+    backgroundPollMs?: number,
   ) {
     this.sessionId = sessionId;
     this.config = config;
@@ -649,6 +682,8 @@ export class AcpSession implements ConfigStateSession {
     this.readTranscriptFile = readTranscriptFile;
     this.statTranscriptFile = statTranscriptFile;
     this.childCapabilities = childCapabilities;
+    this.autoContinueDelayMs = autoContinueDelayMs ?? 2000;
+    this.backgroundPollMs = backgroundPollMs ?? 200;
   }
 }
 
@@ -663,6 +698,8 @@ export interface AcpConnectionOptions {
   runOneShot?: OneShotRunner;
   readTranscriptFile?: (path: string) => Promise<string> | string;
   statTranscriptFile?: (path: string) => Promise<{ size: number; mtimeMs: number }>;
+  autoContinueDelayMs?: number;
+  backgroundPollMs?: number;
 }
 
 function publish(session: AcpSession, emit: Emit, item: ProviderTimelineItem): void {
@@ -1035,6 +1072,17 @@ function handleChildRender(
     session.childSessions.delete(follow.childId);
     follow.transcript?.stop();
     void follow.store?.flush();
+
+    if (!follow.autoNotified) {
+      follow.autoNotified = true;
+      const role = follow.role ?? follow.typeName ?? "Subagent";
+      const finalReply = (render.report || follow.log || "").slice(0, 4000);
+      scheduleAutoContinue(session, emit, {
+        type: "subagent",
+        title: `Subagent "${role}" finished. Its final reply:`,
+        body: finalReply,
+      });
+    }
   }
 }
 
@@ -1112,7 +1160,7 @@ function startParentTranscriptWatcher(
 
   const startedAt = Date.now();
   const TIMEOUT_MS = 30_000;
-  const POLL_MS = 200;
+  const POLL_MS = session.backgroundPollMs ?? 200;
 
   const check = async (): Promise<boolean> => {
     if (session.closing || follow.childConversationId) return true;
@@ -1145,7 +1193,12 @@ function startParentTranscriptWatcher(
     if (done) return;
 
     if (Date.now() - startedAt < TIMEOUT_MS && !session.closing && !follow.childConversationId) {
-      setTimeout(poll, POLL_MS).unref();
+      const timer = setTimeout(async () => {
+        session.parentTranscriptWatcherTimers.delete(timer);
+        await poll();
+      }, POLL_MS);
+      timer.unref();
+      session.parentTranscriptWatcherTimers.add(timer);
     }
   };
 
@@ -1693,14 +1746,30 @@ async function runTurnPrompt(
             : BACKGROUND_NOTE;
         }
 
-        publish(session, emit, {
+        const publishedTool: ProviderToolCallItem = {
           ...tool,
           detail,
           status: "completed",
           error: null,
-        });
+        };
+        publish(session, emit, publishedTool);
+
+        if (tool.name !== "invoke_subagent") {
+          const command = detail.type === "shell" ? detail.command : tool.name;
+          session.backgroundCommands.set(tool.id, {
+            callId: tool.callId,
+            rowId: tool.id,
+            name: tool.name,
+            command,
+            tool: publishedTool,
+          });
+        }
       }
       turn.openTools.clear();
+
+      if (session.backgroundCommands.size > 0) {
+        startBackgroundCommandWatcher(session, emit);
+      }
 
       // If plan mode turn finished with a plan, offer it if not already offered
       if (
@@ -1726,12 +1795,303 @@ async function runTurnPrompt(
   }
 }
 
+export function formatAutoContinueMessage(items: readonly AutoContinueItem[]): string {
+  const parts = items.map((item) => `${item.title}\n\n${item.body}`);
+  return `[Automatic message from Paseo] ${parts.join("\n\n")}`;
+}
+
+export function findBackgroundCommandCompletion(
+  entries: readonly TranscriptEntry[],
+  tracked: TrackedBackgroundCommand,
+): { output: string; status: "completed" | "failed"; error: JsonValue } | null {
+  const sorted = [...entries].sort((a, b) => a.stepIndex - b.stepIndex);
+
+  let matchedCall: { stepIndex: number; callIndex: number } | null = null;
+  for (const entry of sorted) {
+    if (entry.type !== "PLANNER_RESPONSE") continue;
+    for (let index = 0; index < entry.toolCalls.length; index += 1) {
+      const call = entry.toolCalls[index];
+      const decoded = decodeArgs(call.args);
+      const command =
+        typeof decoded.parameters.CommandLine === "string"
+          ? decoded.parameters.CommandLine
+          : typeof decoded.parameters.command === "string"
+            ? decoded.parameters.command
+            : "";
+      if (
+        call.name === tracked.name &&
+        (command === tracked.command || !tracked.command || command.trim() === tracked.command.trim())
+      ) {
+        matchedCall = { stepIndex: entry.stepIndex, callIndex: index };
+      }
+    }
+  }
+
+  if (matchedCall === null) return null;
+
+  const { stepIndex: callStepIndex, callIndex } = matchedCall;
+  const resultStepIndex = callStepIndex + 1 + callIndex;
+  const resultEntry = sorted.find((e) => e.stepIndex === resultStepIndex);
+  if (!resultEntry) return null;
+
+  const content = resultEntry.content ?? "";
+  const launchMatch = BACKGROUND_LAUNCH.exec(content);
+
+  if (launchMatch) {
+    const taskId = launchMatch[1];
+    for (const entry of sorted) {
+      if (entry.stepIndex <= resultStepIndex) continue;
+      if (entry.type === "SYSTEM_MESSAGE") {
+        const sysContent = entry.content ?? "";
+        if (sysContent.includes(`Task id "${taskId}" finished`)) {
+          let output = "";
+          const resultMarker = "finished with result:\n";
+          const markerIdx = sysContent.indexOf(resultMarker);
+          if (markerIdx !== -1) {
+            output = sysContent.slice(markerIdx + resultMarker.length).trim();
+          } else {
+            const shortMarker = "finished with result:";
+            const shortIdx = sysContent.indexOf(shortMarker);
+            if (shortIdx !== -1) {
+              output = sysContent.slice(shortIdx + shortMarker.length).trim();
+            } else {
+              output = sysContent.trim();
+            }
+          }
+          return {
+            output,
+            status: "completed",
+            error: null,
+          };
+        }
+      }
+    }
+    return null;
+  }
+
+  if (resultEntry.type === "GENERIC" && (resultEntry.content !== undefined || resultEntry.error !== undefined)) {
+    const failure =
+      resultEntry.error && resultEntry.error.trim().length > 0
+        ? toolFailureError(resultEntry.error)
+        : null;
+    return {
+      output: resultEntry.content ?? "",
+      status: failure !== null ? "failed" : "completed",
+      error: failure,
+    };
+  }
+
+  return null;
+}
+
+function startBackgroundCommandWatcher(session: AcpSession, emit: Emit): void {
+  if (session.backgroundWatcherTimer || session.closing) return;
+  if (session.backgroundCommands.size === 0) return;
+
+  const parentConversationId = session.conversationId;
+  if (!parentConversationId) return;
+
+  const geminiRoot = accountGeminiRoot(session.accountId);
+  const parentTranscriptPath = conversationTranscriptPath(geminiRoot, parentConversationId);
+  const POLL_MS = session.backgroundPollMs ?? 200;
+
+  const check = async (): Promise<void> => {
+    if (session.closing || session.backgroundCommands.size === 0) {
+      stopBackgroundCommandWatcher(session);
+      return;
+    }
+
+    try {
+      let content = "";
+      if (session.readTranscriptFile) {
+        content = await session.readTranscriptFile(parentTranscriptPath);
+      } else if (existsSync(parentTranscriptPath)) {
+        content = await readFile(parentTranscriptPath, "utf8");
+      }
+
+      if (content.length > 0) {
+        const { entries } = parseTranscriptLines(content);
+        for (const [rowId, tracked] of Array.from(session.backgroundCommands.entries())) {
+          const completion = findBackgroundCommandCompletion(entries, tracked);
+          if (completion) {
+            session.backgroundCommands.delete(rowId);
+
+            const detail = { ...tracked.tool.detail };
+            if (detail.type === "shell") {
+              detail.output = completion.output;
+            } else if (detail.type === "plain_text") {
+              detail.text = completion.output;
+            }
+
+            const updatedTool: ProviderToolCallItem =
+              completion.status === "failed"
+                ? {
+                    ...tracked.tool,
+                    detail,
+                    status: "failed",
+                    error: completion.error,
+                  }
+                : {
+                    ...tracked.tool,
+                    detail,
+                    status: "completed",
+                    error: null,
+                  };
+            publish(session, emit, updatedTool);
+
+            scheduleAutoContinue(session, emit, {
+              type: "command",
+              title: `Background command "${tracked.command}" finished. Output:`,
+              body: completion.output.slice(0, 4000),
+            });
+          }
+        }
+      }
+    } catch {
+      // Best-effort
+    }
+
+    if (session.backgroundCommands.size === 0) {
+      stopBackgroundCommandWatcher(session);
+    }
+  };
+
+  const poll = async () => {
+    if (session.closing) {
+      stopBackgroundCommandWatcher(session);
+      return;
+    }
+    await check();
+    if (!session.closing && session.backgroundCommands.size > 0) {
+      session.backgroundWatcherTimer = setTimeout(poll, POLL_MS);
+      session.backgroundWatcherTimer.unref();
+    } else {
+      stopBackgroundCommandWatcher(session);
+    }
+  };
+
+  session.backgroundWatcherTimer = setTimeout(poll, POLL_MS);
+  session.backgroundWatcherTimer.unref();
+}
+
+function stopBackgroundCommandWatcher(session: AcpSession): void {
+  if (session.backgroundWatcherTimer) {
+    clearTimeout(session.backgroundWatcherTimer);
+    session.backgroundWatcherTimer = null;
+  }
+}
+
+function scheduleAutoContinue(session: AcpSession, emit: Emit, item: AutoContinueItem): void {
+  if (session.closing) return;
+  if (session.activeTurn !== null) {
+    return;
+  }
+
+  session.pendingAutoItems.push(item);
+
+  if (session.autoContinueTimer !== null) {
+    return;
+  }
+
+  const delayMs = session.autoContinueDelayMs ?? 2000;
+  session.autoContinueTimer = setTimeout(() => {
+    session.autoContinueTimer = null;
+    if (session.closing || session.pendingAutoItems.length === 0) return;
+    if (session.activeTurn !== null) {
+      session.pendingAutoItems = [];
+      return;
+    }
+
+    if (session.consecutiveAutoContinuations >= 5) {
+      session.pendingAutoItems = [];
+      emitNotice(
+        session,
+        emit,
+        "agy-auto-continue-cap",
+        "info",
+        "Subagent finished — send a message to continue",
+        "Subagent finished — send a message to continue",
+      );
+      return;
+    }
+
+    const items = [...session.pendingAutoItems];
+    session.pendingAutoItems = [];
+    session.consecutiveAutoContinuations += 1;
+
+    const text = formatAutoContinueMessage(items);
+    void startAutoContinueTurn(session, text, emit);
+  }, delayMs);
+  session.autoContinueTimer.unref();
+}
+
+async function startAutoContinueTurn(session: AcpSession, text: string, emit: Emit): Promise<void> {
+  if (session.closing || session.activeTurn !== null) return;
+  const client = await ensureClient(session, emit);
+  if (session.closing || session.activeTurn !== null) return;
+
+  session.turnCounter += 1;
+  const turnId = `turn-${session.turnCounter}-${randomUUID().slice(0, 8)}`;
+
+  publish(session, emit, {
+    type: "user_message",
+    id: `auto:${turnId}`,
+    text,
+  });
+
+  emit({
+    type: "session.turn",
+    sessionId: session.sessionId,
+    turnId,
+    state: "started",
+  });
+
+  const {
+    promise: promptPromise,
+    resolve: resolvePrompt,
+    reject: rejectPrompt,
+  } = Promise.withResolvers<AcpPromptResult>();
+
+  const activeTurn: AcpActiveTurn = {
+    turnId,
+    currentMessageId: `agy:msg:${turnId}:0`,
+    currentMessageText: "",
+    currentThoughtId: `agy:thought:${turnId}:0`,
+    currentThoughtText: "",
+    messageIndex: 0,
+    thoughtIndex: 0,
+    openTools: new Map(),
+    activePromptPromise: promptPromise,
+    isPlan: false,
+  };
+  session.activeTurn = activeTurn;
+
+  try {
+    const actualPromptPromise = client.prompt([{ type: "text", text }]);
+    actualPromptPromise.then(resolvePrompt, rejectPrompt);
+    await runTurnPrompt(session, activeTurn, promptPromise, emit);
+  } catch (err) {
+    handleProcessExitOrCrash(
+      session,
+      err instanceof Error ? err : new Error(String(err)),
+      emit,
+    );
+  }
+}
+
 async function promptSession(
   input: Extract<ProviderInput, { type: "session.prompt" }>,
   session: AcpSession,
   emit: Emit,
 ): Promise<void> {
   const { prompt } = input;
+
+  if (session.autoContinueTimer !== null) {
+    clearTimeout(session.autoContinueTimer);
+    session.autoContinueTimer = null;
+  }
+  session.pendingAutoItems = [];
+  session.consecutiveAutoContinuations = 0;
 
   if (prompt.outputSchema !== undefined) {
     if (session.activeTurn !== null) {
@@ -2453,6 +2813,8 @@ async function openSession(
     options.readTranscriptFile,
     options.statTranscriptFile,
     childCapabilities,
+    options.autoContinueDelayMs,
+    options.backgroundPollMs,
   );
   state.sessions.set(input.sessionId, session);
 
@@ -2565,6 +2927,11 @@ async function dispatch(
     case "session.interrupt": {
       const session = requireAcpSession(state, input.sessionId);
       session.interrupting = true;
+      if (session.autoContinueTimer !== null) {
+        clearTimeout(session.autoContinueTimer);
+        session.autoContinueTimer = null;
+      }
+      session.pendingAutoItems = [];
       cancelPendingPermissions(session, emit);
       cancelPendingQuestions(session, emit);
       resolvePendingPlan(session, emit);
@@ -2601,7 +2968,11 @@ async function dispatch(
         session.activeTurn === null &&
         session.pendingPermissions.size === 0 &&
         session.pendingQuestions.size === 0 &&
-        session.pendingPlan === null;
+        session.pendingPlan === null &&
+        session.backgroundCommands.size === 0 &&
+        session.autoContinueTimer === null &&
+        session.pendingAutoItems.length === 0 &&
+        ![...session.subagentFollows.values()].some((f) => !f.done);
       emit({
         type: "session.can_stop_runtime",
         requestId: input.requestId,
@@ -2618,6 +2989,17 @@ async function dispatch(
     case "session.close": {
       const session = requireAcpSession(state, input.sessionId);
       session.closing = true;
+      if (session.autoContinueTimer !== null) {
+        clearTimeout(session.autoContinueTimer);
+        session.autoContinueTimer = null;
+      }
+      session.pendingAutoItems = [];
+      stopBackgroundCommandWatcher(session);
+      session.backgroundCommands.clear();
+      for (const timer of session.parentTranscriptWatcherTimers) {
+        clearTimeout(timer);
+      }
+      session.parentTranscriptWatcherTimers.clear();
       cancelPendingPermissions(session, emit);
       cancelPendingQuestions(session, emit);
       resolvePendingPlan(session, emit);
@@ -2658,7 +3040,7 @@ async function dispatch(
 export function createAcpConnection(
   capabilities: readonly ProviderCapability[],
   options: AcpConnectionOptions = {},
-): ProviderConnection {
+): ProviderConnection & { readonly state?: AcpConnectionState } {
   const listeners = new Set<(event: ProviderEvent) => void>();
   const state: AcpConnectionState = { capabilities, sessions: new Map() };
   let closed = false;
@@ -2671,6 +3053,7 @@ export function createAcpConnection(
   return {
     version: 1,
     capabilities,
+    state,
     async send(input) {
       if (closed) throw new Error("Antigravity provider connection is closed");
       validateAdmission(input, state);
@@ -2686,6 +3069,17 @@ export function createAcpConnection(
       const closingSessions: Promise<void>[] = [];
       for (const session of state.sessions.values()) {
         session.closing = true;
+        if (session.autoContinueTimer !== null) {
+          clearTimeout(session.autoContinueTimer);
+          session.autoContinueTimer = null;
+        }
+        session.pendingAutoItems = [];
+        stopBackgroundCommandWatcher(session);
+        session.backgroundCommands.clear();
+        for (const timer of session.parentTranscriptWatcherTimers) {
+          clearTimeout(timer);
+        }
+        session.parentTranscriptWatcherTimers.clear();
         cancelPendingPermissions(session, emit);
         cancelPendingQuestions(session, emit);
         resolvePendingPlan(session, emit);
