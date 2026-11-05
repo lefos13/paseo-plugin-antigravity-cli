@@ -50,5 +50,5 @@ describe.skipIf(!process.env.AGY_LIVE)("live agy acp smoke test", () => {
       await client.close();
       rmSync(smokeDir, { recursive: true, force: true });
     }
-  });
+  }, 120_000);
 });
