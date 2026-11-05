@@ -421,7 +421,16 @@ export class FakeAcpAgent {
       }
 
       if (this.promptHandler) {
-        return this.promptHandler(typedParams, reqId);
+        const { promise, resolve, reject } = Promise.withResolvers<AcpPromptResult>();
+        this.activePrompt = { id: reqId, resolve, reject };
+        return Promise.race([
+          promise,
+          Promise.resolve(this.promptHandler(typedParams, reqId)).finally(() => {
+            if (this.activePrompt?.id === reqId) {
+              this.activePrompt = null;
+            }
+          }),
+        ]);
       }
 
       const nextResult = this.promptQueue.shift() ?? {

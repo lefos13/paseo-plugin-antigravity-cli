@@ -96,6 +96,7 @@ import {
 } from "./subagents";
 import { TranscriptStore, transcriptExists } from "./transcript";
 import { hasEditContent, mapToolDetail, snapshotDiff } from "./tools";
+import { createAcpConnection } from "./acp/session";
 
 type JsonValue = string | number | boolean | null | JsonValue[] | { [key: string]: JsonValue };
 
@@ -111,9 +112,9 @@ const OBSERVED_LIMIT = 32;
  */
 const BACKFILL_DELAY_MS = 5_000;
 
-const PLAN_MODE_ID = "plan";
+export const PLAN_MODE_ID = "plan";
 /** The slash command that runs as a plugin plan-mode turn instead of agy's own `/plan` workflow. */
-const PLAN_COMMAND = "plan";
+export const PLAN_COMMAND = "plan";
 /** The mode an approved plan is implemented in. */
 const IMPLEMENT_MODE_ID = "accept-edits";
 /**
@@ -141,14 +142,14 @@ const IMPLEMENT_PLAN_TEXT = "The plan is approved. Implement it now.";
  * (fixtures/05-unavailable.ndjson). The check is deliberately narrow: widening it would label a
  * permanent failure such as `model does-not-exist is not recognized` as worth retrying.
  */
-const UNAVAILABLE_PATTERN = /\bUNAVAILABLE\b|\b503\b/;
+export const UNAVAILABLE_PATTERN = /\bUNAVAILABLE\b|\b503\b/;
 /**
  * agy 1.2.15+ stops at once when the plan quota is used up and the AI credits balance cannot cover
  * the request. Both strings are read off the 1.2.16 binary; no capture of ours holds either yet.
  */
-const CREDITS_EXHAUSTED_PATTERN =
+export const CREDITS_EXHAUSTED_PATTERN =
   /\bINSUFFICIENT_G1_CREDITS_BALANCE\b|AI credits balance is too low to continue/;
-const CREDITS_EXHAUSTED_CODE = "credits_exhausted";
+export const CREDITS_EXHAUSTED_CODE = "credits_exhausted";
 
 /**
  * `prompt.steer` is deliberately absent: a line written to agy stdin while a turn is running is
@@ -166,7 +167,7 @@ const CREDITS_EXHAUSTED_CODE = "credits_exhausted";
  * forwarded to agy, which reads its own rules from settings.json; that is covered by the MCP
  * notice emitted on session open.
  */
-const CAPABILITIES = [
+export const CAPABILITIES = [
   "prompt.message",
   // A slash command reaches the CLI as `/<name> <arguments>` on a process launched for it.
   "prompt.command",
@@ -187,6 +188,20 @@ const CAPABILITIES = [
   // published as a child session under the invoke_subagent row that spawned it.
   "session.subsession",
   // A plan-mode turn ends with a plan the user approves or dismisses (`offerPlan`).
+  "permission",
+  "permission.tool_policy",
+] as const;
+
+export const ACP_CAPABILITIES = [
+  "prompt.message",
+  "prompt.command",
+  "prompt.image",
+  "prompt.output_schema",
+  "prompt.steer",
+  "session.can_stop_runtime",
+  "session.configure",
+  "session.list",
+  "session.persistence",
   "permission",
   "permission.tool_policy",
 ] as const;
@@ -231,6 +246,12 @@ export function createProvider(): ProviderRegistration {
     async connect(request) {
       if (!request.versions.includes(1)) {
         throw new Error("Antigravity provider requires provider protocol version 1");
+      }
+      const transport = process.env.PASEO_ANTIGRAVITY_TRANSPORT?.trim().toLowerCase();
+      if (transport === "acp") {
+        return createAcpConnection(
+          negotiateProviderCapabilities(request.capabilities, ACP_CAPABILITIES),
+        );
       }
       return createConnection(negotiateProviderCapabilities(request.capabilities, CAPABILITIES));
     },
@@ -554,7 +575,7 @@ interface ChildFollow {
 }
 
 /** The error a failed turn reports, and whether retrying is likely to help. */
-interface TurnFailure {
+export interface TurnFailure {
   error: ProviderError;
   retryable: boolean;
 }
@@ -3151,7 +3172,10 @@ function handleAgyExit(
  * printed one; otherwise a transient outage is named `unavailable` so a retry is obvious, and any
  * other failure keeps the status agy reported or the exit-path code.
  */
-function turnFailure(session: Session, fallback: { message: string; code: string }): TurnFailure {
+export function turnFailure(
+  session: { agyError?: AgyErrorReport | null },
+  fallback: { message: string; code: string },
+): TurnFailure {
   const failure = reportedFailure(session, fallback);
   // Retrying cannot help a spent balance, whatever the report says about retryability.
   if (CREDITS_EXHAUSTED_PATTERN.test(`${failure.error.code ?? ""} ${failure.error.message}`)) {
@@ -3160,7 +3184,10 @@ function turnFailure(session: Session, fallback: { message: string; code: string
   return failure;
 }
 
-function reportedFailure(session: Session, fallback: { message: string; code: string }): TurnFailure {
+function reportedFailure(
+  session: { agyError?: AgyErrorReport | null },
+  fallback: { message: string; code: string },
+): TurnFailure {
   const report = session.agyError;
   if (report) {
     const error: ProviderError = {
@@ -3356,8 +3383,8 @@ function failPrompt(
   });
 }
 
-function emitNotice(
-  session: Session,
+export function emitNotice(
+  session: { sessionId: string },
   emit: Emit,
   id: string,
   severity: "info" | "warning" | "error",
@@ -3371,7 +3398,16 @@ function emitNotice(
   });
 }
 
-function configState(session: Session): ProviderConfigState {
+export interface ConfigStateSession {
+  readonly config?: { cwd: string; mcpServers?: Readonly<Record<string, unknown>> };
+  readonly selection: { model?: string; mode?: string; thinkingOption?: string };
+  readonly accountId: string;
+  readonly settings: Record<string, JsonValue>;
+  readonly availableAgents?: readonly DiscoveredAgent[];
+  readonly agent?: string;
+}
+
+export function configState(session: ConfigStateSession): ProviderConfigState {
   // The tier belongs to the selected model, so the composer's axis is that model's own tiers and
   // the committed option is the one the next launch will actually pass. Both the list and the tiers
   // are the account's: another account's `agy models` output has no say in this session.
@@ -3391,14 +3427,14 @@ function configState(session: Session): ProviderConfigState {
   };
 }
 
-function buildSettings(session: Session): readonly ProviderSetting[] {
+export function buildSettings(session: ConfigStateSession): readonly ProviderSetting[] {
   const policy = approvalPolicy(session);
   // Antigravity decides through its own setting unless the user overrides it here, so the row
   // names that value rather than guessing at what a headless run will do. `agy` reads it from the
   // account's home, so this does too: the value a launch would actually use.
   const permission = readToolPermission(accountGeminiRoot(session.accountId)) ?? "unknown";
   return [
-    ...(session.availableAgents.length > 0 || session.agent !== undefined
+    ...((session.availableAgents && session.availableAgents.length > 0) || session.agent !== undefined
       ? [
           {
             type: "select" as const,
@@ -3437,9 +3473,9 @@ function buildSettings(session: Session): readonly ProviderSetting[] {
       id: "shareMcp",
       label: "Share Paseo tools with Antigravity",
       description:
-        Object.keys(session.config.mcpServers).length === 0
+        Object.keys(session.config?.mcpServers ?? {}).length === 0
           ? "Paseo has no MCP servers configured for this session, so there is nothing to share."
-          : `On writes Paseo's MCP servers into ${mcpConfigPath(session.config.cwd)} as paseo-* entries, where Antigravity can reach them. That file holds their credentials, so it must stay out of version control.`,
+          : `On writes Paseo's MCP servers into ${mcpConfigPath(session.config?.cwd ?? "")} as paseo-* entries, where Antigravity can reach them. That file holds their credentials, so it must stay out of version control.`,
       value: onOff(session.settings.shareMcp),
       options: ON_OFF_OPTIONS,
     },
@@ -3450,7 +3486,7 @@ function buildSettings(session: Session): readonly ProviderSetting[] {
  * The agent the select shows: the setting while one is chosen, else what a launch would pass
  * (`selectedAgent`'s fallback), so the row never disagrees with the flags.
  */
-function chosenAgent(session: Session): string {
+function chosenAgent(session: ConfigStateSession): string {
   const setting = session.settings.agent;
   if (typeof setting === "string" && setting.trim().length > 0) return setting.trim();
   return session.agent ?? "default";
@@ -3462,10 +3498,10 @@ function chosenAgent(session: Session): string {
  * still reaches `--agent`, so it is offered here too: a select whose value is not among its own
  * options shows the user something they cannot select back.
  */
-function agentOptions(session: Session): ReadonlyArray<{ label: string; value: string }> {
+function agentOptions(session: ConfigStateSession): ReadonlyArray<{ label: string; value: string }> {
   const options: Array<{ label: string; value: string }> = [
     { label: "Default (general)", value: "default" },
-    ...session.availableAgents.map((agent) => ({
+    ...(session.availableAgents ?? []).map((agent) => ({
       label: agent.description ? `${agent.name} (${agent.description})` : agent.name,
       value: agent.name,
     })),
@@ -3501,7 +3537,7 @@ function isSettingOn(value: JsonValue | undefined): boolean {
  * passes --dangerously-skip-permissions. A session persisted before this select existed carries
  * the removed `autoApprove` toggle, which was on by default and meant the same as `skip`.
  */
-function approvalPolicy(session: Session): "agy" | "skip" {
+export function approvalPolicy(session: { settings: Record<string, JsonValue> }): "agy" | "skip" {
   const value = session.settings.approvalPolicy;
   if (value === "agy" || value === "skip") return value;
   return session.settings.autoApprove === true ? "skip" : "agy";
@@ -3542,12 +3578,12 @@ function toErrorJson(error: ProviderError): JsonValue {
  * launches in, so it travels with `conversationId`; the extra key needs no version bump, since a
  * reader of version 1 already ignores what it does not know.
  */
-function persistenceFor(conversationId: string | null, accountId: string): ProviderPersistence {
+export function persistenceFor(conversationId: string | null, accountId: string): ProviderPersistence {
   return { version: 1, data: { conversationId, accountId } };
 }
 
 /** A version-1 string field of the persistence blob, or `null` when it is absent or unusable. */
-function persistenceField(
+export function persistenceField(
   persistence: ProviderPersistence | undefined,
   key: "conversationId" | "accountId",
 ): string | null {
@@ -3567,7 +3603,7 @@ function persistenceField(
  * host-wide active account. A named account that is gone fails the open rather than silently
  * handing the conversation to another account.
  */
-function resolveAccountId(
+export function resolveAccountId(
   persistence: ProviderPersistence | undefined,
   conversationId: string | null,
 ): string {
@@ -3585,7 +3621,7 @@ function resolveAccountId(
   return readAccounts().active;
 }
 
-function readProviderOptions(config: ProviderSessionConfig): {
+export function readProviderOptions(config: ProviderSessionConfig): {
   agyPath?: string;
   extraArgs?: readonly string[];
   addDirs?: readonly string[];
@@ -3680,7 +3716,7 @@ async function renderPromptContent(
   return parts.filter((part) => part.length > 0).join("\n\n");
 }
 
-function renderPart(part: Exclude<ProviderContent, { type: "image" | "uploaded_file" }>): string {
+export function renderPart(part: Exclude<ProviderContent, { type: "image" | "uploaded_file" }>): string {
   switch (part.type) {
     case "text":
       return part.text;

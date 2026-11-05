@@ -35,7 +35,7 @@ export interface AgyCommand {
  * tried. `/compact` left that list in 1.3.5, which made it a built-in: it expanded as `(system)`
  * on 2026-10-14 and reported its work as a `checkpoint` step (fixtures/27-compact.ndjson).
  */
-const SYSTEM_COMMANDS: readonly AgyCommand[] = [
+export const SYSTEM_COMMANDS: readonly AgyCommand[] = [
   {
     // Listed for the picker, but never sent to the CLI: agy's own `/plan` approves its own plan
     // review headless, so the provider runs it as its own plan-mode turn instead.
