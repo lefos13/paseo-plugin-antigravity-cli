@@ -73,6 +73,17 @@ import { pathToFileURL } from "node:url";
 
 const argv = process.argv.slice(2);
 
+// Version probe for ACP support
+if (argv[0] === "--version" || argv[0] === "-v") {
+  const version = process.env.FAKE_AGY_VERSION ?? "1.5.0";
+  if (version === "fail") {
+    process.stderr.write("error: failed to get version\n");
+    process.exit(1);
+  }
+  process.stdout.write(`${version}\n`);
+  process.exit(0);
+}
+
 // Command discovery's read of the plugins, not a session launch, so it stays out of the argv logs.
 if (argv[0] === "plugin" && argv[1] === "list") {
   if (process.env.FAKE_PLUGIN_LIST === undefined) {

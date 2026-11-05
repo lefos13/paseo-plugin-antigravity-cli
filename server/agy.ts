@@ -1,9 +1,57 @@
-import { spawn, type ChildProcess } from "node:child_process";
+import { execFile, spawn, type ChildProcess } from "node:child_process";
 import { existsSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { delimiter, join } from "node:path";
 import { createInterface } from "node:readline";
+import { promisify } from "node:util";
 import { encodeUserTurn, parseAgyLine, type AgyEvent } from "./protocol";
+
+const execFileAsync = promisify(execFile);
+
+let cachedAgyVersionPromise: Promise<string | null> | null = null;
+
+export async function detectAgyVersion(binary?: string): Promise<string | null> {
+  const agyBinary = resolveAgyBinary(binary);
+  try {
+    const { stdout, stderr } = await execFileAsync(agyBinary, ["--version"], {
+      timeout: 3000,
+      encoding: "utf8",
+    });
+    const output = (stdout || stderr || "").trim();
+    const match = output.match(/\b(\d+\.\d+(?:\.\d+)?)\b/);
+    return match ? match[1] : null;
+  } catch {
+    return null;
+  }
+}
+
+export function clearAgyVersionCache(): void {
+  cachedAgyVersionPromise = null;
+}
+
+export async function getAgyVersion(
+  probe?: (binary?: string) => Promise<string | null> | string | null,
+  binary?: string,
+): Promise<string | null> {
+  if (probe) {
+    return await probe(binary);
+  }
+  if (!cachedAgyVersionPromise) {
+    cachedAgyVersionPromise = detectAgyVersion(binary);
+  }
+  return await cachedAgyVersionPromise;
+}
+
+export function isAgyVersionSupported(version: string | null): boolean {
+  if (!version) return false;
+  const match = version.match(/\b(\d+)\.(\d+)(?:\.(\d+))?\b/);
+  if (!match) return false;
+  const major = parseInt(match[1], 10);
+  const minor = parseInt(match[2], 10);
+  if (major > 1) return true;
+  if (major === 1 && minor >= 5) return true;
+  return false;
+}
 
 export interface AgyLaunchConfig {
   cwd: string;

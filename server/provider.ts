@@ -29,7 +29,7 @@ import {
   readAccounts,
   syncShadowHome,
 } from "./accounts";
-import { AgyProcess, locateAgyBinary } from "./agy";
+import { AgyProcess, locateAgyBinary, getAgyVersion, isAgyVersionSupported } from "./agy";
 import { attachmentsDir, clearAttachments, linkUpload, writeAttachment } from "./attachments";
 import { readToolPermission } from "./agysettings";
 import {
@@ -648,6 +648,7 @@ export function createConnection(capabilities: readonly ProviderCapability[]): P
 // TODO(acp-phase5): remove temporary router connection
 export interface RouterConnectionOptions {
   acpOptions?: AcpConnectionOptions;
+  probeAgyVersion?: (binary?: string) => Promise<string | null> | string | null;
 }
 
 // TODO(acp-phase5): remove temporary router connection
@@ -710,20 +711,64 @@ export function createRouterConnection(
       }
 
       if (input.type === "session.open") {
+        let requestedTransport: "ndjson" | "acp";
         const persisted = persistenceField(input.persistence, "transport");
         if (persisted === "acp" || persisted === "ndjson") {
-          transport = persisted;
+          requestedTransport = persisted;
+        } else if (input.persistence) {
+          requestedTransport = "ndjson";
         } else if (input.config.settings?.transport === "acp" || input.config.settings?.transport === "ndjson") {
-          transport = input.config.settings.transport;
+          requestedTransport = input.config.settings.transport;
         } else {
-          transport = defaultTransport();
+          requestedTransport = defaultTransport();
         }
+
+        let fallbackNotice: ProviderEvent | null = null;
+        let effectiveInput = input;
+
+        if (requestedTransport === "acp") {
+          const agyPath = readProviderOptions(input.config).agyPath;
+          const version = await getAgyVersion(options?.probeAgyVersion, agyPath);
+          if (isAgyVersionSupported(version)) {
+            transport = "acp";
+          } else {
+            transport = "ndjson";
+            const ver = version ?? "unknown";
+            const noticeMsg = `Antigravity CLI ${ver} is older than 1.5.0, so this session uses the legacy NDJSON driver. Update agy to get steering and the ACP driver.`;
+            fallbackNotice = {
+              type: "session.notice",
+              sessionId: input.sessionId,
+              notice: {
+                id: "agy-version-unsupported",
+                severity: "info",
+                title: noticeMsg,
+                description: noticeMsg,
+              },
+            };
+            effectiveInput = {
+              ...input,
+              config: {
+                ...input.config,
+                settings: {
+                  ...input.config.settings,
+                  transport: "ndjson",
+                },
+              },
+            };
+          }
+        } else {
+          transport = "ndjson";
+        }
+
         sessionTransports.set(input.sessionId, transport);
         console.log(`[antigravity] input ${transport} ${describeInput(input)}`);
         if (transport === "acp") {
           await getAcp().send(input);
         } else {
-          await getNdjson().send(input);
+          await getNdjson().send(effectiveInput);
+          if (fallbackNotice) {
+            emitToListeners(fallbackNotice);
+          }
         }
         return;
       }
@@ -3557,7 +3602,7 @@ export function configState(session: ConfigStateSession): ProviderConfigState {
 
 // TODO(acp-phase5): remove temporary transport setting
 export function defaultTransport(): "ndjson" | "acp" {
-  return process.env.PASEO_ANTIGRAVITY_TRANSPORT?.trim().toLowerCase() === "acp" ? "acp" : "ndjson";
+  return process.env.PASEO_ANTIGRAVITY_TRANSPORT?.trim().toLowerCase() === "ndjson" ? "ndjson" : "acp";
 }
 
 // TODO(acp-phase5): remove temporary transport setting
@@ -3591,11 +3636,11 @@ export function buildSettings(session: ConfigStateSession): readonly ProviderSet
       type: "select" as const,
       id: "transport",
       label: "Transport",
-      description: "Driver transport for the Antigravity session.",
+      description: "ACP connects to Antigravity CLI over ACP for steering and interactive flows; NDJSON is the legacy headless driver.",
       value: sessionTransportSetting(session),
       options: [
-        { label: "NDJSON (current)", value: "ndjson" },
-        { label: "ACP (preview)", value: "acp" },
+        { label: "ACP (default)", value: "acp" },
+        { label: "NDJSON (legacy)", value: "ndjson" },
       ],
     },
     {

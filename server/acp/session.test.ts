@@ -18,6 +18,7 @@ import {
   createProvider,
   createRouterConnection,
   buildSettings,
+  defaultTransport,
   ACP_CAPABILITIES,
   CAPABILITIES,
   IMPLEMENT_PLAN_TEXT,
@@ -117,15 +118,18 @@ describe("ACP Session & Connection (Phase 3a)", () => {
     expect(transportSetting).toMatchObject({
       type: "select",
       id: "transport",
-      value: "ndjson",
+      value: "acp",
       options: [
-        { label: "NDJSON (current)", value: "ndjson" },
-        { label: "ACP (preview)", value: "acp" },
+        { label: "ACP (default)", value: "acp" },
+        { label: "NDJSON (legacy)", value: "ndjson" },
       ],
     });
 
     // 2. Router connection advertises union of capabilities
-    const router = createRouterConnection(ACP_CAPABILITIES, { acpOptions: options });
+    const router = createRouterConnection(ACP_CAPABILITIES, {
+      acpOptions: options,
+      probeAgyVersion: async () => "1.5.0",
+    });
     router.onEvent((e) => events.push(e));
     expect(router.capabilities).toContain("prompt.steer");
 
@@ -3463,7 +3467,10 @@ describe("ACP Parity & Advanced Flows (Phase 3c)", () => {
   describe("Router Logging Parity", () => {
     it("router logs every input once with transport in line for both acp and ndjson", async () => {
       const consoleSpy = vi.spyOn(console, "log");
-      const router = createRouterConnection(ACP_CAPABILITIES, { acpOptions: options });
+      const router = createRouterConnection(ACP_CAPABILITIES, {
+        acpOptions: options,
+        probeAgyVersion: async () => "1.5.0",
+      });
       router.onEvent((e) => events.push(e));
 
       // ACP session open
@@ -4787,6 +4794,235 @@ describe("ACP Parity & Advanced Flows (Phase 3c)", () => {
       expect(sessionState.parentTranscriptWatcherTimers.size).toBe(0);
 
       await connection.close();
+    });
+  });
+
+  describe("Default Transport & Version Gate (Phase 4 Item B)", () => {
+    afterEach(() => {
+      delete process.env.PASEO_ANTIGRAVITY_TRANSPORT;
+    });
+
+    describe("default transport selection", () => {
+      it("env unset -> new session defaults to acp", async () => {
+        delete process.env.PASEO_ANTIGRAVITY_TRANSPORT;
+        expect(defaultTransport()).toBe("acp");
+
+        const router = createRouterConnection(ACP_CAPABILITIES, {
+          acpOptions: options,
+          probeAgyVersion: async () => "1.5.0",
+        });
+        router.onEvent((e) => events.push(e));
+
+        await router.send({
+          type: "session.open",
+          requestId: "r-def-acp",
+          sessionId: "s-def-acp",
+          config: makeConfig(),
+          history: "skip",
+        });
+
+        const opened = events.find((e) => e.type === "session.opened" && e.sessionId === "s-def-acp");
+        expect(opened).toBeDefined();
+        expect((opened as any).capabilities).toContain("prompt.steer");
+        expect((opened as any).persistence.data.transport).toBe("acp");
+
+        await router.close();
+      });
+
+      it("env=ndjson -> new session defaults to ndjson", async () => {
+        process.env.PASEO_ANTIGRAVITY_TRANSPORT = "ndjson";
+        expect(defaultTransport()).toBe("ndjson");
+
+        const router = createRouterConnection(ACP_CAPABILITIES, {
+          acpOptions: options,
+          probeAgyVersion: async () => "1.5.0",
+        });
+        router.onEvent((e) => events.push(e));
+
+        await router.send({
+          type: "session.open",
+          requestId: "r-def-ndjson",
+          sessionId: "s-def-ndjson",
+          config: makeConfig(),
+          history: "skip",
+        });
+
+        const opened = events.find((e) => e.type === "session.opened" && e.sessionId === "s-def-ndjson");
+        expect(opened).toBeDefined();
+        expect((opened as any).capabilities).not.toContain("prompt.steer");
+        expect((opened as any).persistence.data.transport).toBeUndefined();
+
+        await router.close();
+      });
+
+      it("persisted session without transport field keeps resuming on ndjson", async () => {
+        delete process.env.PASEO_ANTIGRAVITY_TRANSPORT;
+        expect(defaultTransport()).toBe("acp");
+
+        const router = createRouterConnection(ACP_CAPABILITIES, {
+          acpOptions: options,
+          probeAgyVersion: async () => "1.5.0",
+        });
+        router.onEvent((e) => events.push(e));
+
+        await router.send({
+          type: "session.open",
+          requestId: "r-res-legacy",
+          sessionId: "s-res-legacy",
+          config: makeConfig(),
+          persistence: {
+            version: 1,
+            data: { conversationId: "old-conv", accountId: "default" },
+          },
+          history: "skip",
+        });
+
+        const opened = events.find((e) => e.type === "session.opened" && e.sessionId === "s-res-legacy");
+        expect(opened).toBeDefined();
+        expect((opened as any).capabilities).not.toContain("prompt.steer");
+        expect((opened as any).persistence.data.transport).toBeUndefined();
+
+        await router.close();
+      });
+    });
+
+    describe("version gate fallback + notice", () => {
+      it("falls back to NDJSON and emits info notice when agy is older than 1.5.0", async () => {
+        delete process.env.PASEO_ANTIGRAVITY_TRANSPORT;
+        const probeSpy = vi.fn().mockResolvedValue("1.4.2");
+
+        const router = createRouterConnection(ACP_CAPABILITIES, {
+          acpOptions: options,
+          probeAgyVersion: probeSpy,
+        });
+        router.onEvent((e) => events.push(e));
+
+        await router.send({
+          type: "session.open",
+          requestId: "r-old",
+          sessionId: "s-old",
+          config: makeConfig(),
+          history: "skip",
+        });
+
+        expect(probeSpy).toHaveBeenCalled();
+
+        // Check fallback to NDJSON
+        const opened = events.find((e) => e.type === "session.opened" && e.sessionId === "s-old");
+        expect(opened).toBeDefined();
+        expect((opened as any).capabilities).not.toContain("prompt.steer");
+        expect((opened as any).persistence.data.transport).toBeUndefined();
+
+        // Check info notice
+        const notice = events.find(
+          (e) => e.type === "session.notice" && e.sessionId === "s-old" && e.notice.id === "agy-version-unsupported",
+        );
+        expect(notice).toBeDefined();
+        expect((notice as any).notice.severity).toBe("info");
+        expect((notice as any).notice.title).toContain(
+          "Antigravity CLI 1.4.2 is older than 1.5.0, so this session uses the legacy NDJSON driver. Update agy to get steering and the ACP driver.",
+        );
+
+        await router.close();
+      });
+
+      it("falls back to NDJSON and emits notice with unknown when version probe fails or returns null", async () => {
+        delete process.env.PASEO_ANTIGRAVITY_TRANSPORT;
+        const probeSpy = vi.fn().mockResolvedValue(null);
+
+        const router = createRouterConnection(ACP_CAPABILITIES, {
+          acpOptions: options,
+          probeAgyVersion: probeSpy,
+        });
+        router.onEvent((e) => events.push(e));
+
+        await router.send({
+          type: "session.open",
+          requestId: "r-unknown",
+          sessionId: "s-unknown",
+          config: makeConfig({ settings: { transport: "acp" } }),
+          history: "skip",
+        });
+
+        expect(probeSpy).toHaveBeenCalled();
+
+        const opened = events.find((e) => e.type === "session.opened" && e.sessionId === "s-unknown");
+        expect(opened).toBeDefined();
+        expect((opened as any).capabilities).not.toContain("prompt.steer");
+
+        const notice = events.find(
+          (e) => e.type === "session.notice" && e.sessionId === "s-unknown" && e.notice.id === "agy-version-unsupported",
+        );
+        expect(notice).toBeDefined();
+        expect((notice as any).notice.title).toContain(
+          "Antigravity CLI unknown is older than 1.5.0, so this session uses the legacy NDJSON driver. Update agy to get steering and the ACP driver.",
+        );
+
+        await router.close();
+      });
+
+      it("proceeds on ACP when agy version is at least 1.5.0", async () => {
+        delete process.env.PASEO_ANTIGRAVITY_TRANSPORT;
+        const probeSpy = vi.fn().mockResolvedValue("1.5.0");
+
+        const router = createRouterConnection(ACP_CAPABILITIES, {
+          acpOptions: options,
+          probeAgyVersion: probeSpy,
+        });
+        router.onEvent((e) => events.push(e));
+
+        await router.send({
+          type: "session.open",
+          requestId: "r-valid",
+          sessionId: "s-valid",
+          config: makeConfig(),
+          history: "skip",
+        });
+
+        expect(probeSpy).toHaveBeenCalled();
+
+        const opened = events.find((e) => e.type === "session.opened" && e.sessionId === "s-valid");
+        expect(opened).toBeDefined();
+        expect((opened as any).capabilities).toContain("prompt.steer");
+        expect((opened as any).persistence.data.transport).toBe("acp");
+
+        const notices = events.filter((e) => e.type === "session.notice" && e.sessionId === "s-valid");
+        expect(notices).toHaveLength(0);
+
+        await router.close();
+      });
+
+      it("does not probe version or emit notice when session explicitly asks for ndjson", async () => {
+        delete process.env.PASEO_ANTIGRAVITY_TRANSPORT;
+        const probeSpy = vi.fn().mockResolvedValue("1.4.0");
+
+        const router = createRouterConnection(ACP_CAPABILITIES, {
+          acpOptions: options,
+          probeAgyVersion: probeSpy,
+        });
+        router.onEvent((e) => events.push(e));
+
+        await router.send({
+          type: "session.open",
+          requestId: "r-ndjson-req",
+          sessionId: "s-ndjson-req",
+          config: makeConfig({ settings: { transport: "ndjson" } }),
+          history: "skip",
+        });
+
+        expect(probeSpy).not.toHaveBeenCalled();
+
+        const opened = events.find((e) => e.type === "session.opened" && e.sessionId === "s-ndjson-req");
+        expect(opened).toBeDefined();
+        expect((opened as any).capabilities).not.toContain("prompt.steer");
+
+        const notice = events.find(
+          (e) => e.type === "session.notice" && e.sessionId === "s-ndjson-req" && e.notice.id === "agy-version-unsupported",
+        );
+        expect(notice).toBeUndefined();
+
+        await router.close();
+      });
     });
   });
 });

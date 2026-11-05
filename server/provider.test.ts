@@ -130,6 +130,7 @@ beforeEach(() => {
 
   chmodSync(fakeAgy, 0o755);
   process.env.PASEO_ANTIGRAVITY_BIN = fakeAgy;
+  process.env.PASEO_ANTIGRAVITY_TRANSPORT = "ndjson";
   process.env.PASEO_HOME = join(tempDir, "paseo-home");
   process.env.FAKE_ARGV_FILE = argvFile;
   process.env.FAKE_ARGV_LOG = argvLog;
@@ -182,6 +183,8 @@ afterEach(async () => {
     "FAKE_QUESTION_GATE",
     "FAKE_QUESTION_EFFECT",
     "PASEO_ANTIGRAVITY_BACKFILL_DELAY_MS",
+    "PASEO_ANTIGRAVITY_TRANSPORT",
+    "FAKE_AGY_VERSION",
   ]) {
     delete process.env[key];
   }
