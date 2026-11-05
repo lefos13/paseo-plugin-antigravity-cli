@@ -25,7 +25,12 @@ import {
   readAccounts,
   syncShadowHome,
 } from "../accounts";
-import { conversationTranscriptPath, BACKGROUND_LAUNCH } from "../backfill";
+import {
+  conversationTranscriptPath,
+  BACKGROUND_LAUNCH,
+  renderBackfill,
+  type BackfillIds,
+} from "../backfill";
 import { toolFailureError } from "../protocol";
 import { readToolPermission } from "../agysettings";
 import { buildCatalog, DEFAULT_MODE_ID, resolveThinking } from "../catalog";
@@ -350,6 +355,24 @@ export interface AcpActiveTurn {
   isPlan?: boolean;
   previousMode?: string;
   latestPlan?: { text: string };
+  awaitingEcho?: boolean;
+  echoTimeoutTimer?: NodeJS.Timeout | null;
+  echoFirstChunkReceived?: boolean;
+}
+
+export interface AcpMirroredTurn {
+  readonly turnId: string;
+  readonly stepIndexStart: number;
+  lastMirroredStep: number;
+  readonly publishedStepIndices: Set<number>;
+  completed: boolean;
+  finalStep: number | null;
+  finalText: string;
+}
+
+export interface AcpUnflushedSelfWake {
+  readonly turnId: string;
+  finalText: string;
 }
 
 export interface AcpSubagentFollow {
@@ -645,6 +668,12 @@ export class AcpSession implements ConfigStateSession {
   pendingAutoItems: AutoContinueItem[] = [];
   autoContinueTimer: NodeJS.Timeout | null = null;
   readonly autoContinueDelayMs: number;
+  readonly fallbackDelayMs?: number;
+  readonly echoTimeoutMs: number;
+
+  lastTurnEndStepIndex: number | null = null;
+  mirroredTurn: AcpMirroredTurn | null = null;
+  unflushedSelfWake: AcpUnflushedSelfWake | null = null;
 
   readonly backgroundCommands = new Map<string, TrackedBackgroundCommand>();
   backgroundWatcherTimer: NodeJS.Timeout | null = null;
@@ -664,6 +693,8 @@ export class AcpSession implements ConfigStateSession {
     childCapabilities: readonly ProviderCapability[] = [],
     autoContinueDelayMs?: number,
     backgroundPollMs?: number,
+    echoTimeoutMs?: number,
+    fallbackDelayMs?: number,
   ) {
     this.sessionId = sessionId;
     this.config = config;
@@ -682,7 +713,9 @@ export class AcpSession implements ConfigStateSession {
     this.readTranscriptFile = readTranscriptFile;
     this.statTranscriptFile = statTranscriptFile;
     this.childCapabilities = childCapabilities;
-    this.autoContinueDelayMs = autoContinueDelayMs ?? 2000;
+    this.autoContinueDelayMs = fallbackDelayMs ?? autoContinueDelayMs ?? 30_000;
+    this.fallbackDelayMs = fallbackDelayMs ?? autoContinueDelayMs;
+    this.echoTimeoutMs = echoTimeoutMs ?? 3000;
     this.backgroundPollMs = backgroundPollMs ?? 200;
   }
 }
@@ -699,6 +732,8 @@ export interface AcpConnectionOptions {
   readTranscriptFile?: (path: string) => Promise<string> | string;
   statTranscriptFile?: (path: string) => Promise<{ size: number; mtimeMs: number }>;
   autoContinueDelayMs?: number;
+  fallbackDelayMs?: number;
+  echoTimeoutMs?: number;
   backgroundPollMs?: number;
 }
 
@@ -1076,12 +1111,15 @@ function handleChildRender(
     if (!follow.autoNotified) {
       follow.autoNotified = true;
       const role = follow.role ?? follow.typeName ?? "Subagent";
-      const finalReply = (render.report || follow.log || "").slice(0, 4000);
+      const finalReply = cleanSystemMessageText((render.report || follow.log || "").slice(0, 4000));
       scheduleAutoContinue(session, emit, {
         type: "subagent",
         title: `Subagent "${role}" finished. Its final reply:`,
         body: finalReply,
       });
+      if (shouldWatchTranscript(session)) {
+        startTranscriptWatcher(session, emit);
+      }
     }
   }
 }
@@ -1276,12 +1314,41 @@ function handleAcpSubagentToolUpdate(
 function handleSessionUpdate(session: AcpSession, update: AcpSessionUpdate, emit: Emit): void {
   const turn = session.activeTurn;
 
+  if (turn?.awaitingEcho) {
+    if (!turn.echoFirstChunkReceived && update.sessionUpdate !== "user_message_chunk") {
+      turn.echoFirstChunkReceived = true;
+      const timeoutMs = session.echoTimeoutMs ?? 3000;
+      turn.echoTimeoutTimer = setTimeout(() => {
+        if (turn.awaitingEcho) {
+          turn.awaitingEcho = false;
+          turn.echoTimeoutTimer = null;
+          session.unflushedSelfWake = null;
+        }
+      }, timeoutMs);
+      turn.echoTimeoutTimer.unref();
+    }
+  }
+
   switch (update.sessionUpdate) {
     case "agent_message_chunk": {
       if (!turn) return;
       const chunk = update as AcpMessageChunkUpdate;
       const text = chunk.content?.text ?? "";
       if (text.length === 0) return;
+
+      if (turn.awaitingEcho) {
+        const unflushed = session.unflushedSelfWake;
+        if (unflushed && (!unflushed.finalText || !unflushed.finalText.includes(text))) {
+          unflushed.finalText = (unflushed.finalText || "") + text;
+          publish(session, emit, {
+            type: "assistant_message",
+            id: `agy:msg:${unflushed.turnId}:0`,
+            text: unflushed.finalText,
+          });
+        }
+        return;
+      }
+
       turn.currentMessageText += text;
       publish(session, emit, {
         type: "assistant_message",
@@ -1296,6 +1363,11 @@ function handleSessionUpdate(session: AcpSession, update: AcpSessionUpdate, emit
       const chunk = update as AcpMessageChunkUpdate;
       const text = chunk.content?.text ?? "";
       if (text.length === 0) return;
+
+      if (turn.awaitingEcho) {
+        return;
+      }
+
       turn.currentThoughtText += text;
       publish(session, emit, {
         type: "reasoning",
@@ -1305,9 +1377,17 @@ function handleSessionUpdate(session: AcpSession, update: AcpSessionUpdate, emit
       break;
     }
 
-    case "user_message_chunk":
-      // Echoed user message chunk; ignored.
+    case "user_message_chunk": {
+      if (turn?.awaitingEcho) {
+        turn.awaitingEcho = false;
+        if (turn.echoTimeoutTimer) {
+          clearTimeout(turn.echoTimeoutTimer);
+          turn.echoTimeoutTimer = null;
+        }
+        session.unflushedSelfWake = null;
+      }
       break;
+    }
 
     case "tool_call":
     case "tool_call_update": {
@@ -1323,6 +1403,18 @@ function handleSessionUpdate(session: AcpSession, update: AcpSessionUpdate, emit
 
       if (isSubagent) {
         handleAcpSubagentToolUpdate(session, toolUpdate, emit);
+        return;
+      }
+
+      if (turn?.awaitingEcho) {
+        let existingItem: ProviderTimelineItem | undefined;
+        if (session.transcript) {
+          const items = session.transcript.list();
+          existingItem = items.find((i) => i.type === "tool_call" && (i as any).callId === callId);
+        }
+        const prevTool = (existingItem as ProviderToolCallItem) ?? previous;
+        const resolved = resolveToolItem(toolUpdate, prevTool, session.config.cwd);
+        publish(session, emit, resolved);
         return;
       }
 
@@ -1687,6 +1779,13 @@ async function runTurnPrompt(
   try {
     const result = await thisPromptPromise;
 
+    if (turn.echoTimeoutTimer) {
+      clearTimeout(turn.echoTimeoutTimer);
+      turn.echoTimeoutTimer = null;
+    }
+    turn.awaitingEcho = false;
+    session.unflushedSelfWake = null;
+
     // Check if this prompt was superseded by a later steering prompt
     if (turn.activePromptPromise !== thisPromptPromise) {
       // Ignored: early end_turn without usage
@@ -1767,8 +1866,8 @@ async function runTurnPrompt(
       }
       turn.openTools.clear();
 
-      if (session.backgroundCommands.size > 0) {
-        startBackgroundCommandWatcher(session, emit);
+      if (shouldWatchTranscript(session)) {
+        startTranscriptWatcher(session, emit);
       }
 
       // If plan mode turn finished with a plan, offer it if not already offered
@@ -1786,6 +1885,11 @@ async function runTurnPrompt(
         turnId: turn.turnId,
         state: "completed",
       });
+
+      await updateLastTurnEndStepIndex(session);
+      if (shouldWatchTranscript(session)) {
+        startTranscriptWatcher(session, emit);
+      }
     }
   } catch (err) {
     if (turn.activePromptPromise !== thisPromptPromise) {
@@ -1795,8 +1899,33 @@ async function runTurnPrompt(
   }
 }
 
+/**
+ * Strips raw <SYSTEM_MESSAGE> wrappers, internal headers, and Log: file:// lines.
+ */
+export function cleanSystemMessageText(text: string): string {
+  let cleaned = text;
+  cleaned = cleaned.replace(
+    /^The following is a <SYSTEM_MESSAGE>[\s\S]*?<SYSTEM_MESSAGE>\s*/i,
+    "",
+  );
+  cleaned = cleaned.replace(/<\/?SYSTEM_MESSAGE>/gi, "");
+  cleaned = cleaned.replace(/^\[Message\]\s+timestamp=[^\n]*\n?/gm, "");
+  cleaned = cleaned.replace(/^Log:\s+\S+[^\n]*\n?/gm, "");
+  return cleaned.trim();
+}
+
+/**
+ * Derives a short info message from a SYSTEM_MESSAGE describing what woke agy.
+ */
+export function deriveWakeDescription(content: string): string {
+  if (/subagent/i.test(content)) {
+    return "Subagent finished";
+  }
+  return "Background command finished";
+}
+
 export function formatAutoContinueMessage(items: readonly AutoContinueItem[]): string {
-  const parts = items.map((item) => `${item.title}\n\n${item.body}`);
+  const parts = items.map((item) => `${item.title}\n\n${cleanSystemMessageText(item.body)}`);
   return `[Automatic message from Paseo] ${parts.join("\n\n")}`;
 }
 
@@ -1858,8 +1987,9 @@ export function findBackgroundCommandCompletion(
               output = sysContent.trim();
             }
           }
+          const cleanOutput = cleanSystemMessageText(output);
           return {
-            output,
+            output: cleanOutput,
             status: "completed",
             error: null,
           };
@@ -1884,120 +2014,263 @@ export function findBackgroundCommandCompletion(
   return null;
 }
 
-function startBackgroundCommandWatcher(session: AcpSession, emit: Emit): void {
-  if (session.backgroundWatcherTimer || session.closing) return;
-  if (session.backgroundCommands.size === 0) return;
-
+function getParentTranscriptPath(session: AcpSession): string | null {
   const parentConversationId = session.conversationId;
-  if (!parentConversationId) return;
-
+  if (!parentConversationId) return null;
   const geminiRoot = accountGeminiRoot(session.accountId);
-  const parentTranscriptPath = conversationTranscriptPath(geminiRoot, parentConversationId);
-  const POLL_MS = session.backgroundPollMs ?? 200;
+  return conversationTranscriptPath(geminiRoot, parentConversationId);
+}
 
-  const check = async (): Promise<void> => {
-    if (session.closing || session.backgroundCommands.size === 0) {
-      stopBackgroundCommandWatcher(session);
+async function readParentTranscript(session: AcpSession, path: string): Promise<string> {
+  if (session.readTranscriptFile) {
+    return Promise.resolve(session.readTranscriptFile(path));
+  }
+  if (existsSync(path)) {
+    return readFile(path, "utf8");
+  }
+  return "";
+}
+
+async function updateLastTurnEndStepIndex(session: AcpSession): Promise<void> {
+  const parentTranscriptPath = getParentTranscriptPath(session);
+  if (!parentTranscriptPath) return;
+  try {
+    const content = await readParentTranscript(session, parentTranscriptPath);
+    if (!content) return;
+    const { entries } = parseTranscriptLines(content);
+    let maxStep = -1;
+    for (const e of entries) {
+      if (e.stepIndex > maxStep) maxStep = e.stepIndex;
+    }
+    if (maxStep >= 0) {
+      session.lastTurnEndStepIndex = maxStep;
+    }
+  } catch {
+    // Best-effort
+  }
+}
+
+function shouldWatchTranscript(session: AcpSession): boolean {
+  if (session.closing) return false;
+  if (session.backgroundCommands.size > 0) return true;
+  for (const follow of session.subagentFollows.values()) {
+    if (!follow.done) return true;
+  }
+  if (session.mirroredTurn !== null && !session.mirroredTurn.completed) return true;
+  if (session.autoContinueTimer !== null) return true;
+  return false;
+}
+
+async function checkTranscriptUpdates(session: AcpSession, emit: Emit): Promise<void> {
+  if (session.closing) return;
+  const parentTranscriptPath = getParentTranscriptPath(session);
+  if (!parentTranscriptPath) return;
+
+  try {
+    const content = await readParentTranscript(session, parentTranscriptPath);
+    if (!content || content.length === 0) return;
+
+    const { entries } = parseTranscriptLines(content);
+    const sorted = [...entries].sort((a, b) => a.stepIndex - b.stepIndex);
+
+    if (session.lastTurnEndStepIndex === null) {
+      let maxStep = -1;
+      for (const e of sorted) {
+        if (e.stepIndex > maxStep) maxStep = e.stepIndex;
+      }
+      session.lastTurnEndStepIndex = maxStep;
       return;
     }
 
-    try {
-      let content = "";
-      if (session.readTranscriptFile) {
-        content = await session.readTranscriptFile(parentTranscriptPath);
-      } else if (existsSync(parentTranscriptPath)) {
-        content = await readFile(parentTranscriptPath, "utf8");
+    const newEntries = sorted.filter((e) => e.stepIndex > session.lastTurnEndStepIndex!);
+    if (newEntries.length === 0) return;
+
+    if (newEntries[0].type === "SYSTEM_MESSAGE") {
+      // agy woke itself! Cancel any fallback timer and drop pending auto items
+      if (session.autoContinueTimer !== null) {
+        clearTimeout(session.autoContinueTimer);
+        session.autoContinueTimer = null;
+      }
+      if (session.activeTurn?.echoTimeoutTimer) {
+        clearTimeout(session.activeTurn.echoTimeoutTimer);
+        session.activeTurn.echoTimeoutTimer = null;
+      }
+      session.pendingAutoItems = [];
+
+      // 1. Emit plugin-started turn (session.turn started ... completed, no client prompt)
+      if (session.mirroredTurn === null) {
+        session.turnCounter += 1;
+        const turnId = `turn-${session.turnCounter}-${randomUUID().slice(0, 8)}`;
+        emit({
+          type: "session.turn",
+          sessionId: session.sessionId,
+          turnId,
+          state: "started",
+        });
+
+        const sysContent = newEntries[0].content ?? "";
+        const desc = deriveWakeDescription(sysContent);
+        publish(session, emit, {
+          type: "notification",
+          id: `info:${turnId}`,
+          level: "info",
+          message: desc,
+        });
+
+        session.mirroredTurn = {
+          turnId,
+          stepIndexStart: newEntries[0].stepIndex,
+          lastMirroredStep: newEntries[0].stepIndex,
+          publishedStepIndices: new Set([newEntries[0].stepIndex]),
+          completed: false,
+          finalStep: null,
+          finalText: "",
+        };
       }
 
-      if (content.length > 0) {
-        const { entries } = parseTranscriptLines(content);
-        for (const [rowId, tracked] of Array.from(session.backgroundCommands.entries())) {
-          const completion = findBackgroundCommandCompletion(entries, tracked);
-          if (completion) {
-            session.backgroundCommands.delete(rowId);
-
-            const detail = { ...tracked.tool.detail };
-            if (detail.type === "shell") {
-              detail.output = completion.output;
-            } else if (detail.type === "plain_text") {
-              detail.text = completion.output;
-            }
-
-            const updatedTool: ProviderToolCallItem =
-              completion.status === "failed"
-                ? {
-                    ...tracked.tool,
-                    detail,
-                    status: "failed",
-                    error: completion.error,
-                  }
-                : {
-                    ...tracked.tool,
-                    detail,
-                    status: "completed",
-                    error: null,
-                  };
-            publish(session, emit, updatedTool);
-
-            scheduleAutoContinue(session, emit, {
-              type: "command",
-              title: `Background command "${tracked.command}" finished. Output:`,
-              body: completion.output.slice(0, 4000),
-            });
+      // 2. Update backgrounded tool rows to completed with real output
+      for (const [rowId, tracked] of Array.from(session.backgroundCommands.entries())) {
+        const completion = findBackgroundCommandCompletion(entries, tracked);
+        if (completion) {
+          session.backgroundCommands.delete(rowId);
+          const cleanOutput = cleanSystemMessageText(completion.output);
+          const detail = { ...tracked.tool.detail };
+          if (detail.type === "shell") {
+            detail.output = cleanOutput;
+          } else if (detail.type === "plain_text") {
+            detail.text = cleanOutput;
           }
+
+          const updatedTool: ProviderToolCallItem =
+            completion.status === "failed"
+              ? {
+                  ...tracked.tool,
+                  detail,
+                  status: "failed",
+                  error: completion.error,
+                }
+              : {
+                  ...tracked.tool,
+                  detail,
+                  status: "completed",
+                  error: null,
+                };
+          publish(session, emit, updatedTool);
         }
       }
-    } catch {
-      // Best-effort
-    }
 
-    if (session.backgroundCommands.size === 0) {
-      stopBackgroundCommandWatcher(session);
+      // 3. Mirror subsequent steps using renderBackfill
+      const turnId = session.mirroredTurn.turnId;
+      const render = renderBackfill(
+        newEntries,
+        {
+          message: (stepIndex) => `agy:msg:${turnId}:${stepIndex}`,
+          tool: (stepIndex) => `agy:tool:${turnId}:${stepIndex}`,
+        },
+        session.config.cwd,
+      );
+
+      for (const { stepIndex, item } of render.rows) {
+        if (!session.mirroredTurn.publishedStepIndices.has(stepIndex)) {
+          session.mirroredTurn.publishedStepIndices.add(stepIndex);
+          publish(session, emit, item);
+        }
+      }
+
+      if (render.finalText) {
+        session.mirroredTurn.finalText = render.finalText;
+      }
+
+      // 4. Complete the mirrored turn when the transcript shows the model's turn ended
+      if (render.finalStep !== null) {
+        session.mirroredTurn.completed = true;
+        session.mirroredTurn.finalStep = render.finalStep;
+        emit({
+          type: "session.turn",
+          sessionId: session.sessionId,
+          turnId,
+          state: "completed",
+        });
+        session.lastTurnEndStepIndex = render.finalStep;
+        session.unflushedSelfWake = {
+          turnId,
+          finalText: render.finalText,
+        };
+        session.mirroredTurn = null;
+      }
+    }
+  } catch {
+    // Best-effort
+  }
+}
+
+function startTranscriptWatcher(session: AcpSession, emit: Emit): void {
+  if (session.backgroundWatcherTimer || session.closing) return;
+  if (!shouldWatchTranscript(session)) return;
+
+  const POLL_MS = session.backgroundPollMs ?? 200;
+
+  const check = async (): Promise<void> => {
+    if (session.closing || !shouldWatchTranscript(session)) {
+      stopTranscriptWatcher(session);
+      return;
+    }
+    await checkTranscriptUpdates(session, emit);
+    if (!session.closing && shouldWatchTranscript(session)) {
+      session.backgroundWatcherTimer = setTimeout(poll, POLL_MS);
+      session.backgroundWatcherTimer.unref();
+    } else {
+      stopTranscriptWatcher(session);
     }
   };
 
   const poll = async () => {
-    if (session.closing) {
-      stopBackgroundCommandWatcher(session);
+    if (session.closing || !shouldWatchTranscript(session)) {
+      stopTranscriptWatcher(session);
       return;
     }
     await check();
-    if (!session.closing && session.backgroundCommands.size > 0) {
-      session.backgroundWatcherTimer = setTimeout(poll, POLL_MS);
-      session.backgroundWatcherTimer.unref();
-    } else {
-      stopBackgroundCommandWatcher(session);
-    }
   };
 
   session.backgroundWatcherTimer = setTimeout(poll, POLL_MS);
   session.backgroundWatcherTimer.unref();
 }
 
-function stopBackgroundCommandWatcher(session: AcpSession): void {
+function stopTranscriptWatcher(session: AcpSession): void {
   if (session.backgroundWatcherTimer) {
     clearTimeout(session.backgroundWatcherTimer);
     session.backgroundWatcherTimer = null;
   }
 }
 
-function scheduleAutoContinue(session: AcpSession, emit: Emit, item: AutoContinueItem): void {
+function startBackgroundCommandWatcher(session: AcpSession, emit: Emit): void {
+  startTranscriptWatcher(session, emit);
+}
+
+function stopBackgroundCommandWatcher(session: AcpSession): void {
+  stopTranscriptWatcher(session);
+}
+
+export function scheduleAutoContinue(session: AcpSession, emit: Emit, item: AutoContinueItem): void {
   if (session.closing) return;
-  if (session.activeTurn !== null) {
+  if (session.activeTurn !== null || session.mirroredTurn !== null) {
     return;
   }
 
-  session.pendingAutoItems.push(item);
+  session.pendingAutoItems.push({
+    ...item,
+    body: cleanSystemMessageText(item.body),
+  });
 
   if (session.autoContinueTimer !== null) {
     return;
   }
 
-  const delayMs = session.autoContinueDelayMs ?? 2000;
+  const delayMs = session.fallbackDelayMs ?? session.autoContinueDelayMs ?? 30_000;
   session.autoContinueTimer = setTimeout(() => {
     session.autoContinueTimer = null;
     if (session.closing || session.pendingAutoItems.length === 0) return;
-    if (session.activeTurn !== null) {
+    if (session.activeTurn !== null || session.mirroredTurn !== null) {
       session.pendingAutoItems = [];
       return;
     }
@@ -2023,6 +2296,10 @@ function scheduleAutoContinue(session: AcpSession, emit: Emit, item: AutoContinu
     void startAutoContinueTurn(session, text, emit);
   }, delayMs);
   session.autoContinueTimer.unref();
+
+  if (shouldWatchTranscript(session)) {
+    startTranscriptWatcher(session, emit);
+  }
 }
 
 async function startAutoContinueTurn(session: AcpSession, text: string, emit: Emit): Promise<void> {
@@ -2063,6 +2340,9 @@ async function startAutoContinueTurn(session: AcpSession, text: string, emit: Em
     openTools: new Map(),
     activePromptPromise: promptPromise,
     isPlan: false,
+    awaitingEcho: session.unflushedSelfWake !== null,
+    echoTimeoutTimer: null,
+    echoFirstChunkReceived: false,
   };
   session.activeTurn = activeTurn;
 
@@ -2092,6 +2372,21 @@ async function promptSession(
   }
   session.pendingAutoItems = [];
   session.consecutiveAutoContinuations = 0;
+
+  // Clean handover if a mirrored turn was running
+  if (session.mirroredTurn !== null) {
+    emit({
+      type: "session.turn",
+      sessionId: session.sessionId,
+      turnId: session.mirroredTurn.turnId,
+      state: "completed",
+    });
+    session.unflushedSelfWake = {
+      turnId: session.mirroredTurn.turnId,
+      finalText: session.mirroredTurn.finalText,
+    };
+    session.mirroredTurn = null;
+  }
 
   if (prompt.outputSchema !== undefined) {
     if (session.activeTurn !== null) {
@@ -2464,6 +2759,9 @@ async function promptSession(
     activePromptPromise: promptPromise,
     isPlan: isPlanMode,
     previousMode,
+    awaitingEcho: session.unflushedSelfWake !== null,
+    echoTimeoutTimer: null,
+    echoFirstChunkReceived: false,
   };
   session.activeTurn = activeTurn;
 
@@ -2815,8 +3113,14 @@ async function openSession(
     childCapabilities,
     options.autoContinueDelayMs,
     options.backgroundPollMs,
+    options.echoTimeoutMs,
+    options.fallbackDelayMs,
   );
   state.sessions.set(input.sessionId, session);
+
+  if (conversationId !== null) {
+    await updateLastTurnEndStepIndex(session);
+  }
 
   const knownHistory = conversationId !== null && transcriptExists(conversationId);
   if (session.persist && conversationId !== null) {
@@ -2931,6 +3235,10 @@ async function dispatch(
         clearTimeout(session.autoContinueTimer);
         session.autoContinueTimer = null;
       }
+      if (session.activeTurn?.echoTimeoutTimer) {
+        clearTimeout(session.activeTurn.echoTimeoutTimer);
+        session.activeTurn.echoTimeoutTimer = null;
+      }
       session.pendingAutoItems = [];
       cancelPendingPermissions(session, emit);
       cancelPendingQuestions(session, emit);
@@ -2992,6 +3300,10 @@ async function dispatch(
       if (session.autoContinueTimer !== null) {
         clearTimeout(session.autoContinueTimer);
         session.autoContinueTimer = null;
+      }
+      if (session.activeTurn?.echoTimeoutTimer) {
+        clearTimeout(session.activeTurn.echoTimeoutTimer);
+        session.activeTurn.echoTimeoutTimer = null;
       }
       session.pendingAutoItems = [];
       stopBackgroundCommandWatcher(session);

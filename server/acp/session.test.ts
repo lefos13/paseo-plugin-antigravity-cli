@@ -3768,7 +3768,7 @@ describe("ACP Parity & Advanced Flows (Phase 3c)", () => {
         return { stopReason: "end_turn", usage: { totalTokens: 8 } };
       });
 
-      // Now complete the child transcript after parent ended
+      // Now complete the child transcript after parent ended, containing raw SYSTEM_MESSAGE wrapper and Log: lines
       childTranscript = [
         JSON.stringify({
           step_index: 0,
@@ -3782,7 +3782,8 @@ describe("ACP Parity & Advanced Flows (Phase 3c)", () => {
           source: "MODEL",
           type: "PLANNER_RESPONSE",
           status: "DONE",
-          content: "Found 12 dependencies in package.json.",
+          content:
+            "<SYSTEM_MESSAGE>\nFound 12 dependencies in package.json.\n\nLog: file:///path/to/child.log\n</SYSTEM_MESSAGE>",
           tool_calls: [],
         }),
         "",
@@ -3810,6 +3811,9 @@ describe("ACP Parity & Advanced Flows (Phase 3c)", () => {
       expect(params.prompt[0].text).toBe(
         `[Automatic message from Paseo] Subagent "Codebase Researcher" finished. Its final reply:\n\nFound 12 dependencies in package.json.`,
       );
+      expect(params.prompt[0].text).not.toContain("<SYSTEM_MESSAGE>");
+      expect(params.prompt[0].text).not.toContain("</SYSTEM_MESSAGE>");
+      expect(params.prompt[0].text).not.toContain("Log:");
 
       // Verify timeline item for auto message
       const userItems = timelineItems("s1").filter((i) => i.type === "user_message");
@@ -4483,7 +4487,7 @@ describe("ACP Parity & Advanced Flows (Phase 3c)", () => {
       await connection.close();
     });
 
-    it("background command completion from fixture transcript -> row updated + automatic prompt", async () => {
+    it("self-wake mirrored (rows, reply, row status updated, turn events, no automatic prompt sent)", async () => {
       const parentConvo = "11111111-2222-3333-4444-555555555555";
 
       let parentTranscript = [
@@ -4581,12 +4585,7 @@ describe("ACP Parity & Advanced Flows (Phase 3c)", () => {
       expect(initialToolRow).toBeDefined();
       expect((initialToolRow?.detail as any).output).toContain("Still running in the background when the turn ended");
 
-      // Setup fake agent to handle the automatic prompt for the completed command
-      fakeAgent.setPromptHandler(async () => {
-        return { stopReason: "end_turn", usage: { totalTokens: 5 } };
-      });
-
-      // Update parent transcript with background task completion
+      // Update parent transcript with self-wake: SYSTEM_MESSAGE + PLANNER_RESPONSE
       parentTranscript = [
         JSON.stringify({
           step_index: 0,
@@ -4620,13 +4619,22 @@ describe("ACP Parity & Advanced Flows (Phase 3c)", () => {
           source: "SYSTEM",
           type: "SYSTEM_MESSAGE",
           status: "DONE",
-          content: 'Task id "task-bg-1" finished with result:\nServer started and listening on http://localhost:3000',
+          content:
+            "The following is a <SYSTEM_MESSAGE> not actually sent by the user.\n\n<SYSTEM_MESSAGE>\nTask id \"task-bg-1\" finished with result:\nServer started and listening on http://localhost:3000\nLog: file:///path/to/log\n</SYSTEM_MESSAGE>",
+        }),
+        JSON.stringify({
+          step_index: 4,
+          source: "MODEL",
+          type: "PLANNER_RESPONSE",
+          status: "DONE",
+          content: "WAKE RESULT: WAKE_DONE",
+          tool_calls: [],
         }),
         "",
       ].join("\n");
       virtualFiles.set(parentPath, parentTranscript);
 
-      // Wait for updated tool row
+      // Wait for updated tool row with clean output
       await waitFor(
         () => {
           const row = toolCallItems().filter((i) => i.callId === "call-cmd-1").at(-1);
@@ -4635,19 +4643,768 @@ describe("ACP Parity & Advanced Flows (Phase 3c)", () => {
         "tool row to be updated with real output",
       );
 
-      // Wait for second turn to complete
+      // Wait for mirrored turn completion
       await waitFor(
         () => events.filter((e) => e.type === "session.turn" && e.sessionId === "s1" && e.state === "completed").length >= 2,
-        "second turn to complete",
+        "mirrored turn to complete",
       );
 
+      // Verify mirrored assistant message
+      const assistantItems = timelineItems("s1").filter((i) => i.type === "assistant_message");
+      expect(assistantItems.map((i) => (i as any).text)).toContain("WAKE RESULT: WAKE_DONE");
+
+      // Verify info row in timeline
+      const notificationItems = timelineItems("s1").filter((i) => i.type === "notification");
+      expect(notificationItems.length).toBeGreaterThan(0);
+      expect((notificationItems[0] as any).message).toBe("Background command finished");
+
+      // Verify NO automatic prompt was sent to fakeAgent (only initial prompt)
       const promptRequests = fakeAgent.recordedRequests.filter((r) => r.method === "session/prompt");
-      expect(promptRequests).toHaveLength(2);
-      const autoPrompt = promptRequests[1];
-      const params = autoPrompt.params as { prompt: Array<{ type: string; text: string }> };
-      expect(params.prompt[0].text).toBe(
-        `[Automatic message from Paseo] Background command "npm start" finished. Output:\n\nServer started and listening on http://localhost:3000`,
+      expect(promptRequests).toHaveLength(1);
+
+      await connection.close();
+    });
+
+    it("pre-echo flush on next prompt does not duplicate text and lands tool status on the old row", async () => {
+      const parentConvo = "11111111-2222-3333-4444-555555555555";
+
+      let parentTranscript = [
+        JSON.stringify({
+          step_index: 0,
+          source: "USER_EXPLICIT",
+          type: "USER_INPUT",
+          status: "DONE",
+          content: "<USER_REQUEST>\nInitial\n</USER_REQUEST>",
+        }),
+        JSON.stringify({
+          step_index: 1,
+          source: "MODEL",
+          type: "PLANNER_RESPONSE",
+          status: "DONE",
+          content: "Started.",
+          tool_calls: [
+            {
+              name: "run_command",
+              args: { CommandLine: JSON.stringify("npm test") },
+            },
+          ],
+        }),
+        JSON.stringify({
+          step_index: 2,
+          source: "MODEL",
+          type: "GENERIC",
+          status: "DONE",
+          content: "Tool is running as a background task with task id: task-bg-2",
+        }),
+        "",
+      ].join("\n");
+
+      const virtualFiles = new Map<string, string>();
+      const parentPath = conversationTranscriptPath(accountGeminiRoot("default"), parentConvo);
+      virtualFiles.set(parentPath, parentTranscript);
+
+      const customOptions: AcpConnectionOptions = {
+        transport: fakeAgent.clientTransport,
+        readTranscriptFile: async (p) => virtualFiles.get(p) ?? "",
+        statTranscriptFile: async (p) => ({
+          size: Buffer.byteLength(virtualFiles.get(p) ?? "", "utf8"),
+          mtimeMs: Date.now(),
+        }),
+        autoContinueDelayMs: 25,
+        backgroundPollMs: 15,
+      };
+
+      const connection = createAcpConnection(ACP_CAPABILITIES, customOptions);
+      connection.onEvent((e) => events.push(e));
+
+      await connection.send({
+        type: "session.open",
+        requestId: "r1",
+        sessionId: "s1",
+        config: makeConfig(),
+        persistence: {
+          version: 1,
+          data: {
+            conversationId: parentConvo,
+            accountId: "default",
+            transport: "acp",
+          },
+        },
+        history: "skip",
+      });
+
+      fakeAgent.setPromptHandler(async () => {
+        fakeAgent.emitSessionUpdate("s1", {
+          sessionUpdate: "tool_call",
+          toolCallId: "call-cmd-2",
+          name: "run_command",
+          args: { CommandLine: "npm test" },
+        });
+        return { stopReason: "end_turn", usage: { totalTokens: 10 } };
+      });
+
+      await connection.send({
+        type: "session.prompt",
+        sessionId: "s1",
+        prompt: {
+          clientMessageId: "m1",
+          delivery: "auto",
+          input: {
+            type: "message",
+            content: [{ type: "text", text: "Initial" }],
+          },
+        },
+      });
+
+      await waitForTurnCompletion("s1");
+
+      // Self-wake in transcript
+      parentTranscript = [
+        JSON.stringify({
+          step_index: 0,
+          source: "USER_EXPLICIT",
+          type: "USER_INPUT",
+          status: "DONE",
+          content: "<USER_REQUEST>\nInitial\n</USER_REQUEST>",
+        }),
+        JSON.stringify({
+          step_index: 1,
+          source: "MODEL",
+          type: "PLANNER_RESPONSE",
+          status: "DONE",
+          content: "Started.",
+          tool_calls: [
+            {
+              name: "run_command",
+              args: { CommandLine: JSON.stringify("npm test") },
+            },
+          ],
+        }),
+        JSON.stringify({
+          step_index: 2,
+          source: "MODEL",
+          type: "GENERIC",
+          status: "DONE",
+          content: "Tool is running as a background task with task id: task-bg-2",
+        }),
+        JSON.stringify({
+          step_index: 3,
+          source: "SYSTEM",
+          type: "SYSTEM_MESSAGE",
+          status: "DONE",
+          content: 'Task id "task-bg-2" finished with result:\nTests passed',
+        }),
+        JSON.stringify({
+          step_index: 4,
+          source: "MODEL",
+          type: "PLANNER_RESPONSE",
+          status: "DONE",
+          content: "WAKE RESULT: WAKE_DONE",
+          tool_calls: [],
+        }),
+        "",
+      ].join("\n");
+      virtualFiles.set(parentPath, parentTranscript);
+
+      // Wait for mirrored turn to complete
+      await waitFor(
+        () => events.filter((e) => e.type === "session.turn" && e.sessionId === "s1" && e.state === "completed").length >= 2,
+        "mirrored turn to complete",
       );
+
+      // Setup fake agent to simulate agy flushing pre-echo updates on next prompt:
+      // tool_call_update completed -> agent_message_chunk (wake reply) -> user_message_chunk (echo) -> agent_message_chunk (new reply)
+      fakeAgent.setPromptHandler(async () => {
+        fakeAgent.emitSessionUpdate("s1", {
+          sessionUpdate: "tool_call_update",
+          toolCallId: "call-cmd-2",
+          status: "completed",
+          rawOutput: "Tests passed",
+        });
+        fakeAgent.emitSessionUpdate("s1", {
+          sessionUpdate: "agent_message_chunk",
+          content: { type: "text", text: "WAKE RESULT: WAKE_DONE" },
+        });
+        fakeAgent.emitSessionUpdate("s1", {
+          sessionUpdate: "user_message_chunk",
+          content: { type: "text", text: "Say only: SECOND" },
+        });
+        fakeAgent.emitSessionUpdate("s1", {
+          sessionUpdate: "agent_message_chunk",
+          content: { type: "text", text: "SECOND" },
+        });
+        return { stopReason: "end_turn", usage: { totalTokens: 15 } };
+      });
+
+      // Send the next user prompt
+      await connection.send({
+        type: "session.prompt",
+        sessionId: "s1",
+        prompt: {
+          clientMessageId: "m2",
+          delivery: "auto",
+          input: {
+            type: "message",
+            content: [{ type: "text", text: "Say only: SECOND" }],
+          },
+        },
+      });
+
+      // Wait for turn 3 to complete
+      await waitFor(
+        () => events.filter((e) => e.type === "session.turn" && e.sessionId === "s1" && e.state === "completed").length >= 3,
+        "third turn to complete",
+      );
+
+      // Verify assistant messages:
+      // Turn 2 was "WAKE RESULT: WAKE_DONE"
+      // Turn 3 must be ONLY "SECOND" (not "WAKE RESULT: WAKE_DONESECOND")
+      const assistantMsgs = timelineItems("s1")
+        .filter((i) => i.type === "assistant_message")
+        .map((i) => (i as any).text);
+      expect(assistantMsgs).toContain("WAKE RESULT: WAKE_DONE");
+      expect(assistantMsgs).toContain("SECOND");
+      expect(assistantMsgs).not.toContain("WAKE RESULT: WAKE_DONESECOND");
+
+      // Verify tool row has status completed
+      const finalToolRow = toolCallItems().filter((i) => i.callId === "call-cmd-2").at(-1);
+      expect(finalToolRow?.status).toBe("completed");
+
+      await connection.close();
+    });
+
+    it("missing echo timeout: subsequent chunks land on new turn after timeout", async () => {
+      const parentConvo = "11111111-2222-3333-4444-555555555555";
+
+      let parentTranscript = [
+        JSON.stringify({
+          step_index: 0,
+          source: "USER_EXPLICIT",
+          type: "USER_INPUT",
+          status: "DONE",
+          content: "<USER_REQUEST>\nInitial\n</USER_REQUEST>",
+        }),
+        JSON.stringify({
+          step_index: 1,
+          source: "MODEL",
+          type: "PLANNER_RESPONSE",
+          status: "DONE",
+          content: "Started.",
+          tool_calls: [
+            {
+              name: "run_command",
+              args: { CommandLine: JSON.stringify("sleep 1") },
+            },
+          ],
+        }),
+        JSON.stringify({
+          step_index: 2,
+          source: "MODEL",
+          type: "GENERIC",
+          status: "DONE",
+          content: "Tool is running as a background task with task id: task-bg-timeout",
+        }),
+        "",
+      ].join("\n");
+
+      const virtualFiles = new Map<string, string>();
+      const parentPath = conversationTranscriptPath(accountGeminiRoot("default"), parentConvo);
+      virtualFiles.set(parentPath, parentTranscript);
+
+      const customOptions: AcpConnectionOptions = {
+        transport: fakeAgent.clientTransport,
+        readTranscriptFile: async (p) => virtualFiles.get(p) ?? "",
+        statTranscriptFile: async (p) => ({
+          size: Buffer.byteLength(virtualFiles.get(p) ?? "", "utf8"),
+          mtimeMs: Date.now(),
+        }),
+        autoContinueDelayMs: 25,
+        backgroundPollMs: 15,
+        echoTimeoutMs: 50,
+      };
+
+      const connection = createAcpConnection(ACP_CAPABILITIES, customOptions);
+      connection.onEvent((e) => events.push(e));
+
+      await connection.send({
+        type: "session.open",
+        requestId: "r1",
+        sessionId: "s1",
+        config: makeConfig(),
+        persistence: {
+          version: 1,
+          data: {
+            conversationId: parentConvo,
+            accountId: "default",
+            transport: "acp",
+          },
+        },
+        history: "skip",
+      });
+
+      fakeAgent.setPromptHandler(async () => {
+        fakeAgent.emitSessionUpdate("s1", {
+          sessionUpdate: "tool_call",
+          toolCallId: "call-timeout-1",
+          name: "run_command",
+          args: { CommandLine: "sleep 1" },
+        });
+        return { stopReason: "end_turn", usage: { totalTokens: 10 } };
+      });
+
+      await connection.send({
+        type: "session.prompt",
+        sessionId: "s1",
+        prompt: {
+          clientMessageId: "m1",
+          delivery: "auto",
+          input: {
+            type: "message",
+            content: [{ type: "text", text: "Start" }],
+          },
+        },
+      });
+
+      await waitForTurnCompletion("s1");
+
+      // Self-wake in transcript
+      parentTranscript = [
+        JSON.stringify({
+          step_index: 0,
+          source: "USER_EXPLICIT",
+          type: "USER_INPUT",
+          status: "DONE",
+          content: "<USER_REQUEST>\nStart\n</USER_REQUEST>",
+        }),
+        JSON.stringify({
+          step_index: 1,
+          source: "MODEL",
+          type: "PLANNER_RESPONSE",
+          status: "DONE",
+          content: "Started.",
+          tool_calls: [
+            {
+              name: "run_command",
+              args: { CommandLine: JSON.stringify("sleep 1") },
+            },
+          ],
+        }),
+        JSON.stringify({
+          step_index: 2,
+          source: "MODEL",
+          type: "GENERIC",
+          status: "DONE",
+          content: "Tool is running as a background task with task id: task-bg-timeout",
+        }),
+        JSON.stringify({
+          step_index: 3,
+          source: "SYSTEM",
+          type: "SYSTEM_MESSAGE",
+          status: "DONE",
+          content: 'Task id "task-bg-timeout" finished with result:\nDone',
+        }),
+        JSON.stringify({
+          step_index: 4,
+          source: "MODEL",
+          type: "PLANNER_RESPONSE",
+          status: "DONE",
+          content: "WAKE REPLY",
+          tool_calls: [],
+        }),
+        "",
+      ].join("\n");
+      virtualFiles.set(parentPath, parentTranscript);
+
+      await waitFor(
+        () => events.filter((e) => e.type === "session.turn" && e.sessionId === "s1" && e.state === "completed").length >= 2,
+        "mirrored turn to complete",
+      );
+
+      // Prompt handler emits chunk without user_message_chunk echo, waits 80ms (past 50ms timeout), then emits chunk
+      fakeAgent.setPromptHandler(async () => {
+        fakeAgent.emitSessionUpdate("s1", {
+          sessionUpdate: "agent_message_chunk",
+          content: { type: "text", text: "PRE_TIMEOUT" },
+        });
+        await new Promise((r) => setTimeout(r, 80));
+        fakeAgent.emitSessionUpdate("s1", {
+          sessionUpdate: "agent_message_chunk",
+          content: { type: "text", text: "POST_TIMEOUT" },
+        });
+        return { stopReason: "end_turn", usage: { totalTokens: 10 } };
+      });
+
+      await connection.send({
+        type: "session.prompt",
+        sessionId: "s1",
+        prompt: {
+          clientMessageId: "m2",
+          delivery: "auto",
+          input: {
+            type: "message",
+            content: [{ type: "text", text: "Missing echo prompt" }],
+          },
+        },
+      });
+
+      await waitFor(
+        () => events.filter((e) => e.type === "session.turn" && e.sessionId === "s1" && e.state === "completed").length >= 3,
+        "third turn to complete",
+      );
+
+      const assistantMsgs = timelineItems("s1")
+        .filter((i) => i.type === "assistant_message")
+        .map((i) => (i as any).text);
+      expect(assistantMsgs).toContain("POST_TIMEOUT");
+
+      await connection.close();
+    });
+
+    it("subagent completion via SYSTEM_MESSAGE in parent transcript -> mirrored turn, no auto prompt", async () => {
+      const parentConvo = "11111111-2222-3333-4444-555555555555";
+      const childConvo = "cccccccc-0000-4000-8000-000000000008";
+      const childLogUri = pathToFileURL(join(tempDir, "child-sub-sys.jsonl")).href;
+
+      let parentTranscript = [
+        JSON.stringify({
+          step_index: 0,
+          source: "USER_EXPLICIT",
+          type: "USER_INPUT",
+          status: "DONE",
+          content: "<USER_REQUEST>\nParent work\n</USER_REQUEST>",
+        }),
+        JSON.stringify({
+          step_index: 1,
+          source: "MODEL",
+          type: "PLANNER_RESPONSE",
+          status: "DONE",
+          content: `Created the following subagents:\n${JSON.stringify({
+            conversationId: childConvo,
+            logAbsoluteUri: childLogUri,
+          })}`,
+          tool_calls: [
+            {
+              name: "invoke_subagent",
+              args: { Model: "inherit", Prompt: "Subagent task", Role: "Codebase Researcher", TypeName: "research" },
+            },
+          ],
+        }),
+        "",
+      ].join("\n");
+
+      const childTranscript = [
+        JSON.stringify({
+          step_index: 0,
+          source: "USER_EXPLICIT",
+          type: "USER_INPUT",
+          status: "DONE",
+          content: "<USER_REQUEST>\nSubagent task\n</USER_REQUEST>",
+        }),
+        "",
+      ].join("\n");
+
+      const virtualFiles = new Map<string, string>();
+      const parentPath = conversationTranscriptPath(accountGeminiRoot("default"), parentConvo);
+      const childPath = join(tempDir, "child-sub-sys.jsonl");
+      virtualFiles.set(parentPath, parentTranscript);
+      virtualFiles.set(childPath, childTranscript);
+
+      const customOptions: AcpConnectionOptions = {
+        transport: fakeAgent.clientTransport,
+        readTranscriptFile: async (p) => virtualFiles.get(p) ?? "",
+        statTranscriptFile: async (p) => ({
+          size: Buffer.byteLength(virtualFiles.get(p) ?? "", "utf8"),
+          mtimeMs: Date.now(),
+        }),
+        autoContinueDelayMs: 25,
+        backgroundPollMs: 15,
+      };
+
+      const connection = createAcpConnection(ACP_CAPABILITIES, customOptions);
+      connection.onEvent((e) => events.push(e));
+
+      await connection.send({
+        type: "session.open",
+        requestId: "r1",
+        sessionId: "s1",
+        config: makeConfig(),
+        persistence: {
+          version: 1,
+          data: {
+            conversationId: parentConvo,
+            accountId: "default",
+            transport: "acp",
+          },
+        },
+        history: "skip",
+      });
+
+      fakeAgent.setPromptHandler(async () => {
+        fakeAgent.emitSessionUpdate("s1", {
+          sessionUpdate: "tool_call",
+          toolCallId: "call-sub-sys-1",
+          name: "invoke_subagent",
+          args: { Model: "inherit", Prompt: "Subagent task", Role: "Codebase Researcher", TypeName: "research" },
+        });
+        return { stopReason: "end_turn", usage: { totalTokens: 10 } };
+      });
+
+      await connection.send({
+        type: "session.prompt",
+        sessionId: "s1",
+        prompt: {
+          clientMessageId: "m1",
+          delivery: "auto",
+          input: {
+            type: "message",
+            content: [{ type: "text", text: "Start task" }],
+          },
+        },
+      });
+
+      await waitForTurnCompletion("s1");
+      const childId = childSessionId("s1", childConvo);
+      await waitFor(() => events.some((e) => e.type === "session.opened" && e.sessionId === childId), "child open");
+
+      // Update parent transcript with subagent completion SYSTEM_MESSAGE and PLANNER_RESPONSE
+      parentTranscript = [
+        JSON.stringify({
+          step_index: 0,
+          source: "USER_EXPLICIT",
+          type: "USER_INPUT",
+          status: "DONE",
+          content: "<USER_REQUEST>\nParent work\n</USER_REQUEST>",
+        }),
+        JSON.stringify({
+          step_index: 1,
+          source: "MODEL",
+          type: "PLANNER_RESPONSE",
+          status: "DONE",
+          content: `Created the following subagents:\n${JSON.stringify({
+            conversationId: childConvo,
+            logAbsoluteUri: childLogUri,
+          })}`,
+          tool_calls: [
+            {
+              name: "invoke_subagent",
+              args: { Model: "inherit", Prompt: "Subagent task", Role: "Codebase Researcher", TypeName: "research" },
+            },
+          ],
+        }),
+        JSON.stringify({
+          step_index: 2,
+          source: "SYSTEM",
+          type: "SYSTEM_MESSAGE",
+          status: "DONE",
+          content: "The following is a <SYSTEM_MESSAGE> not actually sent by the user.\n\n<SYSTEM_MESSAGE>\nSubagent finished with result:\nDone researching\nLog: file:///tmp/log\n</SYSTEM_MESSAGE>",
+        }),
+        JSON.stringify({
+          step_index: 3,
+          source: "MODEL",
+          type: "PLANNER_RESPONSE",
+          status: "DONE",
+          content: "Subagent has concluded its investigation.",
+          tool_calls: [],
+        }),
+        "",
+      ].join("\n");
+      virtualFiles.set(parentPath, parentTranscript);
+
+      // Wait for mirrored turn completion
+      await waitFor(
+        () => events.filter((e) => e.type === "session.turn" && e.sessionId === "s1" && e.state === "completed").length >= 2,
+        "mirrored turn to complete",
+      );
+
+      const assistantItems = timelineItems("s1").filter((i) => i.type === "assistant_message");
+      expect(assistantItems.map((i) => (i as any).text)).toContain("Subagent has concluded its investigation.");
+
+      const notificationItems = timelineItems("s1").filter((i) => i.type === "notification");
+      expect(notificationItems.length).toBeGreaterThan(0);
+      expect((notificationItems[0] as any).message).toBe("Subagent finished");
+
+      // No automatic prompt sent to fake agent
+      const promptRequests = fakeAgent.recordedRequests.filter((r) => r.method === "session/prompt");
+      expect(promptRequests).toHaveLength(1);
+
+      await connection.close();
+    });
+
+    it("user prompt while mirrored turn is running -> clean handover into new prompt", async () => {
+      const parentConvo = "11111111-2222-3333-4444-555555555555";
+
+      let parentTranscript = [
+        JSON.stringify({
+          step_index: 0,
+          source: "USER_EXPLICIT",
+          type: "USER_INPUT",
+          status: "DONE",
+          content: "<USER_REQUEST>\nInitial\n</USER_REQUEST>",
+        }),
+        JSON.stringify({
+          step_index: 1,
+          source: "MODEL",
+          type: "PLANNER_RESPONSE",
+          status: "DONE",
+          content: "Started.",
+          tool_calls: [
+            {
+              name: "run_command",
+              args: { CommandLine: JSON.stringify("run build") },
+            },
+          ],
+        }),
+        JSON.stringify({
+          step_index: 2,
+          source: "MODEL",
+          type: "GENERIC",
+          status: "DONE",
+          content: "Tool is running as a background task with task id: task-bg-handover",
+        }),
+        "",
+      ].join("\n");
+
+      const virtualFiles = new Map<string, string>();
+      const parentPath = conversationTranscriptPath(accountGeminiRoot("default"), parentConvo);
+      virtualFiles.set(parentPath, parentTranscript);
+
+      const customOptions: AcpConnectionOptions = {
+        transport: fakeAgent.clientTransport,
+        readTranscriptFile: async (p) => virtualFiles.get(p) ?? "",
+        statTranscriptFile: async (p) => ({
+          size: Buffer.byteLength(virtualFiles.get(p) ?? "", "utf8"),
+          mtimeMs: Date.now(),
+        }),
+        autoContinueDelayMs: 25,
+        backgroundPollMs: 15,
+      };
+
+      const connection = createAcpConnection(ACP_CAPABILITIES, customOptions);
+      connection.onEvent((e) => events.push(e));
+
+      await connection.send({
+        type: "session.open",
+        requestId: "r1",
+        sessionId: "s1",
+        config: makeConfig(),
+        persistence: {
+          version: 1,
+          data: {
+            conversationId: parentConvo,
+            accountId: "default",
+            transport: "acp",
+          },
+        },
+        history: "skip",
+      });
+
+      fakeAgent.setPromptHandler(async () => {
+        fakeAgent.emitSessionUpdate("s1", {
+          sessionUpdate: "tool_call",
+          toolCallId: "call-handover-1",
+          name: "run_command",
+          args: { CommandLine: "run build" },
+        });
+        return { stopReason: "end_turn", usage: { totalTokens: 10 } };
+      });
+
+      await connection.send({
+        type: "session.prompt",
+        sessionId: "s1",
+        prompt: {
+          clientMessageId: "m1",
+          delivery: "auto",
+          input: {
+            type: "message",
+            content: [{ type: "text", text: "Start build" }],
+          },
+        },
+      });
+
+      await waitForTurnCompletion("s1");
+
+      // Self-wake begins in transcript with SYSTEM_MESSAGE, but NO PLANNER_RESPONSE yet
+      parentTranscript = [
+        JSON.stringify({
+          step_index: 0,
+          source: "USER_EXPLICIT",
+          type: "USER_INPUT",
+          status: "DONE",
+          content: "<USER_REQUEST>\nStart build\n</USER_REQUEST>",
+        }),
+        JSON.stringify({
+          step_index: 1,
+          source: "MODEL",
+          type: "PLANNER_RESPONSE",
+          status: "DONE",
+          content: "Started.",
+          tool_calls: [
+            {
+              name: "run_command",
+              args: { CommandLine: JSON.stringify("run build") },
+            },
+          ],
+        }),
+        JSON.stringify({
+          step_index: 2,
+          source: "MODEL",
+          type: "GENERIC",
+          status: "DONE",
+          content: "Tool is running as a background task with task id: task-bg-handover",
+        }),
+        JSON.stringify({
+          step_index: 3,
+          source: "SYSTEM",
+          type: "SYSTEM_MESSAGE",
+          status: "DONE",
+          content: 'Task id "task-bg-handover" finished with result:\nBuild done',
+        }),
+        "",
+      ].join("\n");
+      virtualFiles.set(parentPath, parentTranscript);
+
+      // Wait for mirrored turn to start
+      await waitFor(
+        () => events.filter((e) => e.type === "session.turn" && e.sessionId === "s1" && e.state === "started").length >= 2,
+        "mirrored turn to start",
+      );
+
+      // User sends a new prompt while mirrored turn is running
+      fakeAgent.setPromptHandler(async () => {
+        fakeAgent.emitSessionUpdate("s1", {
+          sessionUpdate: "user_message_chunk",
+          content: { type: "text", text: "New user steer prompt" },
+        });
+        fakeAgent.emitSessionUpdate("s1", {
+          sessionUpdate: "agent_message_chunk",
+          content: { type: "text", text: "Answer to user steer prompt" },
+        });
+        return { stopReason: "end_turn", usage: { totalTokens: 10 } };
+      });
+
+      await connection.send({
+        type: "session.prompt",
+        sessionId: "s1",
+        prompt: {
+          clientMessageId: "m2",
+          delivery: "auto",
+          input: {
+            type: "message",
+            content: [{ type: "text", text: "New user steer prompt" }],
+          },
+        },
+      });
+
+      // Both mirrored turn and new turn should complete
+      await waitFor(
+        () => events.filter((e) => e.type === "session.turn" && e.sessionId === "s1" && e.state === "completed").length >= 3,
+        "all turns to complete",
+      );
+
+      const assistantMsgs = timelineItems("s1")
+        .filter((i) => i.type === "assistant_message")
+        .map((i) => (i as any).text);
+      expect(assistantMsgs).toContain("Answer to user steer prompt");
 
       await connection.close();
     });
