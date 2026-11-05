@@ -1088,7 +1088,7 @@ describe("ACP Session & Connection (Phase 3a)", () => {
     await connection.close();
   });
 
-  it("structured output refusal: cleanly refuses outputSchema on ACP sessions", async () => {
+  it("structured output refusal: cleanly refuses non-object outputSchema on ACP sessions", async () => {
     const connection = createAcpConnection(ACP_CAPABILITIES, options);
     connection.onEvent((e) => events.push(e));
 
@@ -1111,8 +1111,8 @@ describe("ACP Session & Connection (Phase 3a)", () => {
           content: [{ type: "text", text: "Output JSON" }],
         },
         outputSchema: {
-          type: "object",
-          properties: { result: { type: "string" } },
+          type: "array",
+          items: { type: "string" },
         },
       },
     });

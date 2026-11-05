@@ -416,7 +416,7 @@ export interface ChildSpawn {
   readonly workspaceUris?: readonly string[];
 }
 
-interface CreatedSubagent {
+export interface CreatedSubagent {
   readonly conversationId: string;
   readonly logUri?: string;
   readonly workspaceUris?: readonly string[];
@@ -483,7 +483,7 @@ function spawnPlaceholder(spawn: ChildSpawn, name: string): ProviderTimelineItem
  * 2026-09-29, one to three children), so the objects are cut out by balancing braces rather than
  * parsed as a document.
  */
-function parseCreatedSubagents(text: string): CreatedSubagent[] {
+export function parseCreatedSubagents(text: string): CreatedSubagent[] {
   const created: CreatedSubagent[] = [];
   let depth = 0;
   let start = -1;
@@ -582,6 +582,8 @@ export interface SubagentTranscriptHandlers {
 
 export interface SubagentTranscriptConfig extends ChildContext {
   readonly logUri: string;
+  readonly readFile?: (path: string, encoding: "utf8") => Promise<string>;
+  readonly stat?: (path: string) => Promise<{ size: number; mtimeMs: number }>;
 }
 
 /**
@@ -623,17 +625,20 @@ export class SubagentTranscript {
 
     // While the file does not exist yet there is nothing to watch, but its directory will tell us
     // when it appears; a directory that does not exist either leaves the poll to notice both.
-    const target = existsSync(path) ? path : existsSync(dirname(path)) ? dirname(path) : null;
-    if (target !== null) {
-      try {
-        const watcher = watch(target, () => void this.read());
-        // The poll is the fallback for every case this cannot report (a moved file, a full watch
-        // queue), so a watch error is not worth stopping for.
-        watcher.on("error", () => undefined);
-        watcher.unref();
-        this.watcher = watcher;
-      } catch {
-        this.watcher = null;
+    // If an injected readFile is provided, polling alone is sufficient.
+    if (!this.config.readFile) {
+      const target = existsSync(path) ? path : existsSync(dirname(path)) ? dirname(path) : null;
+      if (target !== null) {
+        try {
+          const watcher = watch(target, () => void this.read());
+          // The poll is the fallback for every case this cannot report (a moved file, a full watch
+          // queue), so a watch error is not worth stopping for.
+          watcher.on("error", () => undefined);
+          watcher.unref();
+          this.watcher = watcher;
+        } catch {
+          this.watcher = null;
+        }
       }
     }
 
@@ -702,7 +707,7 @@ export class SubagentTranscript {
     let size: number;
     let mtimeMs: number;
     try {
-      const stats = await stat(path);
+      const stats = this.config.stat ? await this.config.stat(path) : await stat(path);
       size = stats.size;
       mtimeMs = stats.mtimeMs;
     } catch {
@@ -728,7 +733,7 @@ export class SubagentTranscript {
 
     let text: string;
     try {
-      text = await readFile(path, "utf8");
+      text = this.config.readFile ? await this.config.readFile(path, "utf8") : await readFile(path, "utf8");
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code === "ENOENT") return;
       this.degrade(`its transcript could not be read: ${describe(error)}`);

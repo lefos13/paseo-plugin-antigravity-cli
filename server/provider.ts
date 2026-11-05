@@ -202,6 +202,7 @@ export const ACP_CAPABILITIES = [
   "session.configure",
   "session.list",
   "session.persistence",
+  "session.subsession",
   "permission",
   "permission.tool_policy",
 ] as const;
@@ -603,7 +604,6 @@ export function createConnection(capabilities: readonly ProviderCapability[]): P
     capabilities,
     async send(input) {
       if (closed) throw new Error("Antigravity provider connection is closed");
-      console.log(`[antigravity] input ${describeInput(input)}`);
       validateAdmission(input, state);
       await dispatch(input, state, emit);
     },
@@ -701,13 +701,15 @@ export function createRouterConnection(
     async send(input: ProviderInput): Promise<void> {
       if (closed) throw new Error("Antigravity provider connection is closed");
 
+      let transport: "ndjson" | "acp";
       if (!("sessionId" in input)) {
+        transport = defaultTransport();
+        console.log(`[antigravity] input ${transport} ${describeInput(input)}`);
         await getNdjson().send(input);
         return;
       }
 
       if (input.type === "session.open") {
-        let transport: "ndjson" | "acp";
         const persisted = persistenceField(input.persistence, "transport");
         if (persisted === "acp" || persisted === "ndjson") {
           transport = persisted;
@@ -717,6 +719,7 @@ export function createRouterConnection(
           transport = defaultTransport();
         }
         sessionTransports.set(input.sessionId, transport);
+        console.log(`[antigravity] input ${transport} ${describeInput(input)}`);
         if (transport === "acp") {
           await getAcp().send(input);
         } else {
@@ -725,7 +728,8 @@ export function createRouterConnection(
         return;
       }
 
-      const transport = sessionTransports.get(input.sessionId) ?? "ndjson";
+      transport = sessionTransports.get(input.sessionId) ?? defaultTransport();
+      console.log(`[antigravity] input ${transport} ${describeInput(input)}`);
       if (input.type === "session.close") {
         try {
           if (transport === "acp") {
@@ -1525,7 +1529,7 @@ async function writePendingTurn(session: Session, emit: Emit, turn: PendingTurn)
  * exit 1). A root with `properties` and no `type` can only describe an object, so it gets the type
  * added; any other root is refused rather than rewritten into a different answer shape.
  */
-function objectRootSchema(schema: unknown): { schema: Record<string, unknown> } | { refusal: string } {
+export function objectRootSchema(schema: unknown): { schema: Record<string, unknown> } | { refusal: string } {
   const refuse = (got: string) => ({
     refusal: `Antigravity only accepts a structured-output schema whose root is "type": "object", and this one ${got}. Wrap the value in an object property and send it again.`,
   });
@@ -2713,12 +2717,12 @@ function publishSubagent(session: Session, emit: Emit, row: SubagentRow): void {
   }
 }
 
-function childSessionId(parentSessionId: string, childConversationId: string): string {
+export function childSessionId(parentSessionId: string, childConversationId: string): string {
   return `${parentSessionId}${CHILD_SESSION_MARKER}${childConversationId}`;
 }
 
 /** The child's own turn: one turn per child conversation, named after it. */
-function childTurnId(childConversationId: string): string {
+export function childTurnId(childConversationId: string): string {
   return `agy-sub:${childConversationId}`;
 }
 
@@ -3623,7 +3627,9 @@ export function buildSettings(session: ConfigStateSession): readonly ProviderSet
       description:
         Object.keys(session.config?.mcpServers ?? {}).length === 0
           ? "Paseo has no MCP servers configured for this session, so there is nothing to share."
-          : `On writes Paseo's MCP servers into ${mcpConfigPath(session.config?.cwd ?? "")} as paseo-* entries, where Antigravity can reach them. That file holds their credentials, so it must stay out of version control.`,
+          : session.settings.transport === "acp"
+            ? "On shares Paseo's MCP servers directly with Antigravity as paseo-* entries."
+            : `On writes Paseo's MCP servers into ${mcpConfigPath(session.config?.cwd ?? "")} as paseo-* entries, where Antigravity can reach them. That file holds their credentials, so it must stay out of version control.`,
       value: onOff(session.settings.shareMcp),
       options: ON_OFF_OPTIONS,
     },
@@ -3676,7 +3682,7 @@ function onOff(value: JsonValue | undefined): "on" | "off" {
 }
 
 /** `true` and `"on"` are on; everything else — `false`, `"off"`, a missing setting — is off. */
-function isSettingOn(value: JsonValue | undefined): boolean {
+export function isSettingOn(value: JsonValue | undefined): boolean {
   return value === true || value === "on";
 }
 

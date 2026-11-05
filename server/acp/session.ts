@@ -1,4 +1,9 @@
+import { execFile } from "node:child_process";
 import { randomUUID } from "node:crypto";
+import { existsSync } from "node:fs";
+import { mkdir, readFile, writeFile } from "node:fs/promises";
+import { dirname, join } from "node:path";
+import { pathToFileURL } from "node:url";
 import type {
   ProviderCapability,
   ProviderCommand,
@@ -20,22 +25,38 @@ import {
   readAccounts,
   syncShadowHome,
 } from "../accounts";
+import { conversationTranscriptPath } from "../backfill";
 import { readToolPermission } from "../agysettings";
-import { buildCatalog, DEFAULT_MODE_ID } from "../catalog";
+import { buildCatalog, DEFAULT_MODE_ID, resolveThinking } from "../catalog";
 import { discoverCommands, SYSTEM_COMMANDS, type AgyCommand } from "../commands";
+import { PASEO_MCP_PREFIX, type McpServerConfig } from "../mcp";
+import { pluginDataDir, unsafePathChars } from "../plugindata";
 import { listConversations } from "../sessions";
+import {
+  parseCreatedSubagents,
+  SubagentTranscript,
+  type ChildAction,
+  type ChildRender,
+  type CreatedSubagent,
+  type SubagentTranscriptConfig,
+} from "../subagents";
 import { mapToolDetail } from "../tools";
 import { TranscriptStore, transcriptExists } from "../transcript";
 import {
   ACP_CAPABILITIES,
   approvalPolicy,
+  childSessionId,
+  childTurnId,
   configState,
   emitNotice,
+  isSettingOn,
+  objectRootSchema,
   persistenceField,
   persistenceFor,
   readProviderOptions,
   renderPart,
   resolveAccountId,
+  resolveChildCwd,
   turnFailure,
   IMPLEMENT_MODE_ID,
   IMPLEMENT_PLAN_TEXT,
@@ -327,6 +348,245 @@ export interface AcpActiveTurn {
   latestPlan?: { text: string };
 }
 
+export interface AcpSubagentFollow {
+  readonly rowId: string;
+  childConversationId: string;
+  childId: string;
+  cwd: string;
+  role?: string;
+  typeName?: string;
+  prompt?: string;
+  log: string;
+  actions: ChildAction[];
+  status: "running" | "completed" | "failed";
+  opened: boolean;
+  done: boolean;
+  transcript?: SubagentTranscript;
+  store: TranscriptStore | null;
+}
+
+export interface DiscoveredChild {
+  readonly conversationId: string;
+  readonly logUri: string;
+  readonly workspaceUris?: readonly string[];
+}
+
+export interface OneShotArgs {
+  readonly binary: string;
+  readonly args: readonly string[];
+  readonly cwd: string;
+  readonly env: Readonly<Record<string, string>>;
+}
+
+export interface OneShotResult {
+  readonly stdout: string;
+  readonly stderr: string;
+  readonly code: number | null;
+}
+
+export type OneShotRunner = (args: OneShotArgs) => Promise<OneShotResult>;
+
+export async function defaultRunOneShot(args: OneShotArgs): Promise<OneShotResult> {
+  const { promise, resolve } = Promise.withResolvers<OneShotResult>();
+  execFile(
+    args.binary,
+    [...args.args],
+    { cwd: args.cwd, env: { ...process.env, ...args.env } as NodeJS.ProcessEnv, maxBuffer: 10 * 1024 * 1024 },
+    (error, stdout, stderr) => {
+      resolve({
+        stdout: typeof stdout === "string" ? stdout : stdout ? String(stdout) : "",
+        stderr: typeof stderr === "string" ? stderr : stderr ? String(stderr) : "",
+        code: error ? (((error as any).code as number) ?? 1) : 0,
+      });
+    },
+  );
+  return promise;
+}
+
+export function buildOneShotAgyArgs(options: {
+  promptText: string;
+  conversationId: string;
+  schemaPath: string;
+  model?: string;
+  thinkingOption?: string;
+  mode?: string;
+  accountId: string;
+  skipPermissions: boolean;
+  extraArgs?: readonly string[];
+}): string[] {
+  const thinking = resolveThinking(options.model, options.thinkingOption, options.accountId);
+  const args: string[] = [
+    "-p",
+    options.promptText,
+    "--conversation",
+    options.conversationId,
+    "--output-format",
+    "json",
+    "--json-schema",
+    options.schemaPath,
+    "--disable-slash-commands",
+  ];
+  if (thinking.slug) {
+    args.push("--model", thinking.slug);
+  }
+  if (options.mode && options.mode !== "default" && options.mode !== PLAN_MODE_ID) {
+    args.push("--mode", options.mode);
+  }
+  if (options.skipPermissions) {
+    args.push("--dangerously-skip-permissions");
+  }
+  if (options.extraArgs) {
+    args.push(...options.extraArgs);
+  }
+  return args;
+}
+
+export function toAcpMcpServers(
+  mcpServers: Record<string, McpServerConfig>,
+): unknown[] {
+  const result: unknown[] = [];
+  for (const [key, server] of Object.entries(mcpServers)) {
+    const name = `${PASEO_MCP_PREFIX}${key}`;
+    if (server.type === "stdio") {
+      result.push({
+        name,
+        command: server.command,
+        args: server.args ? [...server.args] : [],
+        env: server.env
+          ? Object.entries(server.env).map(([k, value]) => ({ name: k, value }))
+          : [],
+      });
+    } else if (server.type === "http") {
+      result.push({
+        type: "http",
+        name,
+        url: server.url,
+        headers: server.headers
+          ? Object.entries(server.headers).map(([k, value]) => ({ name: k, value }))
+          : [],
+      });
+    } else if (server.type === "sse") {
+      result.push({
+        type: "sse",
+        name,
+        url: server.url,
+        headers: server.headers
+          ? Object.entries(server.headers).map(([k, value]) => ({ name: k, value }))
+          : [],
+      });
+    }
+  }
+  return result;
+}
+
+export function findNewChildren(
+  transcriptText: string,
+  parentConversationId: string,
+  alreadyFollowed: ReadonlySet<string>,
+  geminiRoot: string,
+): DiscoveredChild[] {
+  const result: DiscoveredChild[] = [];
+  const seen = new Set<string>();
+
+  const lines = transcriptText.split("\n");
+  for (const line of lines) {
+    const trimmed = line.trim();
+    if (trimmed.length === 0) continue;
+
+    if (
+      trimmed.includes("conversationId") ||
+      trimmed.includes("logAbsoluteUri") ||
+      trimmed.includes("Created the following subagents")
+    ) {
+      try {
+        const step = JSON.parse(trimmed);
+        if (step && typeof step === "object") {
+          const content = typeof step.content === "string" ? step.content : "";
+          if (content.length > 0) {
+            const created = parseCreatedSubagents(content);
+            for (const sub of created) {
+              if (
+                sub.conversationId &&
+                sub.conversationId !== parentConversationId &&
+                !alreadyFollowed.has(sub.conversationId) &&
+                !seen.has(sub.conversationId)
+              ) {
+                seen.add(sub.conversationId);
+                const logUri =
+                  sub.logUri ??
+                  pathToFileURL(conversationTranscriptPath(geminiRoot, sub.conversationId)).href;
+                result.push({
+                  conversationId: sub.conversationId,
+                  logUri,
+                  workspaceUris: sub.workspaceUris ? [...sub.workspaceUris] : undefined,
+                });
+              }
+            }
+          }
+        }
+      } catch {
+        // Not a single JSON line
+      }
+
+      const created = parseCreatedSubagents(trimmed);
+      for (const sub of created) {
+        if (
+          sub.conversationId &&
+          sub.conversationId !== parentConversationId &&
+          !alreadyFollowed.has(sub.conversationId) &&
+          !seen.has(sub.conversationId)
+        ) {
+          seen.add(sub.conversationId);
+          const logUri =
+            sub.logUri ??
+            pathToFileURL(conversationTranscriptPath(geminiRoot, sub.conversationId)).href;
+          result.push({
+            conversationId: sub.conversationId,
+            logUri,
+            workspaceUris: sub.workspaceUris ? [...sub.workspaceUris] : undefined,
+          });
+        }
+      }
+    }
+
+    if (trimmed.includes("SYSTEM_MESSAGE") && trimmed.includes("sender=")) {
+      const match = /sender=([0-9a-fA-F-]{36})/.exec(trimmed);
+      if (
+        match &&
+        match[1] &&
+        match[1] !== parentConversationId &&
+        !alreadyFollowed.has(match[1]) &&
+        !seen.has(match[1])
+      ) {
+        const childId = match[1];
+        seen.add(childId);
+        const logPath = conversationTranscriptPath(geminiRoot, childId);
+        result.push({
+          conversationId: childId,
+          logUri: pathToFileURL(logPath).href,
+        });
+      }
+    }
+  }
+
+  const regex = /(?:file:\/\/)?([^\s"'`]+\/brain\/([0-9a-fA-F-]{36})\/\.system_generated\/logs\/transcript\.jsonl)/g;
+  let match: RegExpExecArray | null;
+  while ((match = regex.exec(transcriptText)) !== null) {
+    const rawPath = match[1];
+    const childId = match[2];
+    if (childId !== parentConversationId && !alreadyFollowed.has(childId) && !seen.has(childId)) {
+      seen.add(childId);
+      const logUri = rawPath.startsWith("file://") ? rawPath : pathToFileURL(rawPath).href;
+      result.push({
+        conversationId: childId,
+        logUri,
+      });
+    }
+  }
+
+  return result;
+}
+
 export class AcpSession implements ConfigStateSession {
   readonly sessionId: string;
   readonly config: ProviderSessionConfig;
@@ -350,8 +610,16 @@ export class AcpSession implements ConfigStateSession {
   readonly pendingPermissions = new Map<string, PendingPermission>();
   lastAskQuestionToolCall?: AcpToolCallUpdate;
 
-  // Optional transport provider for scripted testing
+  // Optional transport and hooks for scripted testing
   injectedTransport?: AgyAcpClientTransport | (() => AgyAcpClientTransport);
+  runOneShot?: OneShotRunner;
+  readTranscriptFile?: (path: string) => Promise<string> | string;
+  statTranscriptFile?: (path: string) => Promise<{ size: number; mtimeMs: number }>;
+
+  readonly childCapabilities: readonly ProviderCapability[];
+  readonly subagentFollows = new Map<string, AcpSubagentFollow>();
+  readonly followedChildren = new Set<string>();
+  readonly childSessions = new Set<string>();
 
   constructor(
     sessionId: string,
@@ -359,6 +627,10 @@ export class AcpSession implements ConfigStateSession {
     conversationId: string | null,
     accountId: string,
     injectedTransport?: AgyAcpClientTransport | (() => AgyAcpClientTransport),
+    runOneShot?: OneShotRunner,
+    readTranscriptFile?: (path: string) => Promise<string> | string,
+    statTranscriptFile?: (path: string) => Promise<{ size: number; mtimeMs: number }>,
+    childCapabilities: readonly ProviderCapability[] = [],
   ) {
     this.sessionId = sessionId;
     this.config = config;
@@ -373,6 +645,10 @@ export class AcpSession implements ConfigStateSession {
     this.settings = { ...config.settings };
     this.title = config.title;
     this.injectedTransport = injectedTransport;
+    this.runOneShot = runOneShot;
+    this.readTranscriptFile = readTranscriptFile;
+    this.statTranscriptFile = statTranscriptFile;
+    this.childCapabilities = childCapabilities;
   }
 }
 
@@ -384,6 +660,9 @@ interface AcpConnectionState {
 export interface AcpConnectionOptions {
   clientFactory?: (config: AgyAcpClientConfig, options: AgyAcpClientOptions) => AgyAcpClient;
   transport?: AgyAcpClientTransport | (() => AgyAcpClientTransport);
+  runOneShot?: OneShotRunner;
+  readTranscriptFile?: (path: string) => Promise<string> | string;
+  statTranscriptFile?: (path: string) => Promise<{ size: number; mtimeMs: number }>;
 }
 
 function publish(session: AcpSession, emit: Emit, item: ProviderTimelineItem): void {
@@ -657,6 +936,290 @@ function findChoiceMatch(choices: any[], text: string): any {
   return null;
 }
 
+function publishSubagentRow(
+  session: AcpSession,
+  emit: Emit,
+  follow: AcpSubagentFollow,
+): void {
+  const callId = follow.rowId.replace(/^tool:/, "");
+  const type = follow.role ?? follow.typeName;
+  const item: ProviderTimelineItem = {
+    type: "tool_call",
+    id: follow.rowId,
+    callId,
+    name: "invoke_subagent",
+    detail: {
+      type: "sub_agent",
+      ...(follow.typeName !== undefined ? { subAgentType: follow.typeName } : {}),
+      ...(type !== undefined ? { description: type } : {}),
+      ...(follow.childId ? { childSessionId: follow.childId } : {}),
+      log: follow.log,
+      ...(follow.actions.length > 0 ? { actions: follow.actions } : {}),
+    },
+    metadata: {
+      subagent: {
+        ...(follow.childConversationId ? { conversationId: follow.childConversationId } : {}),
+        ...(follow.typeName !== undefined ? { typeName: follow.typeName } : {}),
+        ...(follow.role !== undefined ? { role: follow.role } : {}),
+        ...(follow.prompt !== undefined ? { prompt: follow.prompt } : {}),
+        ...(follow.done ? { done: true } : {}),
+      },
+    },
+    status: follow.status,
+    error: null,
+  };
+
+  if (session.activeTurn) {
+    session.activeTurn.openTools.set(callId, item as ProviderToolCallItem);
+  }
+  publish(session, emit, item);
+}
+
+function handleChildRender(
+  session: AcpSession,
+  emit: Emit,
+  follow: AcpSubagentFollow,
+  render: ChildRender,
+  changed: readonly ProviderTimelineItem[],
+): void {
+  if (session.closing) return;
+
+  if (!follow.opened) {
+    if (render.items.length === 0) return;
+    follow.opened = true;
+    session.childSessions.add(follow.childId);
+    emit({
+      type: "session.opened",
+      sessionId: follow.childId,
+      parentSessionId: session.sessionId,
+      toolCallId: follow.rowId,
+      capabilities: session.childCapabilities,
+      restoration: "parent",
+      title: follow.role ?? follow.typeName ?? "Subagent",
+      description: (follow.prompt ?? "").slice(0, 100),
+      cwd: follow.cwd,
+    });
+    emit({ type: "session.ready", sessionId: follow.childId });
+    emit({
+      type: "session.turn",
+      sessionId: follow.childId,
+      turnId: childTurnId(follow.childConversationId),
+      state: "started",
+    });
+  }
+
+  for (const item of changed) {
+    if (follow.store) follow.store.upsert(item);
+    emit({ type: "timeline.item", sessionId: follow.childId, item });
+  }
+
+  const finished = render.done;
+  follow.done = finished;
+  if (render.report.length > 0) follow.log = render.report;
+  if (render.actions.length > 0) follow.actions = [...render.actions];
+  if (finished && follow.status === "running") follow.status = "completed";
+
+  publishSubagentRow(session, emit, follow);
+
+  if (finished) {
+    emit({
+      type: "session.turn",
+      sessionId: follow.childId,
+      turnId: childTurnId(follow.childConversationId),
+      state: "completed",
+    });
+    emit({
+      type: "session.closed",
+      sessionId: follow.childId,
+    });
+    session.childSessions.delete(follow.childId);
+    follow.transcript?.stop();
+    void follow.store?.flush();
+  }
+}
+
+async function attachChildToFollow(
+  session: AcpSession,
+  emit: Emit,
+  follow: AcpSubagentFollow,
+  child: DiscoveredChild,
+): Promise<void> {
+  follow.childConversationId = child.conversationId;
+  follow.childId = childSessionId(session.sessionId, child.conversationId);
+  follow.cwd = resolveChildCwd(session.config.cwd, child.workspaceUris);
+
+  if (session.persist) {
+    try {
+      follow.store = await TranscriptStore.load(child.conversationId);
+    } catch {
+      // Best-effort
+    }
+  }
+
+  publishSubagentRow(session, emit, follow);
+
+  const transcriptConfig: SubagentTranscriptConfig = {
+    logUri: child.logUri,
+    childConversationId: child.conversationId,
+    parentConversationId: session.conversationId!,
+    cwd: follow.cwd,
+    readFile: session.readTranscriptFile ? (p) => Promise.resolve(session.readTranscriptFile!(p)) : undefined,
+    stat: session.statTranscriptFile ? (p) => Promise.resolve(session.statTranscriptFile!(p)) : undefined,
+  };
+
+  const follower = new SubagentTranscript(transcriptConfig, {
+    onRender: (render, changed) => handleChildRender(session, emit, follow, render, changed),
+    onDegrade: (reason) => {
+      console.error(`[antigravity] not following subagent ${child.conversationId}: ${reason}`);
+    },
+    onLost: (reason) => {
+      console.error(`[antigravity] stopped following subagent ${child.conversationId}: ${reason}`);
+      if (follow.opened && !follow.done) {
+        emit({
+          type: "session.turn",
+          sessionId: follow.childId,
+          turnId: childTurnId(child.conversationId),
+          state: "canceled",
+          error: { message: reason },
+        });
+        emit({
+          type: "session.closed",
+          sessionId: follow.childId,
+          error: { message: reason },
+        });
+        session.childSessions.delete(follow.childId);
+      }
+    },
+  });
+
+  follow.transcript = follower;
+  follower.start();
+}
+
+function startParentTranscriptWatcher(
+  session: AcpSession,
+  emit: Emit,
+  follow: AcpSubagentFollow,
+  _toolCallId: string,
+): void {
+  if (follow.childConversationId) return;
+
+  const parentConversationId = session.conversationId;
+  if (!parentConversationId) return;
+
+  const geminiRoot = accountGeminiRoot(session.accountId);
+  const parentTranscriptPath = conversationTranscriptPath(geminiRoot, parentConversationId);
+
+  const startedAt = Date.now();
+  const TIMEOUT_MS = 30_000;
+  const POLL_MS = 200;
+
+  const check = async (): Promise<boolean> => {
+    if (session.closing || follow.childConversationId) return true;
+
+    try {
+      let content = "";
+      if (session.readTranscriptFile) {
+        content = await session.readTranscriptFile(parentTranscriptPath);
+      } else if (existsSync(parentTranscriptPath)) {
+        content = await readFile(parentTranscriptPath, "utf8");
+      }
+
+      if (content.length > 0) {
+        const found = findNewChildren(content, parentConversationId, session.followedChildren, geminiRoot);
+        if (found.length > 0) {
+          const child = found[0];
+          session.followedChildren.add(child.conversationId);
+          await attachChildToFollow(session, emit, follow, child);
+          return true;
+        }
+      }
+    } catch {
+      // Best-effort
+    }
+    return false;
+  };
+
+  const poll = async () => {
+    const done = await check();
+    if (done) return;
+
+    if (Date.now() - startedAt < TIMEOUT_MS && !session.closing && !follow.childConversationId) {
+      setTimeout(poll, POLL_MS).unref();
+    }
+  };
+
+  void poll();
+}
+
+function handleAcpSubagentToolUpdate(
+  session: AcpSession,
+  toolUpdate: AcpToolCallUpdate,
+  emit: Emit,
+): void {
+  const callId = toolUpdate.toolCallId;
+  const rowId = `tool:${callId}`;
+
+  const rawArgs =
+    typeof toolUpdate.args === "object" && toolUpdate.args !== null && !Array.isArray(toolUpdate.args)
+      ? (toolUpdate.args as Record<string, unknown>)
+      : typeof toolUpdate.rawInput === "object" && toolUpdate.rawInput !== null && !Array.isArray(toolUpdate.rawInput)
+        ? (toolUpdate.rawInput as Record<string, unknown>)
+        : undefined;
+
+  let follow = session.subagentFollows.get(rowId);
+  if (!follow) {
+    const role =
+      typeof rawArgs?.Role === "string"
+        ? rawArgs.Role
+        : typeof rawArgs?.role === "string"
+          ? rawArgs.role
+          : undefined;
+    const typeName =
+      typeof rawArgs?.TypeName === "string"
+        ? rawArgs.TypeName
+        : typeof rawArgs?.typeName === "string"
+          ? rawArgs.typeName
+          : undefined;
+    const prompt =
+      typeof rawArgs?.Prompt === "string"
+        ? rawArgs.Prompt
+        : typeof rawArgs?.prompt === "string"
+          ? rawArgs.prompt
+          : undefined;
+
+    follow = {
+      rowId,
+      childConversationId: "",
+      childId: "",
+      cwd: session.config.cwd,
+      role,
+      typeName,
+      prompt,
+      log: prompt ?? "",
+      actions: [],
+      status: "running",
+      opened: false,
+      done: false,
+      store: null,
+    };
+    session.subagentFollows.set(rowId, follow);
+
+    publishSubagentRow(session, emit, follow);
+    startParentTranscriptWatcher(session, emit, follow, callId);
+  } else {
+    if (rawArgs) {
+      if (!follow.role && typeof rawArgs.Role === "string") follow.role = rawArgs.Role;
+      if (!follow.typeName && typeof rawArgs.TypeName === "string") follow.typeName = rawArgs.TypeName;
+      if (!follow.prompt && typeof rawArgs.Prompt === "string") follow.prompt = rawArgs.Prompt;
+    }
+    if (toolUpdate.status === "failed") {
+      follow.status = "failed";
+      publishSubagentRow(session, emit, follow);
+    }
+  }
+}
+
 function handleSessionUpdate(session: AcpSession, update: AcpSessionUpdate, emit: Emit): void {
   const turn = session.activeTurn;
 
@@ -695,12 +1258,24 @@ function handleSessionUpdate(session: AcpSession, update: AcpSessionUpdate, emit
 
     case "tool_call":
     case "tool_call_update": {
-      if (!turn) {
-        // TODO(acp-3c): Detached turns after end_turn
-        return;
-      }
       const toolUpdate = update as AcpToolCallUpdate;
       const callId = toolUpdate.toolCallId;
+      const rowId = `tool:${callId}`;
+
+      const previous = turn?.openTools.get(callId);
+      const isSubagent =
+        toolUpdate.name === "invoke_subagent" ||
+        previous?.name === "invoke_subagent" ||
+        session.subagentFollows.has(rowId);
+
+      if (isSubagent) {
+        handleAcpSubagentToolUpdate(session, toolUpdate, emit);
+        return;
+      }
+
+      if (!turn) {
+        return;
+      }
 
       // Plan detection: write_file with ArtifactMetadata.RequestFeedback === true
       const planText = extractPlanText(toolUpdate);
@@ -714,7 +1289,6 @@ function handleSessionUpdate(session: AcpSession, update: AcpSessionUpdate, emit
         return;
       }
 
-      const previous = turn.openTools.get(callId);
       const item = resolveToolItem(toolUpdate, previous, session.config.cwd);
 
       if (item.status === "running") {
@@ -794,6 +1368,10 @@ function handleProcessExitOrCrash(session: AcpSession, error: Error, emit: Emit)
     session.activeTurn = null;
 
     for (const tool of turn.openTools.values()) {
+      if (tool.name === "invoke_subagent") {
+        const follow = session.subagentFollows.get(tool.id);
+        if (follow && !follow.done) continue;
+      }
       publish(
         session,
         emit,
@@ -987,17 +1565,20 @@ async function ensureClient(session: AcpSession, emit: Emit): Promise<AgyAcpClie
 
       await client.initialize();
 
+      const shareMcp = isSettingOn(session.settings.shareMcp);
+      const mcpServers = shareMcp ? toAcpMcpServers(session.config.mcpServers ?? {}) : [];
+
       if (session.conversationId) {
         await client.resumeSession({
           sessionId: session.conversationId,
           cwd: session.config.cwd,
-          mcpServers: [], // TODO(acp-3c): Native MCP sharing via mcpServers
+          mcpServers,
           systemPromptAppend: session.config.systemPrompt,
         });
       } else {
         const res = await client.newSession({
           cwd: session.config.cwd,
-          mcpServers: [], // TODO(acp-3c): Native MCP sharing via mcpServers
+          mcpServers,
           systemPromptAppend: session.config.systemPrompt,
         });
         session.conversationId = res.sessionId;
@@ -1095,6 +1676,12 @@ async function runTurnPrompt(
         "Still running in the background when the turn ended — Antigravity sees its result on your next message.";
 
       for (const tool of turn.openTools.values()) {
+        if (tool.name === "invoke_subagent") {
+          const follow = session.subagentFollows.get(tool.id);
+          if (follow && !follow.done) {
+            continue;
+          }
+        }
         const detail = { ...tool.detail };
         if (detail.type === "shell") {
           detail.output = detail.output
@@ -1147,19 +1734,226 @@ async function promptSession(
   const { prompt } = input;
 
   if (prompt.outputSchema !== undefined) {
-    // TODO(acp-3b): Structured output via one-shot -p fallback
+    if (session.activeTurn !== null) {
+      emit({
+        type: "session.prompt_result",
+        sessionId: session.sessionId,
+        clientMessageId: prompt.clientMessageId,
+        result: {
+          type: "failed",
+          error: {
+            message:
+              "Antigravity applies a structured-output schema to the whole process, so this prompt cannot be queued behind a running turn. Wait for the turn to finish and send it again.",
+            code: "busy",
+          },
+        },
+      });
+      return;
+    }
+
+    const schema = objectRootSchema(prompt.outputSchema);
+    if ("refusal" in schema) {
+      emit({
+        type: "session.prompt_result",
+        sessionId: session.sessionId,
+        clientMessageId: prompt.clientMessageId,
+        result: {
+          type: "failed",
+          error: {
+            message: schema.refusal,
+            code: "schema_unsupported",
+          },
+        },
+      });
+      return;
+    }
+
+    const { content, shown } = toAcpPromptContent(prompt);
+    if (content.length === 0) {
+      emit({
+        type: "session.prompt_result",
+        sessionId: session.sessionId,
+        clientMessageId: prompt.clientMessageId,
+        result: {
+          type: "failed",
+          error: {
+            message: "Antigravity requires a non-empty text prompt",
+            code: "empty_prompt",
+          },
+        },
+      });
+      return;
+    }
+
+    if (!session.conversationId) {
+      try {
+        await ensureClient(session, emit);
+      } catch (err) {
+        emit({
+          type: "session.prompt_result",
+          sessionId: session.sessionId,
+          clientMessageId: prompt.clientMessageId,
+          result: {
+            type: "failed",
+            error: {
+              message: `Failed to initialize conversation for structured output: ${err instanceof Error ? err.message : String(err)}`,
+              code: "agy_launch_failed",
+            },
+          },
+        });
+        return;
+      }
+    }
+
+    if (session.client) {
+      await session.client.close();
+      session.client = null;
+    }
+
+    session.turnCounter += 1;
+    const turnId = `turn-${session.turnCounter}-${randomUUID().slice(0, 8)}`;
+
+    publish(session, emit, {
+      type: "user_message",
+      id: `user:${turnId}`,
+      text: shown,
+      clientMessageId: prompt.clientMessageId,
+    });
+
     emit({
       type: "session.prompt_result",
       sessionId: session.sessionId,
       clientMessageId: prompt.clientMessageId,
       result: {
-        type: "failed",
-        error: {
-          message: "Structured output is not supported over ACP yet",
-          code: "schema_unsupported",
-        },
+        type: "turn",
+        turnId,
       },
     });
+
+    emit({
+      type: "session.turn",
+      sessionId: session.sessionId,
+      turnId,
+      state: "started",
+    });
+
+    const schemaPath = pluginDataDir("schemas", `${session.sessionId.replace(unsafePathChars, "_")}.json`);
+    try {
+      await mkdir(dirname(schemaPath), { recursive: true });
+      await writeFile(schemaPath, JSON.stringify(schema.schema), "utf8");
+    } catch (err) {
+      emit({
+        type: "session.turn",
+        sessionId: session.sessionId,
+        turnId,
+        state: "failed",
+        error: {
+          message: `Could not write the output schema for Antigravity: ${err instanceof Error ? err.message : String(err)}`,
+          code: "schema_failed",
+        },
+      });
+      return;
+    }
+
+    const promptText = content.map((c) => (c.type === "text" ? c.text : "")).join("\n\n");
+    const options = readProviderOptions(session.config);
+    const binary = options.agyPath ?? resolveAgyBinary();
+    const home = accountHome(session.accountId);
+    if (home !== null) syncShadowHome(session.accountId);
+    const env = home === null ? session.config.env : { ...session.config.env, HOME: home };
+
+    const args = buildOneShotAgyArgs({
+      promptText,
+      conversationId: session.conversationId!,
+      schemaPath,
+      model: session.selection.model,
+      thinkingOption: session.selection.thinkingOption,
+      mode: session.selection.mode,
+      accountId: session.accountId,
+      skipPermissions: approvalPolicy(session) === "skip",
+      extraArgs: options.extraArgs,
+    });
+
+    console.log(`[antigravity] spawn ${binary} ${args.join(" ")} (cwd ${session.config.cwd})`);
+
+    const runner = session.runOneShot ?? defaultRunOneShot;
+    let runResult: OneShotResult;
+    try {
+      runResult = await runner({
+        binary,
+        args,
+        cwd: session.config.cwd,
+        env,
+      });
+    } catch (err) {
+      const failure = turnFailure({ agyError: null }, { message: err instanceof Error ? err.message : String(err), code: "agy_exit" });
+      emit({
+        type: "session.turn",
+        sessionId: session.sessionId,
+        turnId,
+        state: "failed",
+        error: failure.error,
+      });
+      return;
+    }
+
+    let parsed: any = null;
+    try {
+      parsed = JSON.parse(runResult.stdout.trim());
+    } catch {
+      // Non-JSON stdout
+    }
+
+    if (runResult.code === 0 && parsed && (parsed.status === "SUCCESS" || (!parsed.status && parsed.structured_output !== undefined))) {
+      if (parsed.structured_output !== undefined) {
+        const json = JSON.stringify(parsed.structured_output);
+        publish(session, emit, {
+          type: "assistant_message",
+          id: `agy:schema:${turnId}`,
+          text: json ?? "",
+        });
+      } else {
+        publish(session, emit, {
+          type: "assistant_message",
+          id: `agy:result:${turnId}`,
+          text: parsed.response ?? "",
+        });
+      }
+
+      if (parsed.usage) {
+        emit({
+          type: "session.usage",
+          sessionId: session.sessionId,
+          turnId,
+          usage: {
+            inputTokens: parsed.usage.input_tokens ?? parsed.usage.inputTokens,
+            cachedInputTokens: parsed.usage.cache_read_tokens ?? parsed.usage.cachedReadTokens,
+            outputTokens:
+              (parsed.usage.output_tokens ?? parsed.usage.outputTokens ?? 0) +
+                (parsed.usage.thinking_tokens ?? parsed.usage.thoughtTokens ?? 0) || undefined,
+          },
+        });
+      }
+
+      emit({
+        type: "session.turn",
+        sessionId: session.sessionId,
+        turnId,
+        state: "completed",
+      });
+    } else {
+      const msg = parsed?.error ?? (runResult.stderr.trim() || parsed?.response || "One-shot agy failed");
+      const code = parsed?.status ?? "agy_exit";
+      const failure = turnFailure({ agyError: null }, { message: msg, code });
+      emit({
+        type: "session.turn",
+        sessionId: session.sessionId,
+        turnId,
+        state: "failed",
+        error: failure.error,
+      });
+    }
+
     return;
   }
 
@@ -1194,70 +1988,74 @@ async function promptSession(
   // Active turn already running
   if (session.activeTurn !== null) {
     if (prompt.delivery === "steer") {
-      const turn = session.activeTurn;
+      const client = await ensureClient(session, emit);
+      // Steering race: if running turn completed before prompt is sent, start a normal new turn
+      if (session.activeTurn !== null) {
+        const turn = session.activeTurn;
 
+        emit({
+          type: "session.prompt_result",
+          sessionId: session.sessionId,
+          clientMessageId: prompt.clientMessageId,
+          result: {
+            type: "steer",
+            turnId: turn.turnId,
+          },
+        });
+
+        publish(session, emit, {
+          type: "user_message",
+          id: `user:${prompt.clientMessageId}`,
+          text: shown,
+          clientMessageId: prompt.clientMessageId,
+        });
+
+        turn.messageIndex += 1;
+        turn.thoughtIndex += 1;
+        turn.currentMessageId = `agy:msg:${turn.turnId}:${turn.messageIndex}`;
+        turn.currentMessageText = "";
+        turn.currentThoughtId = `agy:thought:${turn.turnId}:${turn.thoughtIndex}`;
+        turn.currentThoughtText = "";
+
+        const {
+          promise: steeringPromptPromise,
+          resolve: resolveSteer,
+          reject: rejectSteer,
+        } = Promise.withResolvers<AcpPromptResult>();
+        turn.activePromptPromise = steeringPromptPromise;
+
+        void (async () => {
+          try {
+            const actualPromptPromise = client.prompt(content);
+            actualPromptPromise.then(resolveSteer, rejectSteer);
+            await runTurnPrompt(session, turn, steeringPromptPromise, emit);
+          } catch (err) {
+            handleProcessExitOrCrash(
+              session,
+              err instanceof Error ? err : new Error(String(err)),
+              emit,
+            );
+          }
+        })();
+        return;
+      }
+      // Running turn completed while waiting for client; fall through to start a normal new turn!
+    } else {
+      // Busy
       emit({
         type: "session.prompt_result",
         sessionId: session.sessionId,
         clientMessageId: prompt.clientMessageId,
         result: {
-          type: "steer",
-          turnId: turn.turnId,
+          type: "failed",
+          error: {
+            message: "Antigravity is busy running a turn",
+            code: "busy",
+          },
         },
       });
-
-      publish(session, emit, {
-        type: "user_message",
-        id: `user:${prompt.clientMessageId}`,
-        text: shown,
-        clientMessageId: prompt.clientMessageId,
-      });
-
-      turn.messageIndex += 1;
-      turn.thoughtIndex += 1;
-      turn.currentMessageId = `agy:msg:${turn.turnId}:${turn.messageIndex}`;
-      turn.currentMessageText = "";
-      turn.currentThoughtId = `agy:thought:${turn.turnId}:${turn.thoughtIndex}`;
-      turn.currentThoughtText = "";
-
-      const {
-        promise: steeringPromptPromise,
-        resolve: resolveSteer,
-        reject: rejectSteer,
-      } = Promise.withResolvers<AcpPromptResult>();
-      turn.activePromptPromise = steeringPromptPromise;
-
-      void (async () => {
-        try {
-          const client = await ensureClient(session, emit);
-          const actualPromptPromise = client.prompt(content);
-          actualPromptPromise.then(resolveSteer, rejectSteer);
-          await runTurnPrompt(session, turn, steeringPromptPromise, emit);
-        } catch (err) {
-          handleProcessExitOrCrash(
-            session,
-            err instanceof Error ? err : new Error(String(err)),
-            emit,
-          );
-        }
-      })();
       return;
     }
-
-    // Busy
-    emit({
-      type: "session.prompt_result",
-      sessionId: session.sessionId,
-      clientMessageId: prompt.clientMessageId,
-      result: {
-        type: "failed",
-        error: {
-          message: "Antigravity is busy running a turn",
-          code: "busy",
-        },
-      },
-    });
-    return;
   }
 
   session.turnCounter += 1;
@@ -1590,6 +2388,20 @@ async function configureSession(
     }
   }
   if (changes.settings) {
+    if (changes.settings.shareMcp !== undefined && changes.settings.shareMcp !== session.settings.shareMcp) {
+      if (session.client?.running) {
+        await session.client.close();
+        session.client = null;
+      }
+      emitNotice(
+        session,
+        emit,
+        "mcp-share-changed",
+        "info",
+        "Paseo tools updated",
+        "Sharing Paseo tools with Antigravity will take effect on your next message.",
+      );
+    }
     if (changes.settings.transport !== undefined && changes.settings.transport !== "acp") {
       emitNotice(
         session,
@@ -1630,12 +2442,17 @@ async function openSession(
     (config.providerOptions as Record<string, unknown> | undefined)?.transport ??
     (config.providerOptions as Record<string, unknown> | undefined)?.acpTransport;
 
+  const childCapabilities = state.capabilities.filter((c) => c === "session.subsession");
   const session = new AcpSession(
     input.sessionId,
     config,
     conversationId,
     accountId,
     rawTransport as AgyAcpClientTransport | (() => AgyAcpClientTransport) | undefined,
+    options.runOneShot,
+    options.readTranscriptFile,
+    options.statTranscriptFile,
+    childCapabilities,
   );
   state.sessions.set(input.sessionId, session);
 
@@ -1751,6 +2568,24 @@ async function dispatch(
       cancelPendingPermissions(session, emit);
       cancelPendingQuestions(session, emit);
       resolvePendingPlan(session, emit);
+      for (const follow of session.subagentFollows.values()) {
+        follow.transcript?.stop();
+        if (follow.opened && !follow.done) {
+          emit({
+            type: "session.turn",
+            sessionId: follow.childId,
+            turnId: childTurnId(follow.childConversationId),
+            state: "canceled",
+            error: { message: "Interrupted" },
+          });
+          emit({
+            type: "session.closed",
+            sessionId: follow.childId,
+            error: { message: "Interrupted" },
+          });
+          session.childSessions.delete(follow.childId);
+        }
+      }
       session.client?.cancel();
       emit({ type: "request.completed", requestId: input.requestId });
       return;
@@ -1786,6 +2621,20 @@ async function dispatch(
       cancelPendingPermissions(session, emit);
       cancelPendingQuestions(session, emit);
       resolvePendingPlan(session, emit);
+      for (const follow of session.subagentFollows.values()) {
+        follow.transcript?.stop();
+        if (follow.opened && !follow.done) {
+          emit({
+            type: "session.closed",
+            sessionId: follow.childId,
+          });
+          session.childSessions.delete(follow.childId);
+        }
+        if (follow.store) {
+          void follow.store.flush();
+        }
+      }
+      session.subagentFollows.clear();
       if (session.transcript) {
         await session.transcript.flush();
       }
@@ -1840,6 +2689,20 @@ export function createAcpConnection(
         cancelPendingPermissions(session, emit);
         cancelPendingQuestions(session, emit);
         resolvePendingPlan(session, emit);
+        for (const follow of session.subagentFollows.values()) {
+          follow.transcript?.stop();
+          if (follow.opened && !follow.done) {
+            emit({
+              type: "session.closed",
+              sessionId: follow.childId,
+            });
+            session.childSessions.delete(follow.childId);
+          }
+          if (follow.store) {
+            closingSessions.push(follow.store.flush());
+          }
+        }
+        session.subagentFollows.clear();
         if (session.transcript) {
           closingSessions.push(session.transcript.flush());
         }

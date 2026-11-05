@@ -181,6 +181,8 @@ export class AgyAcpClient extends EventEmitter {
       stdio: ["pipe", "pipe", "pipe"],
     });
 
+    console.log(`[antigravity] spawn ${binary} ${args.join(" ")} (cwd ${this.config.cwd})`);
+
     this.child = child;
     this.exitPromise = new Promise<void>((resolve) => {
       this.resolveExit = resolve;
@@ -523,6 +525,16 @@ export class AgyAcpClient extends EventEmitter {
     this.reportedExit = true;
 
     const exitInfo = this.exitInfo ?? { code: null, signal: null };
+    if (exitInfo.code !== 0 && exitInfo.code !== null) {
+      console.log(
+        `[antigravity] agy acp exited with code ${exitInfo.code}${exitInfo.signal ? ` (signal ${exitInfo.signal})` : ""}`,
+      );
+      if (this.stderrBuffer.length > 0) {
+        for (const line of this.stderrBuffer.slice(-5)) {
+          console.error(`[antigravity] ${line}`);
+        }
+      }
+    }
     this.emit("exit", exitInfo);
 
     if (exitInfo.code !== 0 && exitInfo.code !== null) {
