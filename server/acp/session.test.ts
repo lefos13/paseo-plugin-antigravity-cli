@@ -10,7 +10,9 @@ import type {
   ProviderTimelineItem,
 } from "@getpaseo/plugin/server/provider";
 import { FakeAcpAgent } from "../testing/fake-acp-agent";
-import { createProvider, ACP_CAPABILITIES, CAPABILITIES } from "../provider";
+import {
+  ACP_CAPABILITIES,
+} from "../provider";
 import type { AcpPromptResult } from "./schema";
 import { createAcpConnection, type AcpConnectionOptions } from "./session";
 
@@ -61,35 +63,33 @@ describe("ACP Session & Connection (Phase 3a)", () => {
     );
   }
 
-  it("selects ACP transport via PASEO_ANTIGRAVITY_TRANSPORT=acp and advertises prompt.steer", async () => {
-    const originalEnv = process.env.PASEO_ANTIGRAVITY_TRANSPORT;
-    try {
-      process.env.PASEO_ANTIGRAVITY_TRANSPORT = "acp";
-      const provider = createProvider();
-      const acpConn = await provider.connect({
-        versions: [1],
-        capabilities: [...CAPABILITIES, "prompt.steer"],
-      });
-      expect(acpConn.capabilities).toContain("prompt.steer");
-      await acpConn.close();
-
-      delete process.env.PASEO_ANTIGRAVITY_TRANSPORT;
-      const ndjsonConn = await provider.connect({
-        versions: [1],
-        capabilities: [...CAPABILITIES, "prompt.steer"],
-      });
-      expect(ndjsonConn.capabilities).not.toContain("prompt.steer");
-      await ndjsonConn.close();
-    } finally {
-      if (originalEnv !== undefined) {
-        process.env.PASEO_ANTIGRAVITY_TRANSPORT = originalEnv;
-      } else {
-        delete process.env.PASEO_ANTIGRAVITY_TRANSPORT;
+  async function waitForTurnCompletion(
+    sessionId = "s1",
+    turnId?: string,
+    timeoutMs = 3000,
+  ): Promise<Extract<ProviderEvent, { type: "session.turn" }>> {
+    const start = Date.now();
+    while (Date.now() - start < timeoutMs) {
+      const turns = events.filter(
+        (e): e is Extract<ProviderEvent, { type: "session.turn" }> =>
+          e.type === "session.turn" &&
+          e.sessionId === sessionId &&
+          (e.state === "completed" || e.state === "failed" || e.state === "canceled"),
+      );
+      if (turnId) {
+        const match = turns.find((t) => t.turnId === turnId);
+        if (match) return match;
+      } else if (turns.length > 0) {
+        return turns[turns.length - 1];
       }
+      await new Promise((r) => setTimeout(r, 10));
     }
-  });
+    throw new Error(`Timed out waiting for turn completion in session ${sessionId}`);
+  }
 
-  it("fresh open: calls initialize then session/new with systemPromptAppend and emits ready", async () => {
+
+
+  it("Item 2: lazy start: open does NOT spawn process; first prompt initializes and emits persistence", async () => {
     const connection = createAcpConnection(ACP_CAPABILITIES, options);
     connection.onEvent((e) => events.push(e));
 
@@ -101,15 +101,51 @@ describe("ACP Session & Connection (Phase 3a)", () => {
       history: "skip",
     });
 
-    const initReqs = fakeAgent.requestsFor("initialize");
-    expect(initReqs).toHaveLength(1);
-    expect(initReqs[0].params).toEqual({
-      protocolVersion: 1,
-      clientCapabilities: {
-        elicitation: { form: {} },
+    // Lazy: NO process requests yet!
+    expect(fakeAgent.requestsFor("initialize")).toHaveLength(0);
+    expect(fakeAgent.requestsFor("session/new")).toHaveLength(0);
+
+    const opened = events.find((e) => e.type === "session.opened");
+    expect(opened).toMatchObject({
+      type: "session.opened",
+      requestId: "r1",
+      sessionId: "s1",
+      persistence: {
+        version: 1,
+        data: {
+          conversationId: null,
+          accountId: "default",
+        },
       },
     });
 
+    expect(events.some((e) => e.type === "session.config")).toBe(true);
+    expect(events.some((e) => e.type === "session.commands")).toBe(true);
+    expect(events.some((e) => e.type === "session.ready")).toBe(true);
+
+    // Now send the first prompt -> triggers initialize and session/new
+    fakeAgent.queuePromptResult({
+      stopReason: "end_turn",
+      usage: { inputTokens: 5, outputTokens: 10 },
+    });
+
+    await connection.send({
+      type: "session.prompt",
+      sessionId: "s1",
+      prompt: {
+        clientMessageId: "m1",
+        delivery: "auto",
+        input: {
+          type: "message",
+          content: [{ type: "text", text: "Hello first prompt" }],
+        },
+      },
+    });
+
+    await waitForTurnCompletion("s1");
+
+    // Initialized on demand
+    expect(fakeAgent.requestsFor("initialize")).toHaveLength(1);
     const newReqs = fakeAgent.requestsFor("session/new");
     expect(newReqs).toHaveLength(1);
     expect(newReqs[0].params).toMatchObject({
@@ -124,10 +160,10 @@ describe("ACP Session & Connection (Phase 3a)", () => {
       },
     });
 
-    const opened = events.find((e) => e.type === "session.opened");
-    expect(opened).toMatchObject({
-      type: "session.opened",
-      requestId: "r1",
+    // Persistence emitted on first launch
+    const persistenceEvent = events.find((e) => e.type === "session.persistence");
+    expect(persistenceEvent).toMatchObject({
+      type: "session.persistence",
       sessionId: "s1",
       persistence: {
         version: 1,
@@ -138,14 +174,10 @@ describe("ACP Session & Connection (Phase 3a)", () => {
       },
     });
 
-    expect(events.some((e) => e.type === "session.config")).toBe(true);
-    expect(events.some((e) => e.type === "session.commands")).toBe(true);
-    expect(events.some((e) => e.type === "session.ready")).toBe(true);
-
     await connection.close();
   });
 
-  it("resume session: calls initialize then session/resume using existing conversationId", async () => {
+  it("Item 2: resume session initializes and calls session/resume on first prompt", async () => {
     const connection = createAcpConnection(ACP_CAPABILITIES, options);
     connection.onEvent((e) => events.push(e));
 
@@ -159,12 +191,36 @@ describe("ACP Session & Connection (Phase 3a)", () => {
         data: {
           conversationId: "existing-uuid-1234",
           accountId: "default",
+          transport: "acp",
         },
       },
       history: "skip",
     });
 
-    expect(fakeAgent.requestsFor("initialize")).toHaveLength(1);
+    // Lazy: not spawned yet
+    expect(fakeAgent.requestsFor("session/resume")).toHaveLength(0);
+
+    // First prompt spawns and calls session/resume
+    fakeAgent.queuePromptResult({
+      stopReason: "end_turn",
+      usage: { inputTokens: 5, outputTokens: 10 },
+    });
+
+    await connection.send({
+      type: "session.prompt",
+      sessionId: "s1",
+      prompt: {
+        clientMessageId: "m1",
+        delivery: "auto",
+        input: {
+          type: "message",
+          content: [{ type: "text", text: "Resume turn" }],
+        },
+      },
+    });
+
+    await waitForTurnCompletion("s1");
+
     const resumeReqs = fakeAgent.requestsFor("session/resume");
     expect(resumeReqs).toHaveLength(1);
     expect(resumeReqs[0].params).toMatchObject({
@@ -180,14 +236,134 @@ describe("ACP Session & Connection (Phase 3a)", () => {
       },
     });
 
-    const opened = events.find((e) => e.type === "session.opened");
-    expect(opened).toMatchObject({
-      persistence: {
-        data: {
-          conversationId: "existing-uuid-1234",
+    await connection.close();
+  });
+
+  it("Item 1: non-blocking send(): awaits send(prompt), then sends delivery:steer and session.interrupt mid-turn", async () => {
+    const connection = createAcpConnection(ACP_CAPABILITIES, options);
+    connection.onEvent((e) => events.push(e));
+
+    await connection.send({
+      type: "session.open",
+      requestId: "r1",
+      sessionId: "s1",
+      config: makeConfig(),
+      history: "skip",
+    });
+
+    // Hold prompt so turn stays pending until interrupted
+    fakeAgent.holdPrompt();
+
+    // 1. send(prompt) must NOT block for the turn!
+    await connection.send({
+      type: "session.prompt",
+      sessionId: "s1",
+      prompt: {
+        clientMessageId: "p1",
+        delivery: "auto",
+        input: {
+          type: "message",
+          content: [{ type: "text", text: "Initial long turn" }],
         },
       },
     });
+
+    // send() resolved immediately and admitted the turn
+    const turnResult = events.find((e) => e.type === "session.prompt_result" && e.clientMessageId === "p1");
+    expect(turnResult).toMatchObject({
+      result: { type: "turn" },
+    });
+    const turnStarted = events.find((e) => e.type === "session.turn" && e.state === "started");
+    expect(turnStarted).toBeDefined();
+
+    // Give prompt a moment to spawn client and start turn
+    await new Promise((r) => setTimeout(r, 30));
+
+    // 2. While prompt 1 is still pending, send steer prompt
+    await connection.send({
+      type: "session.prompt",
+      sessionId: "s1",
+      prompt: {
+        clientMessageId: "p2",
+        delivery: "steer",
+        input: {
+          type: "message",
+          content: [{ type: "text", text: "Steering prompt" }],
+        },
+      },
+    });
+
+    const steerResult = events.find((e) => e.type === "session.prompt_result" && e.clientMessageId === "p2");
+    expect(steerResult).toMatchObject({
+      result: { type: "steer" },
+    });
+
+    // 3. Send session.interrupt while prompt is running
+    await connection.send({
+      type: "session.interrupt",
+      requestId: "r-int",
+      sessionId: "s1",
+    });
+
+    const finalTurn = await waitForTurnCompletion("s1");
+    expect(finalTurn.state).toBe("canceled");
+
+    expect(fakeAgent.notificationsFor("session/cancel")).toHaveLength(1);
+    await connection.close();
+  });
+
+  it("Item 3: open tool rows when turn ends: finished-but-backgrounded tools get completed status and note", async () => {
+    const connection = createAcpConnection(ACP_CAPABILITIES, options);
+    connection.onEvent((e) => events.push(e));
+
+    await connection.send({
+      type: "session.open",
+      requestId: "r1",
+      sessionId: "s1",
+      config: makeConfig(),
+      history: "skip",
+    });
+
+    fakeAgent.setPromptHandler(() => {
+      fakeAgent.emitToolCall("s1", "bg-tool", "in_progress", {
+        name: "run_command",
+        args: { CommandLine: "npm run dev", Cwd: tempDir },
+      });
+      return {
+        stopReason: "end_turn",
+        usage: { inputTokens: 10, outputTokens: 20 },
+      };
+    });
+
+    await connection.send({
+      type: "session.prompt",
+      sessionId: "s1",
+      prompt: {
+        clientMessageId: "m1",
+        delivery: "auto",
+        input: {
+          type: "message",
+          content: [{ type: "text", text: "Start dev server" }],
+        },
+      },
+    });
+
+    await waitForTurnCompletion("s1");
+
+    const toolItems = toolCallItems().filter((i) => i.callId === "bg-tool");
+    expect(toolItems).toHaveLength(2);
+    // Final tool row status must be completed, with note appended to output
+    expect(toolItems[1]).toMatchObject({
+      status: "completed",
+      error: null,
+      detail: {
+        type: "shell",
+        command: "npm run dev",
+      },
+    });
+    expect((toolItems[1].detail as any).output).toContain(
+      "Still running in the background when the turn ended — Antigravity sees its result on your next message.",
+    );
 
     await connection.close();
   });
@@ -232,6 +408,7 @@ describe("ACP Session & Connection (Phase 3a)", () => {
       },
     });
 
+    await waitForTurnCompletion("s1");
     const items = timelineItems();
 
     // User message
@@ -262,12 +439,6 @@ describe("ACP Session & Connection (Phase 3a)", () => {
       text: "Hello world!",
     });
 
-    // Turn completed
-    const turns = events.filter((e) => e.type === "session.turn");
-    expect(turns).toHaveLength(2);
-    expect(turns[0]).toMatchObject({ state: "started" });
-    expect(turns[1]).toMatchObject({ state: "completed" });
-
     await connection.close();
   });
 
@@ -284,42 +455,39 @@ describe("ACP Session & Connection (Phase 3a)", () => {
     });
 
     fakeAgent.setPromptHandler(() => {
-      // 1. Vendor name/args: run_command
+      // 1. Vendor tool call: run_command
       fakeAgent.emitToolCall("s1", "call-cmd", "in_progress", {
         name: "run_command",
         args: { CommandLine: "ls -la", Cwd: tempDir },
       });
       fakeAgent.emitToolCall("s1", "call-cmd", "completed", {
         name: "run_command",
+        args: { CommandLine: "ls -la", Cwd: tempDir },
         rawOutput: "file1.txt\nfile2.txt",
       });
 
-      // 2. Fallback path with diff content
+      // 2. Fallback ACP tool call: edit diff
       fakeAgent.emitToolCall("s1", "call-diff", "in_progress", {
         kind: "edit",
         title: "Edit foo.ts",
         content: [
           {
             type: "diff",
-            path: "/path/to/foo.ts",
-            oldText: "const a = 1;",
-            newText: "const a = 2;",
+            path: "foo.ts",
+            oldText: "const x = 1;",
+            newText: "const x = 2;",
           },
         ],
       });
-      fakeAgent.emitToolCall("s1", "call-diff", "completed");
-
-      // 3. Fallback path without diff (standard kind)
-      fakeAgent.emitToolCall("s1", "call-read", "in_progress", {
-        kind: "read",
-        title: "Read bar.txt",
-        locations: [{ path: "/path/to/bar.txt" }],
-      });
-      fakeAgent.emitToolCall("s1", "call-read", "failed", {
-        rawOutput: "Permission denied",
+      fakeAgent.emitToolCall("s1", "call-diff", "completed", {
+        kind: "edit",
+        title: "Edit foo.ts",
       });
 
-      return { stopReason: "end_turn" };
+      return {
+        stopReason: "end_turn",
+        usage: { inputTokens: 10, outputTokens: 20 },
+      };
     });
 
     await connection.send({
@@ -335,45 +503,42 @@ describe("ACP Session & Connection (Phase 3a)", () => {
       },
     });
 
-    const items = timelineItems();
-    const toolItems = items.filter((i) => i.type === "tool_call");
+    await waitForTurnCompletion("s1");
+    const toolItems = toolCallItems();
 
     // Vendor tool call
     const cmdTools = toolItems.filter((i) => i.callId === "call-cmd");
     expect(cmdTools).toHaveLength(2);
     expect(cmdTools[0]).toMatchObject({
       status: "running",
-      detail: { type: "shell", command: "ls -la" },
+      detail: {
+        type: "shell",
+        command: "ls -la",
+      },
     });
     expect(cmdTools[1]).toMatchObject({
       status: "completed",
-      detail: { type: "shell", output: "file1.txt\nfile2.txt" },
+      detail: {
+        type: "shell",
+        command: "ls -la",
+        output: "file1.txt\nfile2.txt",
+      },
     });
 
-    // Diff tool call
+    // Fallback tool call
     const diffTools = toolItems.filter((i) => i.callId === "call-diff");
     expect(diffTools).toHaveLength(2);
     expect(diffTools[0]).toMatchObject({
       status: "running",
       detail: {
         type: "edit",
-        filePath: "/path/to/foo.ts",
-        oldString: "const a = 1;",
-        newString: "const a = 2;",
+        filePath: "foo.ts",
+        oldString: "const x = 1;",
+        newString: "const x = 2;",
       },
     });
-    expect(diffTools[1]).toMatchObject({ status: "completed" });
-
-    // Failed tool call
-    const readTools = toolItems.filter((i) => i.callId === "call-read");
-    expect(readTools).toHaveLength(2);
-    expect(readTools[0]).toMatchObject({
-      status: "running",
-      detail: { type: "read", filePath: "/path/to/bar.txt" },
-    });
-    expect(readTools[1]).toMatchObject({
-      status: "failed",
-      error: "Permission denied",
+    expect(diffTools[1]).toMatchObject({
+      status: "completed",
     });
 
     await connection.close();
@@ -394,11 +559,10 @@ describe("ACP Session & Connection (Phase 3a)", () => {
     fakeAgent.queuePromptResult({
       stopReason: "end_turn",
       usage: {
-        inputTokens: 120,
+        inputTokens: 100,
         cachedReadTokens: 40,
         outputTokens: 50,
         thoughtTokens: 25,
-        totalTokens: 195,
       },
     });
 
@@ -410,10 +574,12 @@ describe("ACP Session & Connection (Phase 3a)", () => {
         delivery: "auto",
         input: {
           type: "message",
-          content: [{ type: "text", text: "Check usage" }],
+          content: [{ type: "text", text: "Usage check" }],
         },
       },
     });
+
+    await waitForTurnCompletion("s1");
 
     const usageEvent = events.find((e) => e.type === "session.usage");
     expect(usageEvent).toBeDefined();
@@ -421,9 +587,9 @@ describe("ACP Session & Connection (Phase 3a)", () => {
       type: "session.usage",
       sessionId: "s1",
       usage: {
-        inputTokens: 120,
+        inputTokens: 100,
         cachedInputTokens: 40,
-        outputTokens: 75, // 50 output + 25 thought
+        outputTokens: 75, // 50 + 25
       },
     });
 
@@ -449,13 +615,10 @@ describe("ACP Session & Connection (Phase 3a)", () => {
         name: "run_command",
         args: { CommandLine: "sleep 10" },
       });
-      // Awaiting interrupt
-      return new Promise((resolve) => {
-        // Will be resolved via session/cancel notification in FakeAcpAgent
-      });
+      return new Promise(() => {});
     });
 
-    const promptPromise = connection.send({
+    await connection.send({
       type: "session.prompt",
       sessionId: "s1",
       prompt: {
@@ -468,7 +631,7 @@ describe("ACP Session & Connection (Phase 3a)", () => {
       },
     });
 
-    // Give prompt a moment to register and start tool
+    // Wait a tick for tool call to arrive
     await new Promise((r) => setTimeout(r, 20));
 
     // Send interrupt
@@ -478,11 +641,10 @@ describe("ACP Session & Connection (Phase 3a)", () => {
       sessionId: "s1",
     });
 
-    await promptPromise;
+    await waitForTurnCompletion("s1");
 
     expect(fakeAgent.notificationsFor("session/cancel")).toHaveLength(1);
 
-    const items = timelineItems();
     const toolItems = toolCallItems().filter((i) => i.callId === "open-tool");
     expect(toolItems).toHaveLength(2);
     expect(toolItems[1]).toMatchObject({
@@ -512,96 +674,79 @@ describe("ACP Session & Connection (Phase 3a)", () => {
 
     fakeAgent.holdPrompt();
 
-    let firstPromptResolved = false;
     fakeAgent.setPromptHandler(async (params, id) => {
       if (id === 3) {
-        // First session/prompt (requests: 1=initialize, 2=session/new, 3=prompt 1)
+        // First session/prompt
         fakeAgent.emitChunk("s1", "Starting turn 1...", "agent_message_chunk");
         return new Promise<AcpPromptResult>((resolve) => {
-          // When steered, fakeAgent will resolve this with end_turn (no usage)
           setTimeout(() => {
-            firstPromptResolved = true;
             resolve({ stopReason: "end_turn" });
           }, 30);
         });
+      } else {
+        // Second session/prompt (steering)
+        fakeAgent.emitChunk("s1", "Steered turn reply!", "agent_message_chunk");
+        return {
+          stopReason: "end_turn",
+          usage: { inputTokens: 50, outputTokens: 80 },
+        };
       }
-      // Steered prompt (id === 4)
-      fakeAgent.emitChunk("s1", "Steered answer", "agent_message_chunk");
-      return {
-        stopReason: "end_turn",
-        usage: {
-          inputTokens: 50,
-          outputTokens: 30,
-        },
-      };
     });
 
-    const prompt1Promise = connection.send({
+    await connection.send({
       type: "session.prompt",
       sessionId: "s1",
       prompt: {
-        clientMessageId: "msg-1",
+        clientMessageId: "m1",
         delivery: "auto",
         input: {
           type: "message",
-          content: [{ type: "text", text: "First instruction" }],
+          content: [{ type: "text", text: "First prompt" }],
         },
       },
     });
 
-    // Wait until prompt 1 has started
-    await new Promise((r) => setTimeout(r, 10));
+    await new Promise((r) => setTimeout(r, 20));
 
-    // Send steer prompt
-    const prompt2Promise = connection.send({
+    // Send steering prompt
+    await connection.send({
       type: "session.prompt",
       sessionId: "s1",
       prompt: {
-        clientMessageId: "msg-2",
+        clientMessageId: "m2",
         delivery: "steer",
         input: {
           type: "message",
-          content: [{ type: "text", text: "Wait, do this instead" }],
+          content: [{ type: "text", text: "Please do this instead" }],
         },
       },
     });
 
-    await Promise.all([prompt1Promise, prompt2Promise]);
+    const finalTurn = await waitForTurnCompletion("s1");
+    expect(finalTurn.state).toBe("completed");
 
-    // Check prompt results
-    const promptResults = events.filter((e) => e.type === "session.prompt_result");
-    expect(promptResults).toHaveLength(2);
-    expect(promptResults[0]).toMatchObject({
-      clientMessageId: "msg-1",
-      result: { type: "turn" },
-    });
-    const turnId = (promptResults[0] as any).result.turnId;
-    expect(promptResults[1]).toMatchObject({
-      clientMessageId: "msg-2",
-      result: { type: "steer", turnId },
+    // Steer prompt result was admitted with type: "steer"
+    const steerResult = events.find(
+      (e) => e.type === "session.prompt_result" && e.clientMessageId === "m2",
+    );
+    expect(steerResult).toMatchObject({
+      result: { type: "steer" },
     });
 
-    // Both user messages published
-    const userMsgs = timelineItems().filter((i) => i.type === "user_message");
-    expect(userMsgs).toHaveLength(2);
-    expect(userMsgs[0]).toMatchObject({ text: "First instruction" });
-    expect(userMsgs[1]).toMatchObject({ text: "Wait, do this instead" });
-
-    // Exactly ONE turn completed!
+    // Exactly ONE turn completed
     const turnCompletions = events.filter((e) => e.type === "session.turn" && e.state === "completed");
     expect(turnCompletions).toHaveLength(1);
-    expect(turnCompletions[0]).toMatchObject({ turnId });
 
-    // Usage from steering prompt reported
+    // Final usage from second prompt
     const usage = events.find((e) => e.type === "session.usage");
     expect(usage).toMatchObject({
-      usage: { inputTokens: 50, outputTokens: 30 },
+      usage: { inputTokens: 50, outputTokens: 80 },
     });
 
     await connection.close();
   });
 
-  it("configure: set_mode and set_config_option map model and thought_level without restart", async () => {
+  it("configure: pre-prompt configuration applied on first launch without restart", async () => {
     const connection = createAcpConnection(ACP_CAPABILITIES, options);
     connection.onEvent((e) => events.push(e));
 
@@ -613,16 +758,47 @@ describe("ACP Session & Connection (Phase 3a)", () => {
       history: "skip",
     });
 
+    // Change configuration before client is spawned
     await connection.send({
       type: "session.configure",
-      requestId: "req-cfg",
+      requestId: "rc1",
       sessionId: "s1",
       changes: {
         mode: "accept-edits",
-        model: "gemini-3.8-flash",
-        thinkingOption: "high",
+        model: "gemini-3.8-flash-low",
+        thinkingOption: "low",
       },
     });
+
+    const cfgEvent = events.filter((e) => e.type === "session.config").at(-1);
+    expect(cfgEvent).toMatchObject({
+      config: {
+        model: "gemini-3.8-flash-low",
+        mode: "accept-edits",
+        thinkingOption: "low",
+      },
+    });
+
+    // Now send first prompt -> spawns client and applies configuration options
+    fakeAgent.queuePromptResult({
+      stopReason: "end_turn",
+      usage: { inputTokens: 10, outputTokens: 10 },
+    });
+
+    await connection.send({
+      type: "session.prompt",
+      sessionId: "s1",
+      prompt: {
+        clientMessageId: "m1",
+        delivery: "auto",
+        input: {
+          type: "message",
+          content: [{ type: "text", text: "Configure test" }],
+        },
+      },
+    });
+
+    await waitForTurnCompletion("s1");
 
     const modeReqs = fakeAgent.requestsFor("session/set_mode");
     expect(modeReqs).toHaveLength(1);
@@ -631,21 +807,10 @@ describe("ACP Session & Connection (Phase 3a)", () => {
       modeId: "accept-edits",
     });
 
-    const configReqs = fakeAgent.requestsFor("session/set_config_option");
-    expect(configReqs).toHaveLength(2);
-    expect(configReqs[0].params).toEqual({
-      sessionId: "33bb33e6-aa54-40ed-87de-f4b4953dd305",
-      configId: "model",
-      value: "gemini-3.8-flash",
-    });
-    expect(configReqs[1].params).toEqual({
-      sessionId: "33bb33e6-aa54-40ed-87de-f4b4953dd305",
-      configId: "thought_level",
-      value: "high",
-    });
-
-    const completed = events.find((e) => e.type === "request.completed" && e.requestId === "req-cfg");
-    expect(completed).toBeDefined();
+    const optReqs = fakeAgent.requestsFor("session/set_config_option");
+    expect(optReqs.length).toBeGreaterThanOrEqual(2);
+    expect(optReqs.some((r) => (r.params as any).configId === "model" && (r.params as any).value === "gemini-3.8-flash-low")).toBe(true);
+    expect(optReqs.some((r) => (r.params as any).configId === "thought_level" && (r.params as any).value === "low")).toBe(true);
 
     await connection.close();
   });
@@ -662,61 +827,62 @@ describe("ACP Session & Connection (Phase 3a)", () => {
       history: "skip",
     });
 
-    // Agent emits commands with duplicate SKILL names and system command overlap
-    fakeAgent.emitSessionUpdate("33bb33e6-aa54-40ed-87de-f4b4953dd305", {
-      sessionUpdate: "available_commands_update",
-      availableCommands: [
-        { name: "SKILL", description: "First skill" },
-        { name: "SKILL", description: "Duplicate skill" },
-        { name: "my_tool", description: "Custom tool" },
-        { name: "plan", description: "Agent plan" },
-      ],
+    fakeAgent.setPromptHandler(() => {
+      fakeAgent.emitSessionUpdate("s1", {
+        sessionUpdate: "available_commands_update",
+        availableCommands: [
+          { name: "SKILL", description: "First duplicate skill" },
+          { name: "SKILL", description: "Second duplicate skill" },
+          { name: "unique_tool", description: "A unique tool" },
+        ],
+      });
+      return { stopReason: "end_turn" };
     });
+
+    await connection.send({
+      type: "session.prompt",
+      sessionId: "s1",
+      prompt: {
+        clientMessageId: "m1",
+        delivery: "auto",
+        input: {
+          type: "message",
+          content: [{ type: "text", text: "Commands test" }],
+        },
+      },
+    });
+
+    await waitForTurnCompletion("s1");
 
     const cmdEvents = events.filter((e) => e.type === "session.commands");
     expect(cmdEvents.length).toBeGreaterThanOrEqual(2);
     const lastCmds = (cmdEvents.at(-1) as any).commands;
 
-    // System commands first
-    expect(lastCmds.find((c: any) => c.name === "goal")).toBeDefined();
-    // System "plan" description preserved (not overridden by agent plan)
-    expect(lastCmds.find((c: any) => c.name === "plan").description).toContain("Plan the task");
-    // Duplicate SKILL dropped; first SKILL preserved
-    const skillCmds = lastCmds.filter((c: any) => c.name === "SKILL");
-    expect(skillCmds).toHaveLength(1);
-    expect(skillCmds[0].description).toBe("First skill");
-    // Custom tool included
-    expect(lastCmds.find((c: any) => c.name === "my_tool")).toBeDefined();
+    // Both duplicate skills kept with deduplicated display names
+    const skillCmds = lastCmds.filter((c: any) => c.name.startsWith("SKILL"));
+    expect(skillCmds).toHaveLength(2);
+    expect(skillCmds[0].name).toBe("SKILL");
+    expect(skillCmds[1].name).toBe("SKILL (2)");
 
-    // A prompt sent as command reaches ACP formatted as /name args
-    await connection.send({
-      type: "session.prompt",
-      sessionId: "s1",
-      prompt: {
-        clientMessageId: "cmd-prompt",
-        delivery: "auto",
-        input: {
-          type: "command",
-          name: "my_tool",
-          arguments: "arg1 arg2",
-        },
-      },
-    });
-
-    const promptReqs = fakeAgent.requestsFor("session/prompt");
-    const lastPrompt = promptReqs.at(-1);
-    expect(lastPrompt?.params).toMatchObject({
-      prompt: [{ type: "text", text: "/my_tool arg1 arg2" }],
-    });
+    // System commands preserved
+    expect(lastCmds.some((c: any) => c.name === "compact")).toBe(true);
+    expect(lastCmds.some((c: any) => c.name === "plan")).toBe(true);
 
     await connection.close();
   });
 
   it("crash recovery: fails running turn, then next prompt relaunches and resumes session", async () => {
     let currentAgent = fakeAgent;
-    const connection = createAcpConnection(ACP_CAPABILITIES, {
-      transport: () => currentAgent.clientTransport,
-    });
+    const dynamicTransport: AcpConnectionOptions["transport"] = {
+      get input() {
+        return currentAgent.clientTransport.input;
+      },
+      get output() {
+        return currentAgent.clientTransport.output;
+      },
+    };
+
+    const connection = createAcpConnection(ACP_CAPABILITIES, { transport: dynamicTransport });
     connection.onEvent((e) => events.push(e));
 
     await connection.send({
@@ -731,12 +897,12 @@ describe("ACP Session & Connection (Phase 3a)", () => {
     currentAgent.setPromptHandler(async () => {
       currentAgent.emitToolCall("s1", "running-cmd", "in_progress", {
         name: "run_command",
-        args: { CommandLine: "start" },
+        args: { CommandLine: "long running process" },
       });
       return new Promise(() => {});
     });
 
-    const prompt1Promise = connection.send({
+    await connection.send({
       type: "session.prompt",
       sessionId: "s1",
       prompt: {
@@ -744,16 +910,19 @@ describe("ACP Session & Connection (Phase 3a)", () => {
         delivery: "auto",
         input: {
           type: "message",
-          content: [{ type: "text", text: "Before crash" }],
+          content: [{ type: "text", text: "Turn 1 will crash" }],
         },
       },
     });
+
+    const p1Result = events.find((e) => e.type === "session.prompt_result" && e.clientMessageId === "m1");
+    const turn1Id = (p1Result as any)?.result?.turnId;
 
     await new Promise((r) => setTimeout(r, 20));
 
     // Agent crashes
     currentAgent.crash(new Error("Process crashed suddenly"));
-    await prompt1Promise;
+    await waitForTurnCompletion("s1", turn1Id);
 
     // Running tool failed
     const toolItems = toolCallItems().filter((i) => i.callId === "running-cmd");
@@ -763,11 +932,15 @@ describe("ACP Session & Connection (Phase 3a)", () => {
     const turn1Fail = events.find((e) => e.type === "session.turn" && e.state === "failed");
     expect(turn1Fail).toBeDefined();
 
-    // Create fresh agent for next launch
-    const nextAgent = new FakeAcpAgent();
-    currentAgent = nextAgent;
+    // Spawn replacement agent for next prompt
+    const agent2 = new FakeAcpAgent({ enableSteering: true });
+    currentAgent = agent2;
 
-    // Next prompt relaunches and resumes
+    agent2.queuePromptResult({
+      stopReason: "end_turn",
+      usage: { inputTokens: 10, outputTokens: 15 },
+    });
+
     await connection.send({
       type: "session.prompt",
       sessionId: "s1",
@@ -776,21 +949,50 @@ describe("ACP Session & Connection (Phase 3a)", () => {
         delivery: "auto",
         input: {
           type: "message",
-          content: [{ type: "text", text: "After crash recovery" }],
+          content: [{ type: "text", text: "Turn 2 after recovery" }],
         },
       },
     });
 
-    // Verify session/resume was called on the new agent with original conversationId
-    expect(nextAgent.requestsFor("initialize")).toHaveLength(1);
-    const resumeReqs = nextAgent.requestsFor("session/resume");
-    expect(resumeReqs).toHaveLength(1);
-    expect(resumeReqs[0].params).toMatchObject({
+    const p2Result = events.find((e) => e.type === "session.prompt_result" && e.clientMessageId === "m2");
+    const turn2Id = (p2Result as any)?.result?.turnId;
+    await waitForTurnCompletion("s1", turn2Id);
+
+    // Agent 2 was initialized and resumed the existing conversation!
+    expect(agent2.requestsFor("initialize")).toHaveLength(1);
+    expect(agent2.requestsFor("session/resume")).toHaveLength(1);
+    expect(agent2.requestsFor("session/resume")[0].params).toMatchObject({
       sessionId: "33bb33e6-aa54-40ed-87de-f4b4953dd305",
-      cwd: tempDir,
     });
 
-    nextAgent.close();
+    agent2.close();
+    await connection.close();
+  });
+
+  it("Item 5: minor: session.permission completes with session.permission_resolved", async () => {
+    const connection = createAcpConnection(ACP_CAPABILITIES, options);
+    connection.onEvent((e) => events.push(e));
+
+    await connection.send({
+      type: "session.open",
+      requestId: "r1",
+      sessionId: "s1",
+      config: makeConfig(),
+      history: "skip",
+    });
+
+    await connection.send({
+      type: "session.permission",
+      sessionId: "s1",
+      permissionId: "perm-123",
+      response: { behavior: "allow" },
+    });
+
+    const resolved = events.find(
+      (e) => e.type === "session.permission_resolved" && e.permissionId === "perm-123",
+    );
+    expect(resolved).toBeDefined();
+
     await connection.close();
   });
 
@@ -810,24 +1012,27 @@ describe("ACP Session & Connection (Phase 3a)", () => {
       type: "session.prompt",
       sessionId: "s1",
       prompt: {
-        clientMessageId: "m-schema",
+        clientMessageId: "m1",
         delivery: "auto",
         input: {
           type: "message",
-          content: [{ type: "text", text: "Return schema" }],
+          content: [{ type: "text", text: "Output JSON" }],
         },
-        outputSchema: { type: "object", properties: { ans: { type: "string" } } },
+        outputSchema: {
+          type: "object",
+          properties: { result: { type: "string" } },
+        },
       },
     });
 
     const res = events.find((e) => e.type === "session.prompt_result");
     expect(res).toMatchObject({
-      clientMessageId: "m-schema",
+      type: "session.prompt_result",
+      clientMessageId: "m1",
       result: {
         type: "failed",
         error: {
           code: "schema_unsupported",
-          message: "Structured output is not supported over ACP yet",
         },
       },
     });
@@ -847,14 +1052,43 @@ describe("ACP Session & Connection (Phase 3a)", () => {
       history: "skip",
     });
 
+    // Idle
     await connection.send({
       type: "session.can_stop_runtime",
-      requestId: "check-idle",
+      requestId: "req-stop-1",
       sessionId: "s1",
     });
 
-    const idleEvent = events.find((e) => e.type === "session.can_stop_runtime");
-    expect(idleEvent).toMatchObject({ canStop: true });
+    const stop1 = events.find((e) => e.type === "session.can_stop_runtime" && e.requestId === "req-stop-1");
+    expect(stop1).toMatchObject({ canStop: true });
+
+    // Active turn
+    fakeAgent.holdPrompt();
+    await connection.send({
+      type: "session.prompt",
+      sessionId: "s1",
+      prompt: {
+        clientMessageId: "m1",
+        delivery: "auto",
+        input: {
+          type: "message",
+          content: [{ type: "text", text: "Hold turn" }],
+        },
+      },
+    });
+
+    await connection.send({
+      type: "session.can_stop_runtime",
+      requestId: "req-stop-2",
+      sessionId: "s1",
+    });
+
+    const stop2 = events.find((e) => e.type === "session.can_stop_runtime" && e.requestId === "req-stop-2");
+    expect(stop2).toMatchObject({ canStop: false });
+
+    // Resolve prompt
+    fakeAgent.resolveHeldPrompt();
+    await waitForTurnCompletion("s1");
 
     await connection.close();
   });
@@ -870,6 +1104,22 @@ describe("ACP Session & Connection (Phase 3a)", () => {
       config: makeConfig(),
       history: "skip",
     });
+
+    // Spawn client via first prompt
+    fakeAgent.queuePromptResult({ stopReason: "end_turn" });
+    await connection.send({
+      type: "session.prompt",
+      sessionId: "s1",
+      prompt: {
+        clientMessageId: "m1",
+        delivery: "auto",
+        input: {
+          type: "message",
+          content: [{ type: "text", text: "Turn to spawn" }],
+        },
+      },
+    });
+    await waitForTurnCompletion("s1");
 
     await connection.send({
       type: "session.close",

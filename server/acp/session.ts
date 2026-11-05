@@ -186,11 +186,19 @@ export function mergeAvailableCommands(
   }
   for (const cmd of availableCommands) {
     if (!cmd.name) continue;
-    const name = cmd.name.trim();
-    if (!COMMAND_NAME.test(name)) continue;
-    if (map.has(name) || map.size >= MAX_COMMANDS) continue;
-    map.set(name, {
-      name,
+    const baseName = cmd.name.trim();
+    if (!baseName) continue;
+
+    let candidateName = baseName;
+    let counter = 2;
+    while (map.has(candidateName)) {
+      candidateName = `${baseName} (${counter})`;
+      counter += 1;
+    }
+
+    if (map.size >= MAX_COMMANDS) break;
+    map.set(candidateName, {
+      name: candidateName,
       description: cmd.description?.trim() ?? "",
     });
   }
@@ -282,6 +290,7 @@ export class AcpSession implements ConfigStateSession {
   title?: string;
   transcript: TranscriptStore | null = null;
   client: AgyAcpClient | null = null;
+  launchPromise: Promise<AgyAcpClient> | null = null;
   activeTurn: AcpActiveTurn | null = null;
   turnCounter = 0;
   interrupting = false;
@@ -551,118 +560,130 @@ function handleProcessExitOrCrash(session: AcpSession, error: Error, emit: Emit)
 }
 
 async function ensureClient(session: AcpSession, emit: Emit): Promise<AgyAcpClient> {
-  if (session.client && session.client.running) {
+  if (session.client?.running && session.client.sessionId) {
     return session.client;
   }
+  if (session.launchPromise) {
+    return session.launchPromise;
+  }
 
-  const options = readProviderOptions(session.config);
-  const binary = options.agyPath ?? resolveAgyBinary();
-  const home = accountHome(session.accountId);
-  if (home !== null) syncShadowHome(session.accountId);
+  const launch = (async () => {
+    try {
+      const options = readProviderOptions(session.config);
+      const binary = options.agyPath ?? resolveAgyBinary();
+      const home = accountHome(session.accountId);
+      if (home !== null) syncShadowHome(session.accountId);
 
-  const env = home === null ? session.config.env : { ...session.config.env, HOME: home };
-  const perm = readToolPermission(accountGeminiRoot(session.accountId));
-  const skipPermissions =
-    approvalPolicy(session) === "skip" || perm === "always-proceed";
+      const env = home === null ? session.config.env : { ...session.config.env, HOME: home };
+      const perm = readToolPermission(accountGeminiRoot(session.accountId));
+      const skipPermissions =
+        approvalPolicy(session) === "skip" || perm === "always-proceed";
 
-  const rawTransport =
-    session.injectedTransport ??
-    (session.config.providerOptions as Record<string, unknown> | undefined)?.transport ??
-    (session.config.providerOptions as Record<string, unknown> | undefined)?.acpTransport;
-  const transport =
-    typeof rawTransport === "function" ? (rawTransport as () => AgyAcpClientTransport)() : (rawTransport as AgyAcpClientTransport | undefined);
+      const rawTransport =
+        session.injectedTransport ??
+        (session.config.providerOptions as Record<string, unknown> | undefined)?.transport ??
+        (session.config.providerOptions as Record<string, unknown> | undefined)?.acpTransport;
+      const transport =
+        typeof rawTransport === "function" ? (rawTransport as () => AgyAcpClientTransport)() : (rawTransport as AgyAcpClientTransport | undefined);
 
-  const client = new AgyAcpClient(
-    {
-      cwd: session.config.cwd,
-      binary,
-      env,
-      skipPermissions,
-      extraArgs: options.extraArgs,
-    },
-    {
-      transport,
-      onRequestPermission: async () => {
-        // TODO(acp-3b): Permission cards
-        return { outcome: { outcome: "cancelled" } };
-      },
-      onElicitation: async () => {
-        // TODO(acp-3b): Question cards
-        return { action: "cancel" };
-      },
-    },
-  );
-
-  session.client = client;
-
-  client.on("sessionUpdate", (notif) => {
-    handleSessionUpdate(session, notif.update, emit);
-  });
-
-  client.on("crash", (error) => {
-    handleProcessExitOrCrash(session, error, emit);
-  });
-
-  client.on("exit", (info) => {
-    if (info.code !== 0 && info.code !== null) {
-      handleProcessExitOrCrash(
-        session,
-        new Error(`agy acp exited with code ${info.code}${info.signal ? ` (signal ${info.signal})` : ""}`),
-        emit,
+      const client = new AgyAcpClient(
+        {
+          cwd: session.config.cwd,
+          binary,
+          env,
+          skipPermissions,
+          extraArgs: options.extraArgs,
+        },
+        {
+          transport,
+          onRequestPermission: async () => {
+            // TODO(acp-3b): Permission cards
+            return { outcome: { outcome: "cancelled" } };
+          },
+          onElicitation: async () => {
+            // TODO(acp-3b): Question cards
+            return { action: "cancel" };
+          },
+        },
       );
-    }
-  });
 
-  await client.initialize();
+      session.client = client;
 
-  if (session.conversationId) {
-    await client.resumeSession({
-      sessionId: session.conversationId,
-      cwd: session.config.cwd,
-      mcpServers: [], // TODO(acp-3c): Native MCP sharing via mcpServers
-      systemPromptAppend: session.config.systemPrompt,
-    });
-  } else {
-    const res = await client.newSession({
-      cwd: session.config.cwd,
-      mcpServers: [], // TODO(acp-3c): Native MCP sharing via mcpServers
-      systemPromptAppend: session.config.systemPrompt,
-    });
-    session.conversationId = res.sessionId;
-    if (session.persist) {
-      session.transcript = new TranscriptStore(session.conversationId);
-    }
-    emit({
-      type: "session.persistence",
-      sessionId: session.sessionId,
-      persistence: persistenceFor(session.conversationId, session.accountId),
-    });
-  }
+      client.on("sessionUpdate", (notif) => {
+        handleSessionUpdate(session, notif.update, emit);
+      });
 
-  // Set initial mode / model / thinking options if specified
-  if (session.selection.mode && session.selection.mode !== "default") {
-    try {
-      await client.setMode(session.selection.mode);
-    } catch {
-      // Best-effort at session startup
-    }
-  }
-  if (session.selection.model) {
-    try {
-      await client.setConfigOption("model", session.selection.model);
-    } catch {
-      // Best-effort at session startup
-    }
-  }
-  if (session.selection.thinkingOption) {
-    try {
-      await client.setConfigOption("thought_level", session.selection.thinkingOption);
-    } catch {
-      // Best-effort at session startup
-    }
-  }
+      client.on("crash", (error) => {
+        handleProcessExitOrCrash(session, error, emit);
+      });
 
-  return client;
+      client.on("exit", (info) => {
+        if (info.code !== 0 && info.code !== null) {
+          handleProcessExitOrCrash(
+            session,
+            new Error(`agy acp exited with code ${info.code}${info.signal ? ` (signal ${info.signal})` : ""}`),
+            emit,
+          );
+        }
+      });
+
+      await client.initialize();
+
+      if (session.conversationId) {
+        await client.resumeSession({
+          sessionId: session.conversationId,
+          cwd: session.config.cwd,
+          mcpServers: [], // TODO(acp-3c): Native MCP sharing via mcpServers
+          systemPromptAppend: session.config.systemPrompt,
+        });
+      } else {
+        const res = await client.newSession({
+          cwd: session.config.cwd,
+          mcpServers: [], // TODO(acp-3c): Native MCP sharing via mcpServers
+          systemPromptAppend: session.config.systemPrompt,
+        });
+        session.conversationId = res.sessionId;
+        if (session.persist) {
+          session.transcript = new TranscriptStore(session.conversationId);
+        }
+        emit({
+          type: "session.persistence",
+          sessionId: session.sessionId,
+          persistence: persistenceFor(session.conversationId, session.accountId),
+        });
+      }
+
+      // Set initial mode / model / thinking options if specified in session.selection
+      if (session.selection.mode && session.selection.mode !== "default") {
+        try {
+          await client.setMode(session.selection.mode);
+        } catch {
+          // Best-effort at session startup
+        }
+      }
+      if (session.selection.model) {
+        try {
+          await client.setConfigOption("model", session.selection.model);
+        } catch {
+          // Best-effort at session startup
+        }
+      }
+      if (session.selection.thinkingOption) {
+        try {
+          await client.setConfigOption("thought_level", session.selection.thinkingOption);
+        } catch {
+          // Best-effort at session startup
+        }
+      }
+
+      return client;
+    } finally {
+      session.launchPromise = null;
+    }
+  })();
+
+  session.launchPromise = launch;
+  return launch;
 }
 
 async function runTurnPrompt(
@@ -709,9 +730,24 @@ async function runTurnPrompt(
         state: "canceled",
       });
     } else {
+      const BACKGROUND_NOTE =
+        "Still running in the background when the turn ended — Antigravity sees its result on your next message.";
+
       for (const tool of turn.openTools.values()) {
+        const detail = { ...tool.detail };
+        if (detail.type === "shell") {
+          detail.output = detail.output
+            ? `${detail.output}\n\n[${BACKGROUND_NOTE}]`
+            : BACKGROUND_NOTE;
+        } else if (detail.type === "plain_text") {
+          detail.text = detail.text
+            ? `${detail.text}\n\n[${BACKGROUND_NOTE}]`
+            : BACKGROUND_NOTE;
+        }
+
         publish(session, emit, {
           ...tool,
+          detail,
           status: "completed",
           error: null,
         });
@@ -803,7 +839,6 @@ async function promptSession(
       turn.currentThoughtId = `agy:thought:${turn.turnId}:${turn.thoughtIndex}`;
       turn.currentThoughtText = "";
 
-      const client = await ensureClient(session, emit);
       const {
         promise: steeringPromptPromise,
         resolve: resolveSteer,
@@ -811,10 +846,20 @@ async function promptSession(
       } = Promise.withResolvers<AcpPromptResult>();
       turn.activePromptPromise = steeringPromptPromise;
 
-      const actualPromptPromise = client.prompt(content);
-      actualPromptPromise.then(resolveSteer, rejectSteer);
-
-      await runTurnPrompt(session, turn, steeringPromptPromise, emit);
+      void (async () => {
+        try {
+          const client = await ensureClient(session, emit);
+          const actualPromptPromise = client.prompt(content);
+          actualPromptPromise.then(resolveSteer, rejectSteer);
+          await runTurnPrompt(session, turn, steeringPromptPromise, emit);
+        } catch (err) {
+          handleProcessExitOrCrash(
+            session,
+            err instanceof Error ? err : new Error(String(err)),
+            emit,
+          );
+        }
+      })();
       return;
     }
 
@@ -861,24 +906,6 @@ async function promptSession(
     state: "started",
   });
 
-  let client: AgyAcpClient;
-  try {
-    client = await ensureClient(session, emit);
-  } catch (err) {
-    const errorMsg = err instanceof Error ? err.message : String(err);
-    emit({
-      type: "session.turn",
-      sessionId: session.sessionId,
-      turnId,
-      state: "failed",
-      error: {
-        message: `Failed to launch Antigravity ACP client: ${errorMsg}`,
-        code: "agy_launch_failed",
-      },
-    });
-    return;
-  }
-
   const {
     promise: promptPromise,
     resolve: resolvePrompt,
@@ -899,10 +926,38 @@ async function promptSession(
   };
   session.activeTurn = activeTurn;
 
-  const actualPromptPromise = client.prompt(content);
-  actualPromptPromise.then(resolvePrompt, rejectPrompt);
+  void (async () => {
+    let client: AgyAcpClient;
+    try {
+      client = await ensureClient(session, emit);
+    } catch (err) {
+      const errorMsg = err instanceof Error ? err.message : String(err);
+      session.activeTurn = null;
+      emit({
+        type: "session.turn",
+        sessionId: session.sessionId,
+        turnId,
+        state: "failed",
+        error: {
+          message: `Failed to launch Antigravity ACP client: ${errorMsg}`,
+          code: "agy_launch_failed",
+        },
+      });
+      return;
+    }
 
-  await runTurnPrompt(session, activeTurn, promptPromise, emit);
+    try {
+      const actualPromptPromise = client.prompt(content);
+      actualPromptPromise.then(resolvePrompt, rejectPrompt);
+      await runTurnPrompt(session, activeTurn, promptPromise, emit);
+    } catch (err) {
+      handleProcessExitOrCrash(
+        session,
+        err instanceof Error ? err : new Error(String(err)),
+        emit,
+      );
+    }
+  })();
 }
 
 async function configureSession(
@@ -973,8 +1028,6 @@ async function openSession(
   if (session.persist && conversationId !== null) {
     session.transcript = await TranscriptStore.load(conversationId);
   }
-
-  await ensureClient(session, emit);
 
   emit({
     type: "session.opened",
@@ -1102,7 +1155,11 @@ async function dispatch(
     }
     case "session.permission": {
       // TODO(acp-3b): Permission cards
-      emit({ type: "request.completed", requestId: (input as { requestId?: string }).requestId ?? "" });
+      emit({
+        type: "session.permission_resolved",
+        sessionId: input.sessionId,
+        permissionId: input.permissionId,
+      });
       return;
     }
     case "session.close": {
