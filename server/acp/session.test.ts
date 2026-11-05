@@ -1,7 +1,8 @@
-import { mkdtempSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { pathToFileURL } from "node:url";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type {
   ProviderCapability,
   ProviderEvent,
@@ -11,6 +12,8 @@ import type {
   ProviderTimelineItem,
 } from "@getpaseo/plugin/server/provider";
 import { FakeAcpAgent } from "../testing/fake-acp-agent";
+import { accountGeminiRoot, addAccount, removeAccount } from "../accounts";
+import { conversationTranscriptPath } from "../backfill";
 import {
   createProvider,
   createRouterConnection,
@@ -18,9 +21,18 @@ import {
   ACP_CAPABILITIES,
   CAPABILITIES,
   IMPLEMENT_PLAN_TEXT,
+  childSessionId,
+  childTurnId,
 } from "../provider";
 import type { AcpPromptResult } from "./schema";
-import { createAcpConnection, type AcpConnectionOptions } from "./session";
+import {
+  createAcpConnection,
+  type AcpConnectionOptions,
+  type OneShotArgs,
+  type OneShotResult,
+  type OneShotRunner,
+  toAcpMcpServers,
+} from "./session";
 
 describe("ACP Session & Connection (Phase 3a)", () => {
   let tempDir: string;
@@ -2399,5 +2411,1161 @@ describe("ACP Cards & Interactive Flows (Phase 3b)", () => {
     expect((promptReqs.at(-1)?.params as any).prompt[0].text).toBe(IMPLEMENT_PLAN_TEXT);
 
     await connection.close();
+  });
+});
+
+describe("ACP Parity & Advanced Flows (Phase 3c)", () => {
+  let tempDir: string;
+  let fakeAgent: FakeAcpAgent;
+  let events: ProviderEvent[];
+  let options: AcpConnectionOptions;
+
+  beforeEach(() => {
+    tempDir = mkdtempSync(join(tmpdir(), "acp-3c-test-"));
+    fakeAgent = new FakeAcpAgent({ enableSteering: true });
+    events = [];
+    options = {
+      transport: fakeAgent.clientTransport,
+    };
+  });
+
+  afterEach(() => {
+    fakeAgent.close();
+    try {
+      rmSync(tempDir, { recursive: true, force: true });
+    } catch {
+      // Best effort cleanup
+    }
+  });
+
+  function makeConfig(overrides: Partial<ProviderSessionConfig> = {}): ProviderSessionConfig {
+    return {
+      cwd: tempDir,
+      env: {},
+      mcpServers: {},
+      settings: {},
+      persist: true,
+      ...overrides,
+    };
+  }
+
+  function timelineItems(): ProviderTimelineItem[] {
+    return events
+      .filter((e): e is Extract<ProviderEvent, { type: "timeline.item" }> => e.type === "timeline.item")
+      .map((e) => e.item);
+  }
+
+  function toolCallItems(): Extract<ProviderTimelineItem, { type: "tool_call" }>[] {
+    return timelineItems().filter(
+      (i): i is Extract<ProviderTimelineItem, { type: "tool_call" }> => i.type === "tool_call",
+    );
+  }
+
+  async function waitFor<T>(predicate: () => T | undefined, label: string, timeoutMs = 3000): Promise<T> {
+    const start = Date.now();
+    while (Date.now() - start < timeoutMs) {
+      const val = predicate();
+      if (val !== undefined) return val;
+      await new Promise((r) => setTimeout(r, 10));
+    }
+    throw new Error(`Timed out waiting for ${label}`);
+  }
+
+  async function waitForTurnCompletion(
+    sessionId = "s1",
+    turnId?: string,
+    timeoutMs = 3000,
+  ): Promise<Extract<ProviderEvent, { type: "session.turn" }>> {
+    const start = Date.now();
+    while (Date.now() - start < timeoutMs) {
+      const turns = events.filter(
+        (e): e is Extract<ProviderEvent, { type: "session.turn" }> =>
+          e.type === "session.turn" &&
+          e.sessionId === sessionId &&
+          (e.state === "completed" || e.state === "failed" || e.state === "canceled"),
+      );
+      if (turnId) {
+        const match = turns.find((t) => t.turnId === turnId);
+        if (match) return match;
+      } else if (turns.length > 0) {
+        return turns[turns.length - 1];
+      }
+      await new Promise((r) => setTimeout(r, 10));
+    }
+    throw new Error(`Timed out waiting for turn completion in session ${sessionId}`);
+  }
+
+  describe("Subagents", () => {
+    it("discovers child from fixture parent transcript, opens child session, emits rows, and completes parent tool row", async () => {
+      const parentConvo = "11111111-2222-3333-4444-555555555555";
+      const childConvo = "aaaaaaaa-0000-4000-8000-000000000000";
+      const childLogUri = pathToFileURL(join(tempDir, "child-transcript.jsonl")).href;
+
+      const parentTranscript = [
+        JSON.stringify({
+          step_index: 0,
+          source: "USER_EXPLICIT",
+          type: "USER_INPUT",
+          status: "DONE",
+          content: "<USER_REQUEST>\nExplore codebase\n</USER_REQUEST>",
+        }),
+        JSON.stringify({
+          step_index: 1,
+          source: "MODEL",
+          type: "PLANNER_RESPONSE",
+          status: "DONE",
+          content: `Created the following subagents:\n${JSON.stringify({
+            conversationId: childConvo,
+            logAbsoluteUri: childLogUri,
+          })}`,
+          tool_calls: [
+            {
+              tool_name: "invoke_subagent",
+              tool_args: {
+                Model: "inherit",
+                Prompt: "Inspect package.json",
+                Role: "Codebase Researcher",
+                TypeName: "research",
+              },
+            },
+          ],
+        }),
+        "",
+      ].join("\n");
+
+      const childTranscript = [
+        JSON.stringify({
+          step_index: 0,
+          source: "USER_EXPLICIT",
+          type: "USER_INPUT",
+          status: "DONE",
+          content: "<USER_REQUEST>\nInspect package.json\n</USER_REQUEST>",
+        }),
+        JSON.stringify({
+          step_index: 1,
+          source: "MODEL",
+          type: "PLANNER_RESPONSE",
+          status: "DONE",
+          content: "Found 12 dependencies in package.json.",
+          tool_calls: [],
+        }),
+        "",
+      ].join("\n");
+
+      const virtualFiles = new Map<string, string>();
+      const parentPath = conversationTranscriptPath(accountGeminiRoot("default"), parentConvo);
+      const childPath = join(tempDir, "child-transcript.jsonl");
+      virtualFiles.set(parentPath, parentTranscript);
+      virtualFiles.set(childPath, childTranscript);
+
+      const customOptions: AcpConnectionOptions = {
+        transport: fakeAgent.clientTransport,
+        readTranscriptFile: async (p) => virtualFiles.get(p) ?? "",
+        statTranscriptFile: async (p) => ({
+          size: Buffer.byteLength(virtualFiles.get(p) ?? "", "utf8"),
+          mtimeMs: Date.now(),
+        }),
+      };
+
+      const connection = createAcpConnection(ACP_CAPABILITIES, customOptions);
+      connection.onEvent((e) => events.push(e));
+
+      await connection.send({
+        type: "session.open",
+        requestId: "r1",
+        sessionId: "s1",
+        config: makeConfig(),
+        persistence: {
+          version: 1,
+          data: {
+            conversationId: parentConvo,
+            accountId: "default",
+            transport: "acp",
+          },
+        },
+        history: "skip",
+      });
+
+      fakeAgent.setPromptHandler(async () => {
+        fakeAgent.emitSessionUpdate("s1", {
+          sessionUpdate: "tool_call",
+          toolCallId: "call-sub-1",
+          name: "invoke_subagent",
+          args: {
+            Model: "inherit",
+            Prompt: "Inspect package.json",
+            Role: "Codebase Researcher",
+            TypeName: "research",
+          },
+        });
+
+        const childId = childSessionId("s1", childConvo);
+        await waitFor(
+          () => events.some((e) => e.type === "session.turn" && e.sessionId === childId && e.state === "completed"),
+          "child turn completed",
+        );
+        return { stopReason: "end_turn", usage: { totalTokens: 15 } };
+      });
+
+      await connection.send({
+        type: "session.prompt",
+        sessionId: "s1",
+        prompt: {
+          clientMessageId: "m1",
+          delivery: "auto",
+          input: {
+            type: "message",
+            content: [{ type: "text", text: "Explore codebase" }],
+          },
+        },
+      });
+
+      await waitForTurnCompletion("s1");
+
+      const childId = childSessionId("s1", childConvo);
+      const childOpened = events.find((e) => e.type === "session.opened" && e.sessionId === childId);
+      expect(childOpened).toBeDefined();
+      expect((childOpened as any).parentSessionId).toBe("s1");
+      expect((childOpened as any).capabilities).toContain("session.subsession");
+
+      const subagentRow = toolCallItems().filter((i) => i.callId === "call-sub-1").at(-1);
+      expect(subagentRow).toBeDefined();
+      expect(subagentRow!.detail.type).toBe("sub_agent");
+      expect((subagentRow!.detail as any).childSessionId).toBe(childId);
+      expect(subagentRow!.status).toBe("completed");
+      expect((subagentRow!.detail as any).log).toContain("Found 12 dependencies in package.json.");
+
+      await connection.close();
+    });
+
+    it("subagent follower survives parent turn end and stops on session close", async () => {
+      const parentConvo = "11111111-2222-3333-4444-555555555555";
+      const childConvo = "bbbbbbbb-0000-4000-8000-000000000000";
+      const childLogUri = pathToFileURL(join(tempDir, "child-survive.jsonl")).href;
+
+      const parentTranscript = [
+        JSON.stringify({
+          step_index: 0,
+          source: "USER_EXPLICIT",
+          type: "USER_INPUT",
+          status: "DONE",
+          content: "<USER_REQUEST>\nParent work\n</USER_REQUEST>",
+        }),
+        JSON.stringify({
+          step_index: 1,
+          source: "MODEL",
+          type: "PLANNER_RESPONSE",
+          status: "DONE",
+          content: `Created the following subagents:\n${JSON.stringify({
+            conversationId: childConvo,
+            logAbsoluteUri: childLogUri,
+          })}`,
+          tool_calls: [
+            {
+              tool_name: "invoke_subagent",
+              tool_args: { Model: "inherit", Prompt: "Long background task", Role: "Worker", TypeName: "worker" },
+            },
+          ],
+        }),
+        "",
+      ].join("\n");
+
+      // Child transcript initially only has user_input, not completed yet
+      let childTranscript = [
+        JSON.stringify({
+          step_index: 0,
+          source: "USER_EXPLICIT",
+          type: "USER_INPUT",
+          status: "DONE",
+          content: "<USER_REQUEST>\nLong background task\n</USER_REQUEST>",
+        }),
+        "",
+      ].join("\n");
+
+      const virtualFiles = new Map<string, string>();
+      const parentPath = conversationTranscriptPath(accountGeminiRoot("default"), parentConvo);
+      const childPath = join(tempDir, "child-survive.jsonl");
+      virtualFiles.set(parentPath, parentTranscript);
+      virtualFiles.set(childPath, childTranscript);
+
+      const customOptions: AcpConnectionOptions = {
+        transport: fakeAgent.clientTransport,
+        readTranscriptFile: async (p) => virtualFiles.get(p) ?? "",
+        statTranscriptFile: async (p) => ({
+          size: Buffer.byteLength(virtualFiles.get(p) ?? "", "utf8"),
+          mtimeMs: Date.now(),
+        }),
+      };
+
+      const connection = createAcpConnection(ACP_CAPABILITIES, customOptions);
+      connection.onEvent((e) => events.push(e));
+
+      await connection.send({
+        type: "session.open",
+        requestId: "r1",
+        sessionId: "s1",
+        config: makeConfig(),
+        persistence: {
+          version: 1,
+          data: {
+            conversationId: parentConvo,
+            accountId: "default",
+            transport: "acp",
+          },
+        },
+        history: "skip",
+      });
+
+      fakeAgent.setPromptHandler(async () => {
+        fakeAgent.emitSessionUpdate("s1", {
+          sessionUpdate: "tool_call",
+          toolCallId: "call-sub-2",
+          name: "invoke_subagent",
+          args: { Model: "inherit", Prompt: "Long background task", Role: "Worker", TypeName: "worker" },
+        });
+
+        // Parent returns immediately while child is still running!
+        return { stopReason: "end_turn", usage: { totalTokens: 10 } };
+      });
+
+      await connection.send({
+        type: "session.prompt",
+        sessionId: "s1",
+        prompt: {
+          clientMessageId: "m1",
+          delivery: "auto",
+          input: {
+            type: "message",
+            content: [{ type: "text", text: "Start long task" }],
+          },
+        },
+      });
+
+      // Parent turn completed
+      await waitForTurnCompletion("s1");
+      const childId = childSessionId("s1", childConvo);
+
+      // Child session opened, but child turn is NOT completed yet
+      await waitFor(() => events.some((e) => e.type === "session.opened" && e.sessionId === childId), "child open");
+      expect(events.some((e) => e.type === "session.turn" && e.sessionId === childId && e.state === "completed")).toBe(
+        false,
+      );
+
+      // Now complete the child transcript
+      childTranscript = [
+        JSON.stringify({
+          step_index: 0,
+          source: "USER_EXPLICIT",
+          type: "USER_INPUT",
+          status: "DONE",
+          content: "<USER_REQUEST>\nLong background task\n</USER_REQUEST>",
+        }),
+        JSON.stringify({
+          step_index: 1,
+          source: "MODEL",
+          type: "PLANNER_RESPONSE",
+          status: "DONE",
+          content: "Background task completed successfully.",
+          tool_calls: [],
+        }),
+        "",
+      ].join("\n");
+      virtualFiles.set(childPath, childTranscript);
+
+      // Child follower detects update and finishes child turn
+      await waitFor(
+        () =>
+          events.some(
+            (e) => e.type === "session.turn" && e.sessionId === childId && e.state === "completed",
+          )
+            ? true
+            : undefined,
+        "child turn completed after parent ended",
+      );
+
+      const subRow = toolCallItems().filter((i) => i.callId === "call-sub-2").at(-1);
+      expect(subRow?.status).toBe("completed");
+      expect((subRow?.detail as any).log).toContain("Background task completed successfully.");
+
+      // Close parent session stops followers and closes child session
+      await connection.send({
+        type: "session.close",
+        requestId: "r-close-1",
+        sessionId: "s1",
+      });
+
+      const childClosed = events.find((e) => e.type === "session.closed" && e.sessionId === childId);
+      expect(childClosed).toBeDefined();
+
+      await connection.close();
+    });
+
+    it("subagent transcript lookup respects non-default account shadow home", async () => {
+      addAccount("Work");
+      try {
+        const parentConvo = "work-parent-uuid-1111";
+        const requestedPaths: string[] = [];
+
+        const customOptions: AcpConnectionOptions = {
+          transport: fakeAgent.clientTransport,
+          readTranscriptFile: async (p) => {
+            requestedPaths.push(p);
+            return "";
+          },
+          statTranscriptFile: async () => ({ size: 0, mtimeMs: Date.now() }),
+        };
+
+        const connection = createAcpConnection(ACP_CAPABILITIES, customOptions);
+        connection.onEvent((e) => events.push(e));
+
+        await connection.send({
+          type: "session.open",
+          requestId: "r1",
+          sessionId: "s1",
+          config: makeConfig(),
+          persistence: {
+            version: 1,
+            data: {
+              conversationId: parentConvo,
+              accountId: "work",
+              transport: "acp",
+            },
+          },
+          history: "skip",
+        });
+
+        fakeAgent.setPromptHandler(() => {
+          fakeAgent.emitSessionUpdate("s1", {
+            sessionUpdate: "tool_call",
+            toolCallId: "call-sub-3",
+            name: "invoke_subagent",
+            args: { Model: "inherit", Prompt: "Check work repo", Role: "Worker", TypeName: "worker" },
+          });
+          return { stopReason: "end_turn", usage: { totalTokens: 5 } };
+        });
+
+        await connection.send({
+          type: "session.prompt",
+          sessionId: "s1",
+          prompt: {
+            clientMessageId: "m1",
+            delivery: "auto",
+            input: {
+              type: "message",
+              content: [{ type: "text", text: "Check work" }],
+            },
+          },
+        });
+
+        await waitForTurnCompletion("s1");
+
+        const expectedWorkRoot = accountGeminiRoot("work");
+        const expectedPath = conversationTranscriptPath(expectedWorkRoot, parentConvo);
+        await waitFor(() => (requestedPaths.includes(expectedPath) ? true : undefined), "requested work path");
+        expect(requestedPaths).toContain(expectedPath);
+
+        await connection.close();
+      } finally {
+        removeAccount("work");
+      }
+    });
+  });
+
+  describe("Structured Output", () => {
+    it("runs one-shot agy via injectable runner, reports schema result, and relaunches fresh ACP process on next prompt", async () => {
+      let currentAgent = fakeAgent;
+      const dynamicTransport: AcpConnectionOptions["transport"] = {
+        get input() {
+          return currentAgent.clientTransport.input;
+        },
+        get output() {
+          return currentAgent.clientTransport.output;
+        },
+      };
+
+      const recordedRuns: OneShotArgs[] = [];
+      const fakeRunner: OneShotRunner = async (args) => {
+        recordedRuns.push(args);
+        return {
+          code: 0,
+          stdout: JSON.stringify({
+            structured_output: { answer: "42", explanation: "Calculated" },
+            response: "Answer 42",
+            status: "SUCCESS",
+            usage: { input_tokens: 14, output_tokens: 28 },
+          }),
+          stderr: "",
+        };
+      };
+
+      const connection = createAcpConnection(ACP_CAPABILITIES, {
+        transport: dynamicTransport,
+        runOneShot: fakeRunner,
+      });
+      connection.onEvent((e) => events.push(e));
+
+      await connection.send({
+        type: "session.open",
+        requestId: "r1",
+        sessionId: "s1",
+        config: makeConfig(),
+        persistence: {
+          version: 1,
+          data: {
+            conversationId: "conv-struct-1",
+            accountId: "default",
+            transport: "acp",
+          },
+        },
+        history: "skip",
+      });
+
+      // Prompt 1: Structured output
+      await connection.send({
+        type: "session.prompt",
+        sessionId: "s1",
+        prompt: {
+          clientMessageId: "m-struct",
+          delivery: "auto",
+          input: {
+            type: "message",
+            content: [{ type: "text", text: "What is the answer?" }],
+          },
+          outputSchema: {
+            type: "object",
+            properties: {
+              answer: { type: "string" },
+              explanation: { type: "string" },
+            },
+            required: ["answer"],
+          },
+        },
+      });
+
+      await waitForTurnCompletion("s1");
+
+      // Verify one-shot args
+      expect(recordedRuns).toHaveLength(1);
+      const run = recordedRuns[0];
+      expect(run.args).toContain("--conversation");
+      expect(run.args).toContain("conv-struct-1");
+      expect(run.args).toContain("--output-format");
+      expect(run.args).toContain("json");
+      expect(run.args).toContain("--json-schema");
+      expect(run.args).toContain("-p");
+      expect(run.args).toContain("What is the answer?");
+
+      // Verify timeline and usage
+      const assistantMsgs = timelineItems().filter((i) => i.type === "assistant_message");
+      expect(
+        assistantMsgs.some(
+          (m: any) => m.id.startsWith("agy:schema") && m.text.includes('"answer":"42"'),
+        ),
+      ).toBe(true);
+
+      const usageEvents = events.filter((e) => e.type === "session.usage");
+      expect(usageEvents).toHaveLength(1);
+      expect((usageEvents[0] as any).usage).toMatchObject({
+        inputTokens: 14,
+        outputTokens: 28,
+      });
+
+      // Prompt 2: Regular turn relaunches fresh ACP client and resumes session
+      currentAgent = new FakeAcpAgent({ enableSteering: true });
+      currentAgent.queuePromptResult({
+        stopReason: "end_turn",
+        usage: { totalTokens: 10 },
+      });
+
+      await connection.send({
+        type: "session.prompt",
+        sessionId: "s1",
+        prompt: {
+          clientMessageId: "m-normal",
+          delivery: "auto",
+          input: {
+            type: "message",
+            content: [{ type: "text", text: "Next regular message" }],
+          },
+        },
+      });
+
+      const p2Result = events.find((e) => e.type === "session.prompt_result" && e.clientMessageId === "m-normal");
+      const turn2Id = (p2Result as any)?.result?.turnId;
+      await waitForTurnCompletion("s1", turn2Id);
+
+      expect(currentAgent.requestsFor("session/resume")).toHaveLength(1);
+      expect(currentAgent.requestsFor("session/resume")[0].params).toMatchObject({
+        sessionId: "conv-struct-1",
+      });
+
+      await connection.close();
+    });
+
+    it("refuses prompt with outputSchema when another turn is running (busy)", async () => {
+      const connection = createAcpConnection(ACP_CAPABILITIES, options);
+      connection.onEvent((e) => events.push(e));
+
+      await connection.send({
+        type: "session.open",
+        requestId: "r1",
+        sessionId: "s1",
+        config: makeConfig(),
+        persistence: {
+          version: 1,
+          data: {
+            conversationId: "conv-busy-1",
+            accountId: "default",
+            transport: "acp",
+          },
+        },
+        history: "skip",
+      });
+
+      fakeAgent.holdPrompt();
+
+      // Start turn 1
+      await connection.send({
+        type: "session.prompt",
+        sessionId: "s1",
+        prompt: {
+          clientMessageId: "m1",
+          delivery: "auto",
+          input: {
+            type: "message",
+            content: [{ type: "text", text: "Turn 1 pending" }],
+          },
+        },
+      });
+
+      // Try prompt 2 with outputSchema while turn 1 is active
+      await connection.send({
+        type: "session.prompt",
+        sessionId: "s1",
+        prompt: {
+          clientMessageId: "m2",
+          delivery: "auto",
+          input: {
+            type: "message",
+            content: [{ type: "text", text: "Turn 2 schema" }],
+          },
+          outputSchema: {
+            type: "object",
+            properties: { ok: { type: "boolean" } },
+          },
+        },
+      });
+
+      const p2Result = events.find((e) => e.type === "session.prompt_result" && e.clientMessageId === "m2");
+      expect(p2Result).toMatchObject({
+        type: "session.prompt_result",
+        sessionId: "s1",
+        clientMessageId: "m2",
+        result: {
+          type: "failed",
+          error: {
+            code: "busy",
+          },
+        },
+      });
+
+      // Cleanup held prompt
+      fakeAgent.resolveHeldPrompt();
+      await waitForTurnCompletion("s1");
+      await connection.close();
+    });
+
+    it("refuses prompt with non-object outputSchema", async () => {
+      const connection = createAcpConnection(ACP_CAPABILITIES, options);
+      connection.onEvent((e) => events.push(e));
+
+      await connection.send({
+        type: "session.open",
+        requestId: "r1",
+        sessionId: "s1",
+        config: makeConfig(),
+        persistence: {
+          version: 1,
+          data: {
+            conversationId: "conv-schema-err",
+            accountId: "default",
+            transport: "acp",
+          },
+        },
+        history: "skip",
+      });
+
+      await connection.send({
+        type: "session.prompt",
+        sessionId: "s1",
+        prompt: {
+          clientMessageId: "m-array",
+          delivery: "auto",
+          input: {
+            type: "message",
+            content: [{ type: "text", text: "Invalid schema format" }],
+          },
+          outputSchema: {
+            type: "array",
+            items: { type: "string" },
+          },
+        },
+      });
+
+      const res = events.find((e) => e.type === "session.prompt_result" && e.clientMessageId === "m-array");
+      expect(res).toMatchObject({
+        type: "session.prompt_result",
+        sessionId: "s1",
+        clientMessageId: "m-array",
+        result: {
+          type: "failed",
+          error: {
+            code: "schema_unsupported",
+          },
+        },
+      });
+
+      await connection.close();
+    });
+
+    it("reports failure when one-shot runner fails", async () => {
+      const failingRunner: OneShotRunner = async () => ({
+        code: 1,
+        stdout: "",
+        stderr: "Agy fatal error: out of memory",
+      });
+
+      const connection = createAcpConnection(ACP_CAPABILITIES, {
+        transport: fakeAgent.clientTransport,
+        runOneShot: failingRunner,
+      });
+      connection.onEvent((e) => events.push(e));
+
+      await connection.send({
+        type: "session.open",
+        requestId: "r1",
+        sessionId: "s1",
+        config: makeConfig(),
+        persistence: {
+          version: 1,
+          data: {
+            conversationId: "conv-fail-1",
+            accountId: "default",
+            transport: "acp",
+          },
+        },
+        history: "skip",
+      });
+
+      await connection.send({
+        type: "session.prompt",
+        sessionId: "s1",
+        prompt: {
+          clientMessageId: "m-fail",
+          delivery: "auto",
+          input: {
+            type: "message",
+            content: [{ type: "text", text: "Trigger failure" }],
+          },
+          outputSchema: {
+            type: "object",
+            properties: { data: { type: "string" } },
+          },
+        },
+      });
+
+      const turn = await waitForTurnCompletion("s1");
+      expect(turn.state).toBe("failed");
+      expect((turn as any).error?.message).toContain("Agy fatal error: out of memory");
+
+      await connection.close();
+    });
+
+    it("fresh session: initializes ACP to get conversation ID then runs one-shot", async () => {
+      const recordedRuns: OneShotArgs[] = [];
+      const fakeRunner: OneShotRunner = async (args) => {
+        recordedRuns.push(args);
+        return {
+          code: 0,
+          stdout: JSON.stringify({
+            structured_output: { initialized: true },
+            response: "Done",
+            status: "SUCCESS",
+          }),
+          stderr: "",
+        };
+      };
+
+      const connection = createAcpConnection(ACP_CAPABILITIES, {
+        transport: fakeAgent.clientTransport,
+        runOneShot: fakeRunner,
+      });
+      connection.onEvent((e) => events.push(e));
+
+      // Fresh session (no conversationId in persistence)
+      await connection.send({
+        type: "session.open",
+        requestId: "r1",
+        sessionId: "s1",
+        config: makeConfig(),
+        history: "skip",
+      });
+
+      await connection.send({
+        type: "session.prompt",
+        sessionId: "s1",
+        prompt: {
+          clientMessageId: "m-fresh-schema",
+          delivery: "auto",
+          input: {
+            type: "message",
+            content: [{ type: "text", text: "Fresh structured output" }],
+          },
+          outputSchema: {
+            type: "object",
+            properties: { initialized: { type: "boolean" } },
+          },
+        },
+      });
+
+      await waitForTurnCompletion("s1");
+
+      // ACP session/new was called to allocate conversation ID
+      expect(fakeAgent.requestsFor("session/new")).toHaveLength(1);
+
+      // One-shot runner was called with the allocated conversation ID
+      expect(recordedRuns).toHaveLength(1);
+      expect(recordedRuns[0].args).toContain("--conversation");
+      expect(recordedRuns[0].args).toContain("33bb33e6-aa54-40ed-87de-f4b4953dd305");
+
+      await connection.close();
+    });
+  });
+
+  describe("Native MCP Sharing", () => {
+    it("maps stdio, http, and sse without touching .agents/mcp_config.json", async () => {
+      const connection = createAcpConnection(ACP_CAPABILITIES, options);
+      connection.onEvent((e) => events.push(e));
+
+      await connection.send({
+        type: "session.open",
+        requestId: "r1",
+        sessionId: "s1",
+        config: makeConfig({
+          mcpServers: {
+            localTool: {
+              type: "stdio",
+              command: "mcp-tool",
+              args: ["serve", "--port", "0"],
+              env: { TOOL_KEY: "secret" },
+            },
+            remoteHttp: {
+              type: "http",
+              url: "https://example.com/mcp",
+              headers: { Authorization: "Bearer tok" },
+            },
+            remoteSse: {
+              type: "sse",
+              url: "https://example.com/sse",
+              headers: { "X-Env": "prod" },
+            },
+          },
+          settings: {
+            shareMcp: "on",
+          },
+        }),
+        history: "skip",
+      });
+
+      fakeAgent.queuePromptResult({
+        stopReason: "end_turn",
+        usage: { totalTokens: 10 },
+      });
+
+      await connection.send({
+        type: "session.prompt",
+        sessionId: "s1",
+        prompt: {
+          clientMessageId: "m1",
+          delivery: "auto",
+          input: {
+            type: "message",
+            content: [{ type: "text", text: "Check MCP setup" }],
+          },
+        },
+      });
+
+      await waitForTurnCompletion("s1");
+
+      const newReq = fakeAgent.requestsFor("session/new")[0];
+      const mcpServers = (newReq.params as any).mcpServers;
+      expect(mcpServers).toHaveLength(3);
+
+      expect(mcpServers).toContainEqual({
+        name: "paseo-localTool",
+        command: "mcp-tool",
+        args: ["serve", "--port", "0"],
+        env: [{ name: "TOOL_KEY", value: "secret" }],
+      });
+
+      expect(mcpServers).toContainEqual({
+        type: "http",
+        name: "paseo-remoteHttp",
+        url: "https://example.com/mcp",
+        headers: [{ name: "Authorization", value: "Bearer tok" }],
+      });
+
+      expect(mcpServers).toContainEqual({
+        type: "sse",
+        name: "paseo-remoteSse",
+        url: "https://example.com/sse",
+        headers: [{ name: "X-Env", value: "prod" }],
+      });
+
+      // No ledger file .agents/mcp_config.json written
+      expect(existsSync(join(tempDir, ".agents", "mcp_config.json"))).toBe(false);
+
+      await connection.close();
+    });
+
+    it("shareMcp off passes empty mcpServers list", async () => {
+      const connection = createAcpConnection(ACP_CAPABILITIES, options);
+      connection.onEvent((e) => events.push(e));
+
+      await connection.send({
+        type: "session.open",
+        requestId: "r1",
+        sessionId: "s1",
+        config: makeConfig({
+          mcpServers: {
+            localTool: {
+              type: "stdio",
+              command: "mcp-tool",
+            },
+          },
+          settings: {
+            shareMcp: "off",
+          },
+        }),
+        history: "skip",
+      });
+
+      fakeAgent.queuePromptResult({
+        stopReason: "end_turn",
+        usage: { totalTokens: 5 },
+      });
+
+      await connection.send({
+        type: "session.prompt",
+        sessionId: "s1",
+        prompt: {
+          clientMessageId: "m1",
+          delivery: "auto",
+          input: {
+            type: "message",
+            content: [{ type: "text", text: "Share MCP off" }],
+          },
+        },
+      });
+
+      await waitForTurnCompletion("s1");
+
+      const newReq = fakeAgent.requestsFor("session/new")[0];
+      expect((newReq.params as any).mcpServers).toEqual([]);
+
+      await connection.close();
+    });
+
+    it("toggling shareMcp on active session lazily closes client and updates mcpServers on next prompt", async () => {
+      let currentAgent = fakeAgent;
+      const dynamicTransport: AcpConnectionOptions["transport"] = {
+        get input() {
+          return currentAgent.clientTransport.input;
+        },
+        get output() {
+          return currentAgent.clientTransport.output;
+        },
+      };
+
+      const connection = createAcpConnection(ACP_CAPABILITIES, { transport: dynamicTransport });
+      connection.onEvent((e) => events.push(e));
+
+      await connection.send({
+        type: "session.open",
+        requestId: "r1",
+        sessionId: "s1",
+        config: makeConfig({
+          mcpServers: {
+            toolA: { type: "stdio", command: "tool-a" },
+          },
+          settings: {
+            shareMcp: "on",
+          },
+        }),
+        history: "skip",
+      });
+
+      // Turn 1 with shareMcp: on
+      currentAgent.queuePromptResult({ stopReason: "end_turn", usage: { totalTokens: 5 } });
+      await connection.send({
+        type: "session.prompt",
+        sessionId: "s1",
+        prompt: {
+          clientMessageId: "m1",
+          delivery: "auto",
+          input: { type: "message", content: [{ type: "text", text: "Turn 1" }] },
+        },
+      });
+      await waitForTurnCompletion("s1");
+
+      expect((currentAgent.requestsFor("session/new")[0].params as any).mcpServers).toHaveLength(1);
+
+      // Toggle shareMcp to off
+      await connection.send({
+        type: "session.configure",
+        requestId: "r-cfg",
+        sessionId: "s1",
+        changes: {
+          settings: { shareMcp: "off" },
+        },
+      });
+
+      const notice = events.find(
+        (e) => e.type === "session.notice" && e.sessionId === "s1" && e.notice.id === "mcp-share-changed",
+      );
+      expect(notice).toBeDefined();
+
+      // Turn 2 with fresh client transport
+      currentAgent = new FakeAcpAgent({ enableSteering: true });
+      currentAgent.queuePromptResult({ stopReason: "end_turn", usage: { totalTokens: 5 } });
+
+      await connection.send({
+        type: "session.prompt",
+        sessionId: "s1",
+        prompt: {
+          clientMessageId: "m2",
+          delivery: "auto",
+          input: { type: "message", content: [{ type: "text", text: "Turn 2" }] },
+        },
+      });
+      const p2Result = events.find((e) => e.type === "session.prompt_result" && e.clientMessageId === "m2");
+      const turn2Id = (p2Result as any)?.result?.turnId;
+      await waitForTurnCompletion("s1", turn2Id);
+
+      const resumeReq = currentAgent.requestsFor("session/resume")[0];
+      expect(resumeReq).toBeDefined();
+      expect((resumeReq.params as any).mcpServers).toEqual([]);
+
+      await connection.close();
+    });
+  });
+
+  describe("Router Logging Parity", () => {
+    it("router logs every input once with transport in line for both acp and ndjson", async () => {
+      const consoleSpy = vi.spyOn(console, "log");
+      const router = createRouterConnection(ACP_CAPABILITIES, { acpOptions: options });
+      router.onEvent((e) => events.push(e));
+
+      // ACP session open
+      await router.send({
+        type: "session.open",
+        requestId: "r-acp",
+        sessionId: "s-acp",
+        config: makeConfig({ settings: { transport: "acp" } }),
+        history: "skip",
+      });
+
+      expect(consoleSpy).toHaveBeenCalledWith(
+        expect.stringContaining("[antigravity] input acp session.open"),
+      );
+
+      // NDJSON session open
+      await router.send({
+        type: "session.open",
+        requestId: "r-ndjson",
+        sessionId: "s-ndjson",
+        config: makeConfig({ settings: { transport: "ndjson" } }),
+        history: "skip",
+      });
+
+      expect(consoleSpy).toHaveBeenCalledWith(
+        expect.stringContaining("[antigravity] input ndjson session.open"),
+      );
+
+      consoleSpy.mockRestore();
+      await router.close();
+    });
+  });
+
+  describe("Steering Race", () => {
+    it("starts a normal new turn if running turn completes between steer arriving and prompt being sent", async () => {
+      let currentAgent = fakeAgent;
+      let delayNextLaunch = false;
+      const dynamicTransport: AcpConnectionOptions["transport"] = {
+        get input() {
+          return currentAgent.clientTransport.input;
+        },
+        get output() {
+          return currentAgent.clientTransport.output;
+        },
+      };
+
+      const connection = createAcpConnection(ACP_CAPABILITIES, { transport: dynamicTransport });
+      connection.onEvent((e) => events.push(e));
+
+      await connection.send({
+        type: "session.open",
+        requestId: "r1",
+        sessionId: "s1",
+        config: makeConfig(),
+        history: "skip",
+      });
+
+      // Start Turn 1 and hold it active
+      fakeAgent.holdPrompt();
+      await connection.send({
+        type: "session.prompt",
+        sessionId: "s1",
+        prompt: {
+          clientMessageId: "m1",
+          delivery: "auto",
+          input: {
+            type: "message",
+            content: [{ type: "text", text: "Turn 1 active" }],
+          },
+        },
+      });
+
+      // Queue result for turn 2 so it can finish once started
+      fakeAgent.queuePromptResult({ stopReason: "end_turn", usage: { totalTokens: 8 } });
+
+      // Turn 1 completes; right as it does, steer arrives before prompt is sent
+      fakeAgent.resolveHeldPrompt();
+      // Ensure the turn completion completes in the background
+      await waitForTurnCompletion("s1");
+
+      const steerPromise = connection.send({
+        type: "session.prompt",
+        sessionId: "s1",
+        prompt: {
+          clientMessageId: "m2",
+          delivery: "steer",
+          input: {
+            type: "message",
+            content: [{ type: "text", text: "Steering prompt racing completion" }],
+          },
+        },
+      });
+
+      await steerPromise;
+
+      const m2Result = events.find((e) => e.type === "session.prompt_result" && e.clientMessageId === "m2");
+      expect(m2Result).toBeDefined();
+      // Turned into a normal turn, not a steer!
+      expect((m2Result as any).result.type).toBe("turn");
+
+      await waitForTurnCompletion("s1", (m2Result as any).result.turnId);
+      await connection.close();
+    });
   });
 });
