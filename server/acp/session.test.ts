@@ -11,7 +11,11 @@ import type {
 } from "@getpaseo/plugin/server/provider";
 import { FakeAcpAgent } from "../testing/fake-acp-agent";
 import {
+  createProvider,
+  createRouterConnection,
+  buildSettings,
   ACP_CAPABILITIES,
+  CAPABILITIES,
 } from "../provider";
 import type { AcpPromptResult } from "./schema";
 import { createAcpConnection, type AcpConnectionOptions } from "./session";
@@ -87,7 +91,91 @@ describe("ACP Session & Connection (Phase 3a)", () => {
     throw new Error(`Timed out waiting for turn completion in session ${sessionId}`);
   }
 
+  it("Item 4: per-agent transport setting, router capabilities, and session routing", async () => {
+    // 1. Setting row id "transport" exists in buildSettings
+    const settings = buildSettings({
+      accountId: "default",
+      settings: {},
+      selection: {},
+    });
+    const transportSetting = settings.find((s) => s.id === "transport");
+    expect(transportSetting).toBeDefined();
+    expect(transportSetting).toMatchObject({
+      type: "select",
+      id: "transport",
+      value: "ndjson",
+      options: [
+        { label: "NDJSON (current)", value: "ndjson" },
+        { label: "ACP (preview)", value: "acp" },
+      ],
+    });
 
+    // 2. Router connection advertises union of capabilities
+    const router = createRouterConnection(ACP_CAPABILITIES, { acpOptions: options });
+    router.onEvent((e) => events.push(e));
+    expect(router.capabilities).toContain("prompt.steer");
+
+    // 3. Route to ACP via settings.transport = "acp"
+    await router.send({
+      type: "session.open",
+      requestId: "r-acp",
+      sessionId: "s-acp",
+      config: makeConfig({ settings: { transport: "acp" } }),
+      history: "skip",
+    });
+
+    const acpOpened = events.find((e) => e.type === "session.opened" && e.sessionId === "s-acp");
+    expect(acpOpened).toBeDefined();
+    expect((acpOpened as any).capabilities).toContain("prompt.steer");
+    expect((acpOpened as any).persistence.data.transport).toBe("acp");
+
+    // 4. Route to NDJSON via settings.transport = "ndjson"
+    await router.send({
+      type: "session.open",
+      requestId: "r-ndjson",
+      sessionId: "s-ndjson",
+      config: makeConfig({ settings: { transport: "ndjson" } }),
+      history: "skip",
+    });
+
+    const ndjsonOpened = events.find((e) => e.type === "session.opened" && e.sessionId === "s-ndjson");
+    expect(ndjsonOpened).toBeDefined();
+    expect((ndjsonOpened as any).capabilities).not.toContain("prompt.steer");
+    expect((ndjsonOpened as any).persistence.data.transport).toBeUndefined();
+
+    // 5. Changing transport on open ACP session emits notice and keeps current transport
+    await router.send({
+      type: "session.configure",
+      requestId: "r-cfg",
+      sessionId: "s-acp",
+      changes: {
+        settings: { transport: "ndjson" },
+      },
+    });
+
+    const notice = events.find(
+      (e) => e.type === "session.notice" && e.sessionId === "s-acp" && e.notice.id === "transport-change-unsupported",
+    );
+    expect(notice).toBeDefined();
+
+    // 6. Resuming with old persistence (no transport) stays on NDJSON
+    await router.send({
+      type: "session.open",
+      requestId: "r-res-old",
+      sessionId: "s-res-old",
+      config: makeConfig(),
+      persistence: {
+        version: 1,
+        data: { conversationId: "old-conv-id", accountId: "default" },
+      },
+      history: "skip",
+    });
+
+    const resOldOpened = events.find((e) => e.type === "session.opened" && e.sessionId === "s-res-old");
+    expect((resOldOpened as any).persistence.data.transport).toBeUndefined();
+
+    await router.close();
+  });
 
   it("Item 2: lazy start: open does NOT spawn process; first prompt initializes and emits persistence", async () => {
     const connection = createAcpConnection(ACP_CAPABILITIES, options);
@@ -115,6 +203,7 @@ describe("ACP Session & Connection (Phase 3a)", () => {
         data: {
           conversationId: null,
           accountId: "default",
+          transport: "acp",
         },
       },
     });
@@ -170,6 +259,7 @@ describe("ACP Session & Connection (Phase 3a)", () => {
         data: {
           conversationId: "33bb33e6-aa54-40ed-87de-f4b4953dd305",
           accountId: "default",
+          transport: "acp",
         },
       },
     });

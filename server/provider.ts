@@ -96,7 +96,7 @@ import {
 } from "./subagents";
 import { TranscriptStore, transcriptExists } from "./transcript";
 import { hasEditContent, mapToolDetail, snapshotDiff } from "./tools";
-import { createAcpConnection } from "./acp/session";
+import { createAcpConnection, type AcpConnectionOptions } from "./acp/session";
 
 type JsonValue = string | number | boolean | null | JsonValue[] | { [key: string]: JsonValue };
 
@@ -206,6 +206,11 @@ export const ACP_CAPABILITIES = [
   "permission.tool_policy",
 ] as const;
 
+export const ROUTER_CAPABILITIES = [
+  ...CAPABILITIES,
+  "prompt.steer",
+] as const;
+
 export function createProvider(): ProviderRegistration {
   return {
     id: PROVIDER_ID,
@@ -247,13 +252,9 @@ export function createProvider(): ProviderRegistration {
       if (!request.versions.includes(1)) {
         throw new Error("Antigravity provider requires provider protocol version 1");
       }
-      const transport = process.env.PASEO_ANTIGRAVITY_TRANSPORT?.trim().toLowerCase();
-      if (transport === "acp") {
-        return createAcpConnection(
-          negotiateProviderCapabilities(request.capabilities, ACP_CAPABILITIES),
-        );
-      }
-      return createConnection(negotiateProviderCapabilities(request.capabilities, CAPABILITIES));
+      return createRouterConnection(
+        negotiateProviderCapabilities(request.capabilities, ROUTER_CAPABILITIES),
+      );
     },
   };
 }
@@ -587,7 +588,7 @@ interface ConnectionState {
 
 type Emit = (event: ProviderEvent) => void;
 
-function createConnection(capabilities: readonly ProviderCapability[]): ProviderConnection {
+export function createConnection(capabilities: readonly ProviderCapability[]): ProviderConnection {
   const listeners = new Set<(event: ProviderEvent) => void>();
   const state: ConnectionState = { capabilities, sessions: new Map() };
   let closed = false;
@@ -640,6 +641,119 @@ function createConnection(capabilities: readonly ProviderCapability[]): Provider
       // processes are disposed is what lets a reload replay the answer that just finished.
       await Promise.all([...flushing, ...releasing]);
       await Promise.all(running.map((process) => process.dispose()));
+    },
+  };
+}
+
+// TODO(acp-phase5): remove temporary router connection
+export interface RouterConnectionOptions {
+  acpOptions?: AcpConnectionOptions;
+}
+
+// TODO(acp-phase5): remove temporary router connection
+export function createRouterConnection(
+  capabilities: readonly ProviderCapability[],
+  options?: RouterConnectionOptions,
+): ProviderConnection {
+  const sessionTransports = new Map<string, "ndjson" | "acp">();
+  let ndjsonConn: ProviderConnection | null = null;
+  let acpConn: ProviderConnection | null = null;
+  const listeners = new Set<(event: ProviderEvent) => void>();
+  let closed = false;
+
+  function emitToListeners(event: ProviderEvent): void {
+    if (closed) return;
+    for (const listener of listeners) {
+      try {
+        listener(event);
+      } catch (error) {
+        console.error("[antigravity] error in router event listener:", error);
+      }
+    }
+  }
+
+  function getNdjson(): ProviderConnection {
+    if (!ndjsonConn) {
+      ndjsonConn = createConnection(negotiateProviderCapabilities(capabilities, CAPABILITIES));
+      ndjsonConn.onEvent(emitToListeners);
+    }
+    return ndjsonConn;
+  }
+
+  function getAcp(): ProviderConnection {
+    if (!acpConn) {
+      acpConn = createAcpConnection(
+        negotiateProviderCapabilities(capabilities, ACP_CAPABILITIES),
+        options?.acpOptions,
+      );
+      acpConn.onEvent(emitToListeners);
+    }
+    return acpConn;
+  }
+
+  return {
+    version: 1,
+    capabilities,
+    onEvent(listener: (event: ProviderEvent) => void): () => void {
+      listeners.add(listener);
+      return () => listeners.delete(listener);
+    },
+    async send(input: ProviderInput): Promise<void> {
+      if (closed) throw new Error("Antigravity provider connection is closed");
+
+      if (!("sessionId" in input)) {
+        await getNdjson().send(input);
+        return;
+      }
+
+      if (input.type === "session.open") {
+        let transport: "ndjson" | "acp";
+        const persisted = persistenceField(input.persistence, "transport");
+        if (persisted === "acp" || persisted === "ndjson") {
+          transport = persisted;
+        } else if (input.config.settings?.transport === "acp" || input.config.settings?.transport === "ndjson") {
+          transport = input.config.settings.transport;
+        } else {
+          transport = defaultTransport();
+        }
+        sessionTransports.set(input.sessionId, transport);
+        if (transport === "acp") {
+          await getAcp().send(input);
+        } else {
+          await getNdjson().send(input);
+        }
+        return;
+      }
+
+      const transport = sessionTransports.get(input.sessionId) ?? "ndjson";
+      if (input.type === "session.close") {
+        try {
+          if (transport === "acp") {
+            await getAcp().send(input);
+          } else {
+            await getNdjson().send(input);
+          }
+        } finally {
+          sessionTransports.delete(input.sessionId);
+        }
+        return;
+      }
+
+      if (transport === "acp") {
+        await getAcp().send(input);
+      } else {
+        await getNdjson().send(input);
+      }
+    },
+    async close(): Promise<void> {
+      if (closed) return;
+      closed = true;
+      sessionTransports.clear();
+      listeners.clear();
+      const closing: Promise<void>[] = [];
+      if (ndjsonConn) closing.push(ndjsonConn.close());
+      if (acpConn) closing.push(acpConn.close());
+      await Promise.all(closing);
     },
   };
 }
@@ -846,9 +960,9 @@ async function openSession(
     type: "session.opened",
     requestId: input.requestId,
     sessionId: input.sessionId,
-    capabilities: state.capabilities,
+    capabilities: negotiateProviderCapabilities(state.capabilities, CAPABILITIES),
     restoration: "core",
-    persistence: persistenceFor(conversationId, accountId),
+    persistence: persistenceFor(conversationId, accountId, "ndjson"),
     title: config.title,
     cwd: config.cwd,
   });
@@ -1496,7 +1610,17 @@ async function configureSession(
       changes.thinkingOption === null ? undefined : changes.thinkingOption;
   }
   if (changes.settings) {
-    session.settings = { ...session.settings, ...changes.settings };
+    if (changes.settings.transport !== undefined && changes.settings.transport !== "ndjson") {
+      emitNotice(
+        session,
+        emit,
+        "transport-change-unsupported",
+        "info",
+        "Transport cannot be changed",
+        "Transport (NDJSON / ACP) is selected when the session is opened and cannot be changed for an existing session.",
+      );
+    }
+    session.settings = { ...session.settings, ...changes.settings, transport: "ndjson" };
   }
 
   // A newly selected model may be the one the provider option's effort belongs to, and a newly
@@ -2186,7 +2310,7 @@ function handleAgyEvent(session: Session, event: AgyEvent, emit: Emit): void {
       emit({
         type: "session.persistence",
         sessionId: session.sessionId,
-        persistence: persistenceFor(event.conversationId, session.accountId),
+        persistence: persistenceFor(event.conversationId, session.accountId, "ndjson"),
       });
       return;
     case "step_update":
@@ -3427,6 +3551,18 @@ export function configState(session: ConfigStateSession): ProviderConfigState {
   };
 }
 
+// TODO(acp-phase5): remove temporary transport setting
+export function defaultTransport(): "ndjson" | "acp" {
+  return process.env.PASEO_ANTIGRAVITY_TRANSPORT?.trim().toLowerCase() === "acp" ? "acp" : "ndjson";
+}
+
+// TODO(acp-phase5): remove temporary transport setting
+export function sessionTransportSetting(session: { settings: Record<string, JsonValue> }): "ndjson" | "acp" {
+  const val = session.settings.transport;
+  if (val === "acp" || val === "ndjson") return val;
+  return defaultTransport();
+}
+
 export function buildSettings(session: ConfigStateSession): readonly ProviderSetting[] {
   const policy = approvalPolicy(session);
   // Antigravity decides through its own setting unless the user overrides it here, so the row
@@ -3446,6 +3582,18 @@ export function buildSettings(session: ConfigStateSession): readonly ProviderSet
           },
         ]
       : []),
+    // TODO(acp-phase5): remove temporary transport setting
+    {
+      type: "select" as const,
+      id: "transport",
+      label: "Transport",
+      description: "Driver transport for the Antigravity session.",
+      value: sessionTransportSetting(session),
+      options: [
+        { label: "NDJSON (current)", value: "ndjson" },
+        { label: "ACP (preview)", value: "acp" },
+      ],
+    },
     {
       type: "select",
       id: "approvalPolicy",
@@ -3578,14 +3726,25 @@ function toErrorJson(error: ProviderError): JsonValue {
  * launches in, so it travels with `conversationId`; the extra key needs no version bump, since a
  * reader of version 1 already ignores what it does not know.
  */
-export function persistenceFor(conversationId: string | null, accountId: string): ProviderPersistence {
-  return { version: 1, data: { conversationId, accountId } };
+export function persistenceFor(
+  conversationId: string | null,
+  accountId: string,
+  transport?: "ndjson" | "acp",
+): ProviderPersistence {
+  return {
+    version: 1,
+    data: {
+      conversationId,
+      accountId,
+      ...(transport === "acp" ? { transport: "acp" } : {}),
+    },
+  };
 }
 
 /** A version-1 string field of the persistence blob, or `null` when it is absent or unusable. */
 export function persistenceField(
   persistence: ProviderPersistence | undefined,
-  key: "conversationId" | "accountId",
+  key: "conversationId" | "accountId" | "transport",
 ): string | null {
   if (!persistence || persistence.version !== 1) return null;
   const data = persistence.data;

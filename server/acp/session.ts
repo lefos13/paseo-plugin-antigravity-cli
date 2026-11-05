@@ -649,7 +649,7 @@ async function ensureClient(session: AcpSession, emit: Emit): Promise<AgyAcpClie
         emit({
           type: "session.persistence",
           sessionId: session.sessionId,
-          persistence: persistenceFor(session.conversationId, session.accountId),
+          persistence: persistenceFor(session.conversationId, session.accountId, "acp"),
         });
       }
 
@@ -985,7 +985,17 @@ async function configureSession(
     }
   }
   if (changes.settings) {
-    session.settings = { ...session.settings, ...changes.settings };
+    if (changes.settings.transport !== undefined && changes.settings.transport !== "acp") {
+      emitNotice(
+        session,
+        emit,
+        "transport-change-unsupported",
+        "info",
+        "Transport cannot be changed",
+        "Transport (NDJSON / ACP) is selected when the session is opened and cannot be changed for an existing session.",
+      );
+    }
+    session.settings = { ...session.settings, ...changes.settings, transport: "acp" };
   }
 
   emit({
@@ -1035,7 +1045,7 @@ async function openSession(
     sessionId: input.sessionId,
     capabilities: state.capabilities,
     restoration: "core",
-    persistence: persistenceFor(session.conversationId, accountId),
+    persistence: persistenceFor(session.conversationId, accountId, "acp"),
     title: config.title,
     cwd: config.cwd,
   });
