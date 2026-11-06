@@ -64,6 +64,9 @@ export type JsonRpcMessage =
 export type RequestHandler = (params: unknown) => Promise<unknown> | unknown;
 export type NotificationHandler = (params: unknown) => void;
 
+/** How long a closed or failed stream waits for the owner to report a better error. */
+const TEARDOWN_GRACE_MS = 250;
+
 interface PendingRequest {
   resolve: (value: unknown) => void;
   reject: (reason: Error) => void;
@@ -110,13 +113,15 @@ export class JsonRpcConnection extends EventEmitter {
       this.teardown(err);
     });
 
+    // Stream endings and write failures wait briefly before tearing down: when the agent process
+    // dies, its stdout closes and a pending write fails with EPIPE *before* the owner sees the exit
+    // code and stderr (observed on Linux CI). The owner's `close(error)` within the grace period
+    // wins, so callers get "exited with code N: <stderr>" instead of a bare EPIPE.
     const scheduleTeardown = (defaultError: Error) => {
       const timer = setTimeout(() => {
-        const streamErr =
-          (this.input as { errored?: Error }).errored ??
-          (this.output as { errored?: Error }).errored;
-        this.teardown(this.closeError ?? streamErr ?? defaultError);
-      }, 50);
+        const inputErr = (this.input as { errored?: Error }).errored;
+        this.teardown(this.closeError ?? inputErr ?? defaultError);
+      }, TEARDOWN_GRACE_MS);
       timer.unref?.();
     };
 
@@ -140,7 +145,7 @@ export class JsonRpcConnection extends EventEmitter {
     });
 
     this.output.on("error", (err: Error) => {
-      this.teardown(new Error(`Output stream error: ${err.message}`));
+      scheduleTeardown(new Error(`Output stream error: ${err.message}`));
     });
 
     this.output.on("close", () => {
@@ -183,9 +188,13 @@ export class JsonRpcConnection extends EventEmitter {
     try {
       await this.write(msg);
     } catch (err) {
-      this.pending.delete(id);
-      const errorObj = err instanceof Error ? err : new Error(String(err));
-      reject(errorObj);
+      // A failed write means the stream is going away; its "error" event schedules the teardown,
+      // which rejects this request with the owner's better error (exit code, stderr). Only reject
+      // here when the connection has already closed and nothing else will.
+      if (this.closed) {
+        this.pending.delete(id);
+        reject(this.closeError ?? (err instanceof Error ? err : new Error(String(err))));
+      }
     }
 
     return promise;
