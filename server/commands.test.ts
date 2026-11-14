@@ -1,4 +1,4 @@
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { basename, dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -343,6 +343,29 @@ describe("discoverCommands", () => {
       { name: "release-notes", description: "Workspace copy" },
     ]);
     expect(discovered.expanded.has("release-notes")).toBe(false);
+  });
+
+  it("follows symlinked skill directories and skips broken symlinks", async () => {
+    const store = join(home, "skill-store");
+    const nativeTarget = join(store, "git-commit-staged");
+    const sharedTarget = join(store, "domain-modeling");
+    writeItemSkill(nativeTarget);
+    writeItemSkill(sharedTarget);
+
+    const geminiSkills = join(home, ".gemini", "skills");
+    const sharedSkills = join(home, ".agents", "skills");
+    mkdirSync(geminiSkills, { recursive: true });
+    mkdirSync(sharedSkills, { recursive: true });
+    symlinkSync(nativeTarget, join(geminiSkills, "git-commit-staged"), "dir");
+    symlinkSync(sharedTarget, join(sharedSkills, "domain-modeling"), "dir");
+    symlinkSync(join(store, "missing-skill"), join(geminiSkills, "broken-link"), "dir");
+
+    const discovered = await discoverCommands(workspace);
+    expect(discovered.commands.map((command) => command.name)).toContain("git-commit-staged");
+    expect(discovered.commands.map((command) => command.name)).toContain("domain-modeling");
+    expect(discovered.commands.map((command) => command.name)).not.toContain("broken-link");
+    expect(discovered.expanded.has("git-commit-staged")).toBe(false);
+    expect(discovered.expanded.has("domain-modeling")).toBe(true);
   });
 
   it("builds the turn text from the skill's body without its frontmatter", async () => {
@@ -967,5 +990,19 @@ describe("discoverCommands", () => {
 
       expect(await agentNames()).toEqual([]);
     });
+  });
+
+  it("follows symlinked agent files and directories and skips broken symlinks", async () => {
+    const store = join(home, "agent-store");
+    writeAgent(join(store, "sym-flat.md"), "sym-flat", "Symlinked file agent");
+    writeAgent(join(store, "sym-dir", "agent.md"), "sym-dir", "Symlinked dir agent");
+
+    const globalAgents = join(home, ".gemini", "config", "agents");
+    mkdirSync(globalAgents, { recursive: true });
+    symlinkSync(join(store, "sym-flat.md"), join(globalAgents, "sym-flat.md"), "file");
+    symlinkSync(join(store, "sym-dir"), join(globalAgents, "sym-dir"), "dir");
+    symlinkSync(join(store, "missing.md"), join(globalAgents, "broken.md"), "file");
+
+    expect(await agentNames()).toEqual(["sym-dir", "sym-flat"]);
   });
 });

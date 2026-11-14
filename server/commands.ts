@@ -1,4 +1,5 @@
 import { execFile } from "node:child_process";
+import type { Dirent } from "node:fs";
 import { readdir, readFile, stat } from "node:fs/promises";
 import { homedir } from "node:os";
 import { basename, dirname, join, resolve, sep } from "node:path";
@@ -305,13 +306,33 @@ function remember(commands: Map<string, AgyCommand>, command: AgyCommand): void 
   commands.set(command.name, command);
 }
 
+/** Resolves a directory entry's target kind, following symlinks and ignoring broken links. */
+async function entryKind(entry: Dirent, fullPath: string): Promise<"dir" | "file" | null> {
+  if (entry.isDirectory()) return "dir";
+  if (entry.isFile()) return "file";
+  if (!entry.isSymbolicLink()) return null;
+  try {
+    const info = await stat(fullPath);
+    if (info.isDirectory()) return "dir";
+    if (info.isFile()) return "file";
+  } catch {
+    // broken symlink
+  }
+  return null;
+}
+
 /** A missing or unreadable root is simply a root with no skills in it. */
 async function subdirectories(root: string): Promise<string[]> {
   try {
     const entries = await readdir(root, { withFileTypes: true });
-    return entries
-      .filter((entry) => entry.isDirectory())
-      .map((entry) => join(root, entry.name))
+    const dirs = await Promise.all(
+      entries.map(async (entry) => {
+        const path = join(root, entry.name);
+        return (await entryKind(entry, path)) === "dir" ? path : null;
+      }),
+    );
+    return dirs
+      .filter((path): path is string => path !== null)
       .sort()
       .slice(0, MAX_DIRS_PER_ROOT);
   } catch {
@@ -795,10 +816,12 @@ async function scanAgents(root: string): Promise<ConfiguredItem<DiscoveredAgent>
     const entries = await readdir(root, { withFileTypes: true });
     for (const entry of entries) {
       if (entry.name.startsWith(".")) continue;
-      const agent = entry.isDirectory()
-        ? await readAgent(join(root, entry.name, "agent.md"))
-        : entry.isFile() && entry.name.endsWith(".md")
-          ? await readAgent(join(root, entry.name))
+      const full = join(root, entry.name);
+      const kind = await entryKind(entry, full);
+      const agent = kind === "dir"
+        ? await readAgent(join(full, "agent.md"))
+        : kind === "file" && entry.name.endsWith(".md")
+          ? await readAgent(full)
           : null;
       if (agent !== null) found.push({ item: AGENT_CONFIG.filterName(entry.name), value: agent });
     }
