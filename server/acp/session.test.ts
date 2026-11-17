@@ -32,6 +32,7 @@ import {
   type OneShotArgs,
   type OneShotResult,
   type OneShotRunner,
+  injectedAcpTransport,
   toAcpMcpServers,
 } from "./session";
 
@@ -5781,5 +5782,24 @@ describe("ACP Parity & Advanced Flows (Phase 3c)", () => {
         await router.close();
       });
     });
+  });
+});
+
+describe("injectedAcpTransport", () => {
+  it("ignores the per-agent transport setting Paseo passes in providerOptions", () => {
+    expect(injectedAcpTransport("acp")).toBeUndefined();
+    expect(injectedAcpTransport("ndjson")).toBeUndefined();
+    expect(injectedAcpTransport(undefined)).toBeUndefined();
+    expect(injectedAcpTransport({})).toBeUndefined();
+  });
+
+  it("accepts a stream pair or a factory", () => {
+    const fake = new FakeAcpAgent();
+    try {
+      expect(injectedAcpTransport(fake.clientTransport)).toBe(fake.clientTransport);
+      expect(injectedAcpTransport(() => fake.clientTransport)).toBe(fake.clientTransport);
+    } finally {
+      fake.close();
+    }
   });
 });

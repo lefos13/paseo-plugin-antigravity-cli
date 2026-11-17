@@ -484,6 +484,17 @@ export function buildOneShotAgyArgs(options: {
   return args;
 }
 
+/**
+ * The ACP transport a test injected: a stream pair or a factory returning one. Paseo also hands the per-agent
+ * `transport` setting (the string "acp") to the provider in `providerOptions`, which is not a transport; treating it as
+ * one gave readline an undefined input and every launch failed with "input.on is not a function".
+ */
+export function injectedAcpTransport(raw: unknown): AgyAcpClientTransport | undefined {
+  if (typeof raw === "function") return (raw as () => AgyAcpClientTransport)();
+  if (raw && typeof raw === "object" && "input" in raw && "output" in raw) return raw as AgyAcpClientTransport;
+  return undefined;
+}
+
 export function toAcpMcpServers(
   mcpServers: Record<string, McpServerConfig>,
 ): unknown[] {
@@ -1572,8 +1583,7 @@ async function ensureClient(session: AcpSession, emit: Emit): Promise<AgyAcpClie
         session.injectedTransport ??
         (session.config.providerOptions as Record<string, unknown> | undefined)?.transport ??
         (session.config.providerOptions as Record<string, unknown> | undefined)?.acpTransport;
-      const transport =
-        typeof rawTransport === "function" ? (rawTransport as () => AgyAcpClientTransport)() : (rawTransport as AgyAcpClientTransport | undefined);
+      const transport = injectedAcpTransport(rawTransport);
 
       const client = new AgyAcpClient(
         {
